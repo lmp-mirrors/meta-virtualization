@@ -8,6 +8,7 @@ DESCRIPTION = "Podman is a daemonless container engine for developing, \
 
 inherit features_check
 REQUIRED_DISTRO_FEATURES ?= "seccomp ipv6"
+REQUIRED_DISTRO_FEATURES:class-native ?= ""
 
 DEPENDS = " \
     gpgme \
@@ -146,6 +147,11 @@ RDEPENDS:${PN} += "\
 	catatonit conmon ${VIRTUAL-RUNTIME_container_runtime} gpgme iptables libdevmapper \
 	${VIRTUAL-RUNTIME_container_dns} ${VIRTUAL-RUNTIME_container_networking} ${VIRTUAL-RUNTIME_base-utils-nsenter} \
 "
+
+DEPENDS:class-native += " conmon"
+RDEPENDS:${PN}:class-native = ""
+RRECOMMENDS:${PN}:class-native = ""
+
 RRECOMMENDS:${PN} += "slirp4netns \
                       kernel-module-xt-masquerade \
                       kernel-module-xt-comment \
@@ -155,3 +161,17 @@ RRECOMMENDS:${PN} += "slirp4netns \
                       kernel-module-xt-tcpudp \
                       "
 RCONFLICTS:${PN} = "${@bb.utils.contains('PACKAGECONFIG', 'docker', 'docker', '', d)}"
+
+RDEPENDS:${PN}-ptest += " \
+	bash \
+	bats \
+	buildah \
+	coreutils \
+	file \
+	gnupg \
+	jq \
+	make \
+	skopeo \
+	tar \
+"
+BBCLASSEXTEND = "native"

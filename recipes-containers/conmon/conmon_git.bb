@@ -28,3 +28,6 @@ PACKAGECONFIG[systemd] = ",,systemd"
 do_install() {
     oe_runmake 'DESTDIR=${D}' install
 }
+
+BBCLASSEXTEND = "native"
+REQUIRED_DISTRO_FEATURES:class-native ?= ""
