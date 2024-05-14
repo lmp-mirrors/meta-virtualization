@@ -68,3 +68,8 @@ DOCKER_VERSION = "29.0.0-rc.1"
 PV = "${DOCKER_VERSION}+git${SRCREV_moby}"
 
 CVE_PRODUCT = "docker mobyproject:moby"
+
+
+DEPENDS:class-native += ""
+RDEPENDS:${PN}:class-native = ""
+BBCLASSEXTEND = "native"
