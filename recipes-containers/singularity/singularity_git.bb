@@ -14,8 +14,8 @@ SRC_URI = "git://github.com/singularityware/singularity.git;protocol=https;branc
     file://0001-Use-python3.patch \
     file://0001-configure.ac-drop-2nd-AM_INIT_AUTOMAKE.patch \
 "
-PV = "2.3.1+git"
-SRCREV = "e214d4ebf0a1274b1c63b095fd55ae61c7e92947"
+PV = "v3.8.3+git"
+SRCREV = "9dceb4240c12b4cff1da94630d422a3422b39fcf"
 
 inherit python3native autotools-brokensep
 EXTRA_OECONF = "--prefix=/usr/local"
