@@ -1,24 +1,50 @@
-# Skip QA check for library symbolic links (core issue is a packaging problem within 
+# Skip QA check for library symbolic links (core issue is a packaging problem within
 # Singularity build / config: read up on the dev-so test for more info)
 INSANE_SKIP:${PN} += "dev-so"
 
 RDEPENDS:${PN} += "python3 ca-certificates openssl bash e2fsprogs-mke2fs"
 
 LICENSE = "BSD-3-Clause | Apache-2.0"
-LIC_FILES_CHKSUM = "file://COPYRIGHT.md;md5=be78c34e483dd7d8439358b1e024b294 \
-                    file://LICENSE-LBNL.md;md5=45a007b527e1a9507aa7fa869f8d7ede \
-                    file://LICENSE.md;md5=df4326b473db6424033f1d98a5645e30 \
-                    file://debian/copyright;md5=ed267cf386d9b75ab1f27f407e935b10"
+LIC_FILES_CHKSUM = "file://COPYRIGHT.md;md5=ed21b60743b305a734f53029f37d94fc \
+                    file://LICENSE-LBNL.md;md5=5f7c53093a01a7b1495d80b29cb72e35 \
+                    file://LICENSE.md;md5=fdcf58cf8020ccdfad7f67cd64c61624 \
+                   "
 
 SRC_URI = "git://github.com/singularityware/singularity.git;protocol=https;branch=master \
-    file://0001-Use-python3.patch \
-    file://0001-configure.ac-drop-2nd-AM_INIT_AUTOMAKE.patch \
 "
 PV = "v3.8.3+git"
 SRCREV = "9dceb4240c12b4cff1da94630d422a3422b39fcf"
 
-inherit python3native autotools-brokensep
-EXTRA_OECONF = "--prefix=/usr/local"
+GO_IMPORT = "import"
+
+inherit python3native
+inherit go goarch
+inherit pkgconfig
+
+S = "${WORKDIR}/git"
+B = "${S}"
+
+# EXTRA_OECONF = "--prefix=/usr/local"
+
+do_configure() {
+    echo "configure"
+    echo "source dir: ${S}"
+    echo "build dir: ${B}"
+    echo "working directory: "
+    pwd
+    ./mconfig
+    ls -alF
+    # exit 1
+}
+do_compile() {
+    echo "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+
+    cd builddir
+    oe_runmake singularity
+
+    pwd
+    exit 1
+}
 
 pkg_postinst:${PN}() {
     # python3 expects CA certificates to be installed in a different place to where
