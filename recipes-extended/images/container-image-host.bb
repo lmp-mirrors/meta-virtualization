@@ -127,3 +127,5 @@ IMAGE_ROOTFS_SIZE = "8192"
 # we always need extra space to install container images
 # 2GB
 IMAGE_ROOTFS_EXTRA_SPACE = "2000000"
+
+inherit container-cross-install
