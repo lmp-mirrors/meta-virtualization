@@ -80,8 +80,8 @@ class TestPortForwarding:
     """Test port forwarding with memres.
 
     Port forwarding allows access to services running in containers from the host.
-    Containers must use --network=host because Docker bridge networking is not
-    available inside the QEMU VM.
+    --network=host is used by default for all containers since Docker bridge
+    networking is not available inside the QEMU VM.
     """
 
     @pytest.mark.network
@@ -91,7 +91,7 @@ class TestPortForwarding:
 
         This test:
         1. Starts memres with port forward 8080:80
-        2. Runs nginx with --network=host
+        2. Runs nginx (--network=host is the default)
         3. Verifies nginx is accessible from host via curl
         """
         import subprocess
@@ -108,8 +108,8 @@ class TestPortForwarding:
             # Pull nginx:alpine if not present
             vdkr.run("pull", "nginx:alpine", timeout=300)
 
-            # Run nginx with host networking
-            result = vdkr.run("run", "-d", "--rm", "--network=host", "nginx:alpine", timeout=60)
+            # Run nginx (--network=host is the default)
+            result = vdkr.run("run", "-d", "--rm", "nginx:alpine", timeout=60)
             assert result.returncode == 0, f"nginx run failed: {result.stderr}"
 
             # Give nginx time to start
