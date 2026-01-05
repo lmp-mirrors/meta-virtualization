@@ -299,9 +299,18 @@ class VdkrRunner:
             raise AssertionError(error_msg)
         return result
 
-    def memres_start(self, timeout=120):
-        """Start memory resident mode."""
-        return self.run("memres", "start", timeout=timeout)
+    def memres_start(self, timeout=120, port_forwards=None):
+        """Start memory resident mode.
+
+        Args:
+            timeout: Command timeout in seconds
+            port_forwards: List of port forwards, e.g., ["8080:80", "2222:22"]
+        """
+        args = ["memres", "start"]
+        if port_forwards:
+            for pf in port_forwards:
+                args.extend(["-p", pf])
+        return self.run(*args, timeout=timeout)
 
     def memres_stop(self, timeout=30):
         """Stop memory resident mode."""
@@ -506,9 +515,18 @@ class VpdmnRunner:
             raise AssertionError(error_msg)
         return result
 
-    def memres_start(self, timeout=120):
-        """Start memory resident mode."""
-        return self.run("memres", "start", timeout=timeout)
+    def memres_start(self, timeout=120, port_forwards=None):
+        """Start memory resident mode.
+
+        Args:
+            timeout: Command timeout in seconds
+            port_forwards: List of port forwards, e.g., ["8080:80", "2222:22"]
+        """
+        args = ["memres", "start"]
+        if port_forwards:
+            for pf in port_forwards:
+                args.extend(["-p", pf])
+        return self.run(*args, timeout=timeout)
 
     def memres_stop(self, timeout=30):
         """Stop memory resident mode."""

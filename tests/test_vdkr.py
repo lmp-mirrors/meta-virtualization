@@ -76,6 +76,66 @@ class TestMemresBasic:
         assert vdkr.is_memres_running()
 
 
+class TestPortForwarding:
+    """Test port forwarding with memres.
+
+    Port forwarding allows access to services running in containers from the host.
+    Containers must use --network=host because Docker bridge networking is not
+    available inside the QEMU VM.
+    """
+
+    @pytest.mark.network
+    @pytest.mark.slow
+    def test_port_forward_nginx(self, vdkr):
+        """Test port forwarding with nginx.
+
+        This test:
+        1. Starts memres with port forward 8080:80
+        2. Runs nginx with --network=host
+        3. Verifies nginx is accessible from host via curl
+        """
+        import subprocess
+        import time
+
+        # Stop any running memres first
+        vdkr.memres_stop()
+
+        # Start memres with port forwarding
+        result = vdkr.memres_start(timeout=180, port_forwards=["8080:80"])
+        assert result.returncode == 0, f"memres start failed: {result.stderr}"
+
+        try:
+            # Pull nginx:alpine if not present
+            vdkr.run("pull", "nginx:alpine", timeout=300)
+
+            # Run nginx with host networking
+            result = vdkr.run("run", "-d", "--rm", "--network=host", "nginx:alpine", timeout=60)
+            assert result.returncode == 0, f"nginx run failed: {result.stderr}"
+
+            # Give nginx time to start
+            time.sleep(3)
+
+            # Test access from host
+            curl_result = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            assert curl_result.stdout == "200", f"Expected HTTP 200, got {curl_result.stdout}"
+
+        finally:
+            # Clean up: stop all containers
+            vdkr.run("ps", "-q", check=False)
+            ps_result = vdkr.run("ps", "-q", check=False)
+            if ps_result.stdout.strip():
+                for container_id in ps_result.stdout.strip().split('\n'):
+                    vdkr.run("stop", container_id, timeout=10, check=False)
+
+            # Stop memres
+            vdkr.memres_stop()
+
+
 class TestImages:
     """Test image management commands."""
 
