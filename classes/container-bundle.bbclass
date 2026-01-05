@@ -170,7 +170,7 @@ VRUNTIME_MULTICONFIG = "${@get_vruntime_multiconfig(d)}"
 VRUNTIME_MACHINE = "${@get_vruntime_machine(d)}"
 BLOB_ARCH = "${@get_blob_arch(d)}"
 
-# Path to vrunner.sh from vdkr-native
+# Path to vrunner.sh from vcontainer-native
 VRUNNER_PATH = "${STAGING_BINDIR_NATIVE}/vrunner.sh"
 
 # Blobs come from multiconfig deploy directory
