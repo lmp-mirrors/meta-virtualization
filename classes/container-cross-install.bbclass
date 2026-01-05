@@ -100,31 +100,14 @@
 #
 # See also: container-bundle.bbclass
 
+# Inherit shared functions for multiconfig/machine/arch mapping
+inherit container-common
+
 # Dependencies on native tools
 # vcontainer-native provides vrunner.sh
 # Blobs come from multiconfig builds (vdkr-initramfs-create, vpdmn-initramfs-create)
 DEPENDS += "qemuwrapper-cross qemu-system-native skopeo-native"
 DEPENDS += "vcontainer-native coreutils-native"
-
-# Determine multiconfig name for blob building based on target architecture
-def get_vruntime_multiconfig(d):
-    arch = d.getVar('TARGET_ARCH')
-    if arch == 'aarch64':
-        return 'vruntime-aarch64'
-    elif arch in ['x86_64', 'i686', 'i586']:
-        return 'vruntime-x86-64'
-    else:
-        return None
-
-# Get the MACHINE name used in the multiconfig (for deploy path)
-def get_vruntime_machine(d):
-    arch = d.getVar('TARGET_ARCH')
-    if arch == 'aarch64':
-        return 'qemuarm64'
-    elif arch in ['x86_64', 'i686', 'i586']:
-        return 'qemux86-64'
-    else:
-        return None
 
 VRUNTIME_MULTICONFIG = "${@get_vruntime_multiconfig(d)}"
 VRUNTIME_MACHINE = "${@get_vruntime_machine(d)}"
@@ -213,19 +196,7 @@ def get_kernel_name(d):
 
 KERNEL_IMAGETYPE_QEMU = "${@get_kernel_name(d)}"
 
-# Map TARGET_ARCH to blob directory name (aarch64, x86_64)
-def get_blob_arch(d):
-    """Map Yocto TARGET_ARCH to blob directory name"""
-    arch = d.getVar('TARGET_ARCH')
-    blob_map = {
-        'aarch64': 'aarch64',
-        'arm': 'aarch64',  # Use aarch64 blobs for 32-bit ARM too
-        'x86_64': 'x86_64',
-        'i686': 'x86_64',
-        'i586': 'x86_64',
-    }
-    return blob_map.get(arch, 'aarch64')
-
+# BLOB_ARCH uses get_blob_arch() from container-common.bbclass
 BLOB_ARCH = "${@get_blob_arch(d)}"
 
 # ============================================================================
