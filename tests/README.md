@@ -156,11 +156,10 @@ BBMULTICONFIG = "vruntime-aarch64 vruntime-x86-64"
 
 | Test Class | What It Tests | Build Required |
 |------------|---------------|----------------|
-| `TestContainerCrossTools` | container-cross-tools-native | `bitbake container-cross-tools-native` |
 | `TestContainerCrossClass` | bbclass file syntax | None (file check only) |
 | `TestOCIImageBuild` | OCI image generation | `bitbake container-app-base` (if available) |
 | `TestBundledContainers` | End-to-end bundling | Full image build with `BUNDLED_CONTAINERS` |
-| `TestVdkrRecipes` | vdkr recipe builds | `bitbake vdkr-native` |
+| `TestVdkrRecipes` | vdkr recipe builds | `bitbake vcontainer-tarball` |
 | `TestMulticonfig` | Multiconfig setup | `BBMULTICONFIG` configured |
 | `TestBundledContainersBoot` | **Boot image and verify containers** | Full image with Docker/Podman |
 
@@ -436,8 +435,6 @@ tests/
 │   ├── TestContainerLifecycle       # ps, stop, rm
 │   └── TestVolumeMounts             # volume mount tests
 ├── test_container_cross_install.py  # Yocto integration tests
-│   ├── TestContainerCrossInitramfs  # blob building
-│   ├── TestContainerCrossTools      # tools-native
 │   ├── TestContainerCrossClass      # bbclass syntax
 │   ├── TestOCIImageBuild            # OCI generation
 │   ├── TestBundledContainers        # end-to-end bundling

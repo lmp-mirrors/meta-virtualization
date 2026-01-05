@@ -20,7 +20,7 @@ Build instructions:
      cp tmp/deploy/images/qemuarm64/vpdmn/aarch64/initramfs.cpio.gz .
      cp tmp/deploy/images/qemuarm64/vpdmn/aarch64/rootfs.img .
 
-Once these files are present, vpdmn-native will automatically include them.
+Once these files are present, vcontainer-native will automatically include them.
 
 Alternatively, set VPDMN_USE_DEPLOY = "1" in local.conf to use blobs
 directly from DEPLOY_DIR without copying to the layer.
