@@ -10,8 +10,10 @@ Execute Docker or Podman commands inside a QEMU-emulated target environment.
 ## Quick Start
 
 ```bash
-# Build vdkr
-bitbake vdkr-native
+# Build and install SDK (see "Standalone SDK" section for full instructions)
+MACHINE=qemux86-64 bitbake vcontainer-tarball
+./tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y
+source /tmp/vcontainer/init-env.sh
 
 # List images (uses host architecture by default)
 vdkr images
@@ -190,34 +192,52 @@ vdkr --stateless images   # Empty
 vdkr clean
 ```
 
-## Standalone Distribution
+## Standalone SDK
 
-Create a self-contained redistributable tarball that works without Yocto:
+Create a self-contained redistributable SDK that works without Yocto:
 
 ```bash
-# Build the standalone tarball
-MACHINE=qemux86-64 bitbake vdkr-native -c create_tarball
+# Ensure multiconfig is enabled in local.conf:
+# BBMULTICONFIG = "vruntime-aarch64 vruntime-x86-64"
 
-# Output: tmp/deploy/vdkr/vdkr-standalone-x86_64.tar.gz
+# Step 1: Build blobs for desired architectures (sequentially to avoid deadlocks)
+bitbake mc:vruntime-x86-64:vdkr-initramfs-create mc:vruntime-x86-64:vpdmn-initramfs-create
+bitbake mc:vruntime-aarch64:vdkr-initramfs-create mc:vruntime-aarch64:vpdmn-initramfs-create
+
+# Step 2: Build SDK (auto-detects available architectures)
+MACHINE=qemux86-64 bitbake vcontainer-tarball
+
+# Output: tmp/deploy/sdk/vcontainer-standalone.sh
 ```
 
-The tarball includes:
-- `vdkr` - Main CLI script
-- `vdkr-aarch64`, `vdkr-x86_64` - Symlinks (only for available architectures)
-- `vrunner.sh` - QEMU runner
-- `vdkr-blobs/` - Kernel and initramfs per architecture
-- `qemu/` - QEMU system emulators with wrapper scripts
-- `lib/` - Shared libraries for QEMU
-- `share/qemu/` - QEMU firmware files
-- `socat` - Socket communication for memres mode
+To limit architectures, set in local.conf:
+```bash
+VCONTAINER_ARCHITECTURES = "x86_64"           # x86_64 only
+VCONTAINER_ARCHITECTURES = "aarch64"          # aarch64 only
+VCONTAINER_ARCHITECTURES = "x86_64 aarch64"   # both (default if both built)
+```
+
+The SDK includes:
+- `vdkr`, `vpdmn` - Main CLI scripts
+- `vdkr-<arch>`, `vpdmn-<arch>` - Symlinks for each included architecture
+- `vrunner.sh` - Shared QEMU runner
+- `vdkr-blobs/`, `vpdmn-blobs/` - Kernel and initramfs per architecture
+- `sysroots/` - SDK binaries (QEMU, socat, libraries)
 - `init-env.sh` - Environment setup script
 
 Usage:
 ```bash
-tar -xzf vdkr-standalone-x86_64.tar.gz
-cd vdkr-standalone
+# Install (self-extracting)
+./vcontainer-standalone.sh -d /tmp/vcontainer -y
+
+# Or extract tarball directly
+tar -xf vcontainer-standalone.tar.xz -C /tmp/vcontainer
+
+# Use
+cd /tmp/vcontainer
 source init-env.sh
-vdkr images
+vdkr-x86_64 images
+vdkr-aarch64 images
 ```
 
 ## Interactive Mode
@@ -297,13 +317,13 @@ vdkr rm -f debug
 See `tests/README.md` for the pytest-based test suite:
 
 ```bash
-# Build standalone tarball
-MACHINE=qemux86-64 bitbake vdkr-native -c create_tarball
+# Build and install SDK
+MACHINE=qemux86-64 bitbake vcontainer-tarball
+./tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y
 
-# Extract and run tests
-cd /tmp && tar -xzf .../vdkr-standalone-x86_64.tar.gz
+# Run tests
 cd /opt/bruce/poky/meta-virtualization
-pytest tests/test_vdkr.py -v --vdkr-dir /tmp/vdkr-standalone
+pytest tests/test_vdkr.py -v --vdkr-dir /tmp/vcontainer
 ```
 
 ## vpdmn (Podman)
@@ -331,9 +351,7 @@ Key differences from vdkr:
 
 | Recipe | Purpose |
 |--------|---------|
-| `vdkr-native_1.0.bb` | Main vdkr (Docker) CLI and blobs |
-| `vpdmn-native_1.0.bb` | Main vpdmn (Podman) CLI and blobs |
-| `vcontainer-native_1.0.bb` | Unified tarball with both tools |
+| `vcontainer-tarball.bb` | Standalone SDK with vdkr and vpdmn |
 | `vdkr-initramfs-create_1.0.bb` | Build vdkr initramfs blobs |
 | `vpdmn-initramfs-create_1.0.bb` | Build vpdmn initramfs blobs |
 
@@ -347,18 +365,16 @@ Key differences from vdkr:
 | `vdkr-init.sh` | Docker init script (baked into initramfs) |
 | `vpdmn-init.sh` | Podman init script (daemonless) |
 
-## Testing
+## Testing Both Tools
 
 ```bash
-# Build unified standalone tarball
-bitbake vcontainer-native -c create_tarball
-
-# Extract
-cd /tmp && tar -xzf .../vcontainer-standalone-*.tar.gz
+# Build and install SDK (includes both vdkr and vpdmn)
+MACHINE=qemux86-64 bitbake vcontainer-tarball
+./tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y
 
 # Run tests for both tools
 cd /opt/bruce/poky/meta-virtualization
-pytest tests/test_vdkr.py tests/test_vpdmn.py -v --vdkr-dir /tmp/vcontainer-standalone
+pytest tests/test_vdkr.py tests/test_vpdmn.py -v --vdkr-dir /tmp/vcontainer
 ```
 
 ## See Also

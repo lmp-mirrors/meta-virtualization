@@ -872,6 +872,16 @@ if [ -n "$STATE_DIR" ]; then
     mkdir -p "$STATE_DIR"
     STATE_IMG="$STATE_DIR/$STATE_FILE"
 
+    # Migration: vpdmn used to use docker-state.img, now uses podman-state.img
+    # If old file exists but new file doesn't, rename it automatically
+    if [ "$STATE_FILE" = "podman-state.img" ]; then
+        OLD_STATE_IMG="$STATE_DIR/docker-state.img"
+        if [ -f "$OLD_STATE_IMG" ] && [ ! -f "$STATE_IMG" ]; then
+            log "INFO" "Migrating old vpdmn state file: docker-state.img -> podman-state.img"
+            mv "$OLD_STATE_IMG" "$STATE_IMG"
+        fi
+    fi
+
     if [ ! -f "$STATE_IMG" ]; then
         log "INFO" "Creating new state disk at $STATE_IMG..."
         # Create 2GB state disk for Docker storage
