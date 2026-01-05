@@ -365,6 +365,11 @@ ${BOLD}MEMORY RESIDENT MODE (vmemres):${NC}
          Forward host port to container port (protocol: tcp or udp, default: tcp)
          Multiple -p options can be specified
 
+    ${YELLOW}NOTE:${NC} --network=host is used by default for all containers.
+    Docker bridge networking is not available inside the VM. Host networking
+    allows containers to share the VM's network stack, enabling port forwards
+    from the host to reach the container. Use --network=none to disable.
+
 ${BOLD}RUN vs VRUN:${NC}
     ${CYAN}run${NC}   - Full ${RUNTIME_UPPER} passthrough. Entrypoint is honored.
             Command args are passed TO the entrypoint.
@@ -452,19 +457,19 @@ ${BOLD}EXAMPLES:${NC}
 
     # Port forwarding (web server)
     ${PROG_NAME} memres start -p 8080:80           # Forward host:8080 to guest:80
-    ${PROG_NAME} run -d --rm --network=host nginx:alpine  # Container uses host network
+    ${PROG_NAME} run -d --rm nginx:alpine          # Run nginx (--network=host is default)
     curl http://localhost:8080                     # Access nginx from host
 
     # Port forwarding (SSH into a container)
     ${PROG_NAME} memres start -p 2222:22           # Forward host:2222 to guest:22
-    ${PROG_NAME} run -d --network=host my-ssh-image  # Container with SSH server
+    ${PROG_NAME} run -d my-ssh-image               # Container with SSH server
     ssh -p 2222 localhost                          # SSH from host into container
 
     # Multiple instances with different ports
     ${PROG_NAME} memres list                       # Show running instances
     ${PROG_NAME} -I web memres start -p 8080:80    # Start named instance
     ${PROG_NAME} -I web images                     # Use named instance
-    ${PROG_NAME} -I backend run -d --network=host my-api:latest
+    ${PROG_NAME} -I backend run -d my-api:latest
 
 ${BOLD}NOTES:${NC}
     - Architecture detection (in priority order):
@@ -1720,6 +1725,10 @@ case "$COMMAND" in
         # Usage: <tool> run [options] <image> [command]
         # Automatically prepends 'runtime run' to the arguments
         # Supports volume mounts with -v (requires daemon mode)
+        #
+        # NOTE: --network=host is added by default because Docker runs with
+        # --bridge=none inside the VM. Users can override with --network=none
+        # if they truly want no networking.
         if [ ${#COMMAND_ARGS[@]} -eq 0 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} run requires an image" >&2
             echo "Usage: $VCONTAINER_RUNTIME_NAME run [options] <image> [command]" >&2
@@ -1732,13 +1741,17 @@ case "$COMMAND" in
             exit 1
         fi
 
-        # Check if any volume mounts are present
+        # Check if any volume mounts are present and if user specified --network
         RUN_HAS_VOLUMES=false
+        RUN_HAS_NETWORK=false
         for arg in "${COMMAND_ARGS[@]}"; do
             if [ "$arg" = "-v" ] || [ "$arg" = "--volume" ]; then
                 RUN_HAS_VOLUMES=true
-                break
             fi
+            # Check for explicit --network option (user override)
+            case "$arg" in
+                --network=*|--net=*) RUN_HAS_NETWORK=true ;;
+            esac
         done
 
         # Volume mounts require daemon mode
@@ -1762,10 +1775,17 @@ case "$COMMAND" in
 
         # Build runtime run command from args
         # Note: -it may have been consumed by global parser, so add it back if INTERACTIVE is set
+        # Default to --network=host because Docker runs with --bridge=none inside the VM
+        RUN_NETWORK_OPTS=""
+        if [ "$RUN_HAS_NETWORK" = "false" ]; then
+            RUN_NETWORK_OPTS="--network=host --dns=10.0.2.3 --dns=8.8.8.8"
+            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using default --network=host" >&2
+        fi
+
         if [ "$INTERACTIVE" = "true" ]; then
-            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run -it ${COMMAND_ARGS[*]}"
+            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run -it $RUN_NETWORK_OPTS ${COMMAND_ARGS[*]}"
         else
-            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run ${COMMAND_ARGS[*]}"
+            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run $RUN_NETWORK_OPTS ${COMMAND_ARGS[*]}"
         fi
 
         if [ "$INTERACTIVE" = "true" ]; then
