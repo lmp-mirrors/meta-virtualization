@@ -123,13 +123,15 @@ IMAGE_CMD:oci() {
 	tar -cf "$image_name-dir.tar" "$image_name"
 
 	# create a convenience symlink
-	ln -sf "$image_name.tar" "${IMAGE_BASENAME}-$image_tag-oci.tar"
-	ln -sf "$image_name-dir.tar" "${IMAGE_BASENAME}-$image_tag-oci-dir.tar"
+	# Use -n to avoid creating link inside existing symlink target directory
+	ln -sfn "$image_name.tar" "${IMAGE_BASENAME}-$image_tag-oci.tar"
+	ln -sfn "$image_name-dir.tar" "${IMAGE_BASENAME}-$image_tag-oci-dir.tar"
     fi
 
     # We could make this optional, since the bundle is directly runnable via runc
     rm -rf $image_bundle_name
 
     # This is the OCI image directory, which is technically the "image" as specified
-    ln -sf $image_name ${IMAGE_BASENAME}-$image_tag-oci
+    # Use -n to avoid creating link inside existing symlink target directory
+    ln -sfn $image_name ${IMAGE_BASENAME}-$image_tag-oci
 }
