@@ -381,10 +381,17 @@ class VdkrRunner:
         return self.run("load", "-i", str(input_file), timeout=timeout)
 
     def has_image(self, image_name):
-        """Check if an image exists."""
+        """Check if an image exists.
+
+        Uses 'image inspect' for precise matching instead of substring
+        search in 'images' output, which can give false positives
+        (e.g., 'nginx:alpine' matching search for 'alpine').
+        """
         self.ensure_memres()
-        result = self.images()
-        return image_name.split(":")[0] in result.stdout
+        # Use image inspect for precise matching - returns 0 if image exists
+        ref = image_name if ":" in image_name else f"{image_name}:latest"
+        result = self.run("image", "inspect", ref, check=False, capture_output=True)
+        return result.returncode == 0
 
     def ensure_alpine(self, timeout=300):
         """Ensure alpine:latest is available, pulling if necessary."""
@@ -585,10 +592,17 @@ class VpdmnRunner:
         return self.run("load", "-i", str(input_file), timeout=timeout)
 
     def has_image(self, image_name):
-        """Check if an image exists."""
+        """Check if an image exists.
+
+        Uses 'image inspect' for precise matching instead of substring
+        search in 'images' output, which can give false positives
+        (e.g., 'nginx:alpine' matching search for 'alpine').
+        """
         self.ensure_memres()
-        result = self.images()
-        return image_name.split(":")[0] in result.stdout
+        # Use image inspect for precise matching - returns 0 if image exists
+        ref = image_name if ":" in image_name else f"{image_name}:latest"
+        result = self.run("image", "inspect", ref, check=False, capture_output=True)
+        return result.returncode == 0
 
     def ensure_alpine(self, timeout=300):
         """Ensure alpine:latest is available, pulling if necessary."""
