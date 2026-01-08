@@ -1319,7 +1319,7 @@ case "$COMMAND" in
 
         # Show host port forwards if daemon is running and we have any
         if daemon_is_running; then
-            local pf_file=$(get_port_forward_file)
+            pf_file=$(get_port_forward_file)
             if [ -f "$pf_file" ] && [ -s "$pf_file" ]; then
                 echo ""
                 echo -e "${CYAN}Host Port Forwards (QEMU):${NC}"
@@ -1993,8 +1993,8 @@ case "$COMMAND" in
         RUN_PORT_FORWARDS=()
 
         # Parse COMMAND_ARGS to extract relevant flags
-        local i=0
-        local prev_arg=""
+        i=0
+        prev_arg=""
         for arg in "${COMMAND_ARGS[@]}"; do
             case "$arg" in
                 -v|--volume)
@@ -2113,10 +2113,10 @@ case "$COMMAND" in
                 for port_spec in "${RUN_PORT_FORWARDS[@]}"; do
                     # Parse port specification: [host_ip:]host_port:container_port[/protocol]
                     # Examples: 8080:80, 127.0.0.1:8080:80, 8080:80/tcp, 8080:80/udp
-                    local spec="$port_spec"
-                    local protocol="tcp"
-                    local host_port=""
-                    local guest_port=""
+                    spec="$port_spec"
+                    protocol="tcp"
+                    host_port=""
+                    guest_port=""
 
                     # Extract protocol if present
                     if echo "$spec" | grep -q '/'; then
@@ -2125,7 +2125,7 @@ case "$COMMAND" in
                     fi
 
                     # Count colons to determine format
-                    local colon_count=$(echo "$spec" | tr -cd ':' | wc -c)
+                    colon_count=$(echo "$spec" | tr -cd ':' | wc -c)
                     if [ "$colon_count" -eq 2 ]; then
                         # Format: host_ip:host_port:container_port (ignore host_ip for now)
                         host_port=$(echo "$spec" | cut -d: -f2)
@@ -2232,7 +2232,7 @@ case "$COMMAND" in
                 ;;
             stop)
                 # Clear port forward registry when stopping daemon
-                local pf_file=$(get_port_forward_file)
+                pf_file=$(get_port_forward_file)
                 if [ -f "$pf_file" ]; then
                     rm -f "$pf_file"
                 fi
@@ -2240,7 +2240,7 @@ case "$COMMAND" in
                 ;;
             restart)
                 # Stop if running and clear port forward registry
-                local pf_file=$(get_port_forward_file)
+                pf_file=$(get_port_forward_file)
                 if [ -f "$pf_file" ]; then
                     rm -f "$pf_file"
                 fi
