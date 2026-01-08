@@ -36,7 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   3. Default: ~/.config/${VCONTAINER_RUNTIME_NAME}
 #
 # Config file format: key=value (one per line)
-# Supported keys: arch, timeout, state-dir, verbose
+# Supported keys: arch, timeout, state-dir, verbose, idle-timeout, auto-daemon
 # ============================================================================
 
 # Pre-parse --config-dir from command line (needs to happen before detect_default_arch)
@@ -128,11 +128,13 @@ config_list() {
 config_default() {
     local key="$1"
     case "$key" in
-        arch)      uname -m ;;
-        timeout)   echo "300" ;;
-        state-dir) echo "$HOME/.$VCONTAINER_RUNTIME_NAME" ;;
-        verbose)   echo "false" ;;
-        *)         echo "" ;;
+        arch)         uname -m ;;
+        timeout)      echo "300" ;;
+        state-dir)    echo "$HOME/.$VCONTAINER_RUNTIME_NAME" ;;
+        verbose)      echo "false" ;;
+        idle-timeout) echo "1800" ;;   # 30 minutes
+        auto-daemon)  echo "true" ;;   # Auto-start daemon by default
+        *)            echo "" ;;
     esac
 }
 
@@ -387,8 +389,11 @@ ${BOLD}CONFIGURATION (vconfig):${NC}
     ${CYAN}vconfig${NC} <key> <value>        Set configuration value
     ${CYAN}vconfig${NC} <key> --reset        Reset to default value
 
-    Supported keys: arch, timeout, state-dir, verbose
+    Supported keys: arch, timeout, state-dir, verbose, idle-timeout, auto-daemon
     Config file: \$CONFIG_DIR/config (default: ~/.config/${VCONTAINER_RUNTIME_NAME}/config)
+
+    idle-timeout: Daemon idle timeout in seconds [default: 1800]
+    auto-daemon:  Auto-start daemon on first command [default: true]
 
 ${BOLD}GLOBAL OPTIONS:${NC}
     --arch, -a <arch>     Target architecture: x86_64 or aarch64 [default: ${DEFAULT_ARCH}]
@@ -400,6 +405,7 @@ ${BOLD}GLOBAL OPTIONS:${NC}
     --storage <file>      Export ${VCONTAINER_RUNTIME_CMD} storage after command (tar file)
     --input-storage <tar> Load ${RUNTIME_UPPER} state from tar before command
     --no-kvm              Disable KVM acceleration (use TCG emulation)
+    --no-daemon           Run in ephemeral mode (don't auto-start/use daemon)
     --verbose, -v         Enable verbose output
     --help, -h            Show this help
 
@@ -529,6 +535,7 @@ NETWORK="true"
 INTERACTIVE="false"
 PORT_FORWARDS=()
 DISABLE_KVM="false"
+NO_DAEMON="false"
 COMMAND=""
 COMMAND_ARGS=()
 
@@ -583,6 +590,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-kvm)
             DISABLE_KVM="true"
+            shift
+            ;;
+        --no-daemon)
+            NO_DAEMON="true"
             shift
             ;;
         -it|--interactive)
@@ -682,13 +693,37 @@ run_runtime_command() {
     local runtime_cmd="$1"
     local runner_args=$(build_runner_args)
 
+    # Check for --no-daemon flag - use ephemeral mode
+    if [ "$NO_DAEMON" = "true" ]; then
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using ephemeral mode (--no-daemon)" >&2
+        "$RUNNER" $runner_args -- "$runtime_cmd"
+        return $?
+    fi
+
     if daemon_is_running; then
         # Use daemon mode - faster
         [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon mode" >&2
         "$RUNNER" $runner_args --daemon-send "$runtime_cmd"
     else
-        # Regular mode - start QEMU for this command
-        "$RUNNER" $runner_args -- "$runtime_cmd"
+        # Check if auto-daemon is enabled
+        local auto_daemon=$(config_get "auto-daemon" "true")
+        if [ "$auto_daemon" = "true" ]; then
+            # Auto-start daemon
+            echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Starting daemon..." >&2
+            local idle_timeout=$(config_get "idle-timeout" "1800")
+            "$RUNNER" $runner_args --idle-timeout "$idle_timeout" --daemon-start
+
+            if daemon_is_running; then
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon mode" >&2
+                "$RUNNER" $runner_args --daemon-send "$runtime_cmd"
+            else
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to start daemon, using ephemeral mode" >&2
+                "$RUNNER" $runner_args -- "$runtime_cmd"
+            fi
+        else
+            # Auto-daemon disabled - use ephemeral mode
+            "$RUNNER" $runner_args -- "$runtime_cmd"
+        fi
     fi
 }
 
@@ -700,13 +735,37 @@ run_runtime_command_with_input() {
     local runtime_cmd="$3"
     local runner_args=$(build_runner_args)
 
+    # Check for --no-daemon flag - use ephemeral mode
+    if [ "$NO_DAEMON" = "true" ]; then
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using ephemeral mode (--no-daemon)" >&2
+        "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" -- "$runtime_cmd"
+        return $?
+    fi
+
     if daemon_is_running; then
         # Use daemon mode with virtio-9p shared directory
         [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon mode for file I/O" >&2
         "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" --daemon-send-input -- "$runtime_cmd"
     else
-        # Regular mode - start QEMU for this command
-        "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" -- "$runtime_cmd"
+        # Check if auto-daemon is enabled
+        local auto_daemon=$(config_get "auto-daemon" "true")
+        if [ "$auto_daemon" = "true" ]; then
+            # Auto-start daemon
+            echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Starting daemon..." >&2
+            local idle_timeout=$(config_get "idle-timeout" "1800")
+            "$RUNNER" $runner_args --idle-timeout "$idle_timeout" --daemon-start
+
+            if daemon_is_running; then
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon mode for file I/O" >&2
+                "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" --daemon-send-input -- "$runtime_cmd"
+            else
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to start daemon, using ephemeral mode" >&2
+                "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" -- "$runtime_cmd"
+            fi
+        else
+            # Auto-daemon disabled - use ephemeral mode
+            "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" -- "$runtime_cmd"
+        fi
     fi
 }
 

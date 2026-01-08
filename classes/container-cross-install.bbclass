@@ -261,6 +261,7 @@ merge_installed_bundles() {
         local docker_storage="${WORKDIR}/docker-storage-$$.tar"
 
         ${VRUNNER_PATH} \
+            --no-daemon \
             --runtime docker \
             --arch ${BLOB_ARCH} \
             --blob-dir ${VDKR_BLOB_DIR} \
@@ -292,6 +293,7 @@ merge_installed_bundles() {
         local podman_storage="${WORKDIR}/podman-storage-$$.tar"
 
         ${VRUNNER_PATH} \
+            --no-daemon \
             --runtime podman \
             --arch ${BLOB_ARCH} \
             --blob-dir ${VPDMN_BLOB_DIR} \
