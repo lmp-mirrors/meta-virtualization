@@ -381,10 +381,11 @@ ${BOLD}MEMORY RESIDENT MODE (vmemres):${NC}
         - protocol: tcp (default) or udp
         - Multiple -p options can be specified
 
-    ${YELLOW}NOTE:${NC} --network=host is used by default for all containers.
-    Docker bridge networking is not available inside the VM. Host networking
-    allows containers to share the VM's network stack, enabling port forwards
-    from the host to reach the container. Use --network=none to disable.
+    ${YELLOW}NOTE:${NC} Docker bridge networking (docker0) is used by default.
+    Each container gets its own IP on 172.17.0.0/16. Port forwarding works via:
+      Host:8080 -> QEMU -> VM:8080 -> Docker iptables -> Container:80
+    Use --network=host for legacy behavior where containers share VM's network.
+    Use --network=none to disable networking entirely.
 
 ${BOLD}RUN vs VRUN:${NC}
     ${CYAN}run${NC}   - Full ${RUNTIME_UPPER} passthrough. Entrypoint is honored.
@@ -736,6 +737,7 @@ qmp_send() {
 
 # Add a port forward to the running daemon
 # Usage: qmp_add_hostfwd <host_port> <guest_port> [protocol]
+# With bridge networking: QEMU forwards host:port -> VM:port, Docker handles VM:port -> container:port
 qmp_add_hostfwd() {
     local host_port="$1"
     local guest_port="$2"
@@ -743,7 +745,8 @@ qmp_add_hostfwd() {
 
     [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Adding port forward: ${host_port} -> ${guest_port}/${protocol}" >&2
 
-    local result=$(qmp_send "hostfwd_add net0 ${protocol}::${host_port}-:${guest_port}")
+    # QEMU forwards to host_port on VM; Docker -p handles the container port mapping
+    local result=$(qmp_send "hostfwd_add net0 ${protocol}::${host_port}-:${host_port}")
     if echo "$result" | grep -q '"error"'; then
         echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to add port forward: $result" >&2
         return 1
@@ -861,6 +864,12 @@ run_runtime_command() {
             "$RUNNER" $runner_args --idle-timeout "$idle_timeout" --daemon-start
 
             if daemon_is_running; then
+                # Fresh daemon has no port forwards - clear stale registry
+                local pf_file=$(get_port_forward_file)
+                if [ -f "$pf_file" ]; then
+                    [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Clearing stale port forward registry" >&2
+                    rm -f "$pf_file"
+                fi
                 [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon mode" >&2
                 "$RUNNER" $runner_args --daemon-send "$runtime_cmd"
             else
@@ -903,6 +912,12 @@ run_runtime_command_with_input() {
             "$RUNNER" $runner_args --idle-timeout "$idle_timeout" --daemon-start
 
             if daemon_is_running; then
+                # Fresh daemon has no port forwards - clear stale registry
+                local pf_file=$(get_port_forward_file)
+                if [ -f "$pf_file" ]; then
+                    [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Clearing stale port forward registry" >&2
+                    rm -f "$pf_file"
+                fi
                 [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon mode for file I/O" >&2
                 "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" --daemon-send-input -- "$runtime_cmd"
             else
@@ -1890,10 +1905,10 @@ case "$COMMAND" in
         if [ "$INTERACTIVE" = "true" ]; then
             RUNTIME_RUN_OPTS="$RUNTIME_RUN_OPTS -it"
         fi
-        # Use host networking when enabled (container shares VM's network stack)
-        # This is needed because Docker runs with --bridge=none
+        # Use bridge networking (Docker's default) with VM's DNS
+        # Each container gets its own IP on 172.17.0.0/16
         if [ "$NETWORK" = "true" ]; then
-            RUNTIME_RUN_OPTS="$RUNTIME_RUN_OPTS --network=host --dns=10.0.2.3 --dns=8.8.8.8"
+            RUNTIME_RUN_OPTS="$RUNTIME_RUN_OPTS --dns=10.0.2.3 --dns=8.8.8.8"
         fi
 
         # Add volume mounts
@@ -2047,11 +2062,12 @@ case "$COMMAND" in
 
         # Build runtime run command from args
         # Note: -it may have been consumed by global parser, so add it back if INTERACTIVE is set
-        # Default to --network=host because Docker runs with --bridge=none inside the VM
+        # Use bridge networking (Docker's default) - each container gets 172.17.0.x IP
+        # User can override with --network=host for legacy behavior
         RUN_NETWORK_OPTS=""
         if [ "$RUN_HAS_NETWORK" = "false" ]; then
-            RUN_NETWORK_OPTS="--network=host --dns=10.0.2.3 --dns=8.8.8.8"
-            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using default --network=host" >&2
+            RUN_NETWORK_OPTS="--dns=10.0.2.3 --dns=8.8.8.8"
+            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using default bridge networking" >&2
         fi
 
         if [ "$INTERACTIVE" = "true" ]; then
@@ -2337,9 +2353,20 @@ case "$COMMAND" in
                     echo "  (no orphans found)"
                 fi
                 ;;
+            clean-ports)
+                # Clear the port forward registry without stopping daemon
+                pf_file=$(get_port_forward_file)
+                if [ -f "$pf_file" ]; then
+                    count=$(wc -l < "$pf_file")
+                    rm -f "$pf_file"
+                    echo -e "${GREEN}[$VCONTAINER_RUNTIME_NAME]${NC} Cleared $count port forward entries from registry"
+                else
+                    echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Port forward registry is already empty"
+                fi
+                ;;
             *)
                 echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Unknown memres subcommand: $MEMRES_CMD" >&2
-                echo "Usage: $VCONTAINER_RUNTIME_NAME memres start|stop|restart|status|list" >&2
+                echo "Usage: $VCONTAINER_RUNTIME_NAME vmemres start|stop|restart|status|list|clean-ports" >&2
                 exit 1
                 ;;
         esac
