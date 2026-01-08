@@ -1333,7 +1333,15 @@ case "$COMMAND" in
         PS_EXIT=$?
 
         # Show host port forwards if daemon is running and we have any
-        if daemon_is_running; then
+        # Skip if -q/--quiet flag is present (only container IDs requested)
+        PS_QUIET=false
+        for arg in "${COMMAND_ARGS[@]}"; do
+            case "$arg" in
+                -q|--quiet) PS_QUIET=true; break ;;
+            esac
+        done
+
+        if [ "$PS_QUIET" = "false" ] && daemon_is_running; then
             pf_file=$(get_port_forward_file)
             if [ -f "$pf_file" ] && [ -s "$pf_file" ]; then
                 echo ""
