@@ -131,7 +131,7 @@ class TestPortForwarding:
             ps_result = vdkr.run("ps", "-q", check=False)
             if ps_result.stdout.strip():
                 for container_id in ps_result.stdout.strip().split('\n'):
-                    vdkr.run("stop", container_id, timeout=10, check=False)
+                    vdkr.run("stop", container_id, timeout=30, check=False)
 
             # Stop memres
             vdkr.memres_stop()
@@ -197,8 +197,8 @@ class TestPortForwarding:
 
         finally:
             # Clean up
-            vdkr.run("stop", "nginx1", timeout=10, check=False)
-            vdkr.run("stop", "nginx2", timeout=10, check=False)
+            vdkr.run("stop", "nginx1", timeout=30, check=False)
+            vdkr.run("stop", "nginx2", timeout=30, check=False)
             vdkr.run("rm", "-f", "nginx1", check=False)
             vdkr.run("rm", "-f", "nginx2", check=False)
             vdkr.memres_stop()
@@ -263,7 +263,7 @@ class TestPortForwarding:
             if ps_result.stdout.strip():
                 for container_id in ps_result.stdout.strip().split('\n'):
                     if container_id.strip():
-                        vdkr.run("stop", container_id, timeout=10, check=False)
+                        vdkr.run("stop", container_id, timeout=30, check=False)
             vdkr.memres_stop()
 
 
@@ -1029,7 +1029,7 @@ class TestDynamicPortForwarding:
 
         finally:
             # Clean up
-            vdkr.run("stop", "nginx-test", timeout=10, check=False)
+            vdkr.run("stop", "nginx-test", timeout=30, check=False)
             vdkr.run("rm", "-f", "nginx-test", check=False)
 
     def test_port_forward_cleanup_on_stop(self, memres_session):
@@ -1045,8 +1045,8 @@ class TestDynamicPortForwarding:
                           "busybox:latest", "sleep", "300", timeout=60, check=False)
 
         if result.returncode == 0:
-            # Stop the container
-            vdkr.run("stop", "port-test", timeout=10, check=False)
+            # Stop the container (docker stop has 10s grace period, so need longer timeout)
+            vdkr.run("stop", "port-test", timeout=30, check=False)
 
             # Check ps - port forward should be removed
             ps_result = vdkr.run("ps")
@@ -1107,15 +1107,15 @@ class TestDynamicPortForwarding:
             assert ps_result.returncode == 0
 
             # Stop first - second should still work
-            vdkr.run("stop", "http1", timeout=10, check=False)
+            vdkr.run("stop", "http1", timeout=30, check=False)
 
             # Check ps - only second port forward should remain
             ps_result = vdkr.run("ps")
             # http1's port should be cleaned up, http2 should remain
 
         finally:
-            vdkr.run("stop", "http1", timeout=10, check=False)
-            vdkr.run("stop", "http2", timeout=10, check=False)
+            vdkr.run("stop", "http1", timeout=30, check=False)
+            vdkr.run("stop", "http2", timeout=30, check=False)
             vdkr.run("rm", "-f", "http1", check=False)
             vdkr.run("rm", "-f", "http2", check=False)
 
