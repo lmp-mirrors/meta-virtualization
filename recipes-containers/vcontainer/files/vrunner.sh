@@ -454,7 +454,7 @@ daemon_send() {
     done
 
     # Clean up - close FDs and kill socat
-    exec {SOCAT[0]}<&- {SOCAT[1]}>&-
+    eval "exec ${SOCAT[0]}<&- ${SOCAT[1]}>&-"
     kill $SOCAT_PID 2>/dev/null || true
     wait $SOCAT_PID 2>/dev/null || true
 
