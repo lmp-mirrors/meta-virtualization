@@ -88,11 +88,11 @@ class TestPortForwarding:
     @pytest.mark.network
     @pytest.mark.slow
     def test_port_forward_nginx(self, vdkr):
-        """Test port forwarding with nginx.
+        """Test port forwarding with nginx using bridge networking.
 
         This test:
-        1. Starts memres with port forward 8080:80
-        2. Runs nginx (--network=host is the default)
+        1. Starts memres (no static port forwards needed)
+        2. Runs nginx with -p 8080:80 (Docker bridge + iptables NAT)
         3. Verifies nginx is accessible from host via curl
         """
         import subprocess
@@ -201,6 +201,69 @@ class TestPortForwarding:
             vdkr.run("stop", "nginx2", timeout=10, check=False)
             vdkr.run("rm", "-f", "nginx1", check=False)
             vdkr.run("rm", "-f", "nginx2", check=False)
+            vdkr.memres_stop()
+
+    @pytest.mark.network
+    @pytest.mark.slow
+    def test_network_host_backward_compat(self, vdkr):
+        """Test --network=host backward compatibility.
+
+        This tests that the old host networking mode still works when explicitly
+        specified. With --network=host, containers share the VM's network stack
+        (10.0.2.15), so static port forwarding at memres start is required.
+
+        Note: With bridge networking as default, static port forwards now map
+        host_port -> host_port on VM (Docker -p handles container port mapping).
+        For --network=host, use matching ports (e.g., 8082:8082) since the
+        container binds directly to VM ports.
+        """
+        import subprocess
+        import time
+
+        # Stop any running memres first
+        vdkr.memres_stop()
+
+        # Start memres with static port forward (required for --network=host)
+        # Use matching ports since container binds directly to VM network
+        result = vdkr.memres_start(timeout=180, port_forwards=["8082:8082"])
+        assert result.returncode == 0, f"memres start failed: {result.stderr}"
+
+        try:
+            # Use busybox httpd (configurable port) instead of nginx (fixed port 80)
+            vdkr.run("pull", "busybox:latest", timeout=300, check=False)
+
+            # Run httpd with --network=host on port 8082
+            # With host networking, httpd binds directly to VM:8082
+            # Static forward maps host:8082 -> VM:8082
+            result = vdkr.run("run", "-d", "--rm", "--name", "httpd-host",
+                              "--network=host", "busybox:latest",
+                              "httpd", "-f", "-p", "8082", timeout=60)
+            assert result.returncode == 0, f"httpd run failed: {result.stderr}"
+
+            # Give httpd time to start
+            time.sleep(2)
+
+            # Test access from host via static port forward
+            # Note: busybox httpd returns 404 for /, but that's still a valid HTTP response
+            curl_result = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "http://localhost:8082/"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            # Accept 200, 404, or other HTTP codes - we just need connectivity
+            http_code = curl_result.stdout
+            assert http_code.isdigit() and int(http_code) > 0, \
+                f"Expected HTTP response, got {http_code}"
+
+        finally:
+            # Clean up
+            ps_result = vdkr.run("ps", "-q", check=False)
+            if ps_result.stdout.strip():
+                for container_id in ps_result.stdout.strip().split('\n'):
+                    if container_id.strip():
+                        vdkr.run("stop", container_id, timeout=10, check=False)
             vdkr.memres_stop()
 
 
