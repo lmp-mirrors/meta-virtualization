@@ -96,6 +96,51 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
 
+# Ports used by tests that need to be free
+TEST_PORTS = [8080, 8081, 8888, 8001, 8002, 9999, 7777, 6666]
+
+
+def _cleanup_orphan_qemu_on_ports():
+    """
+    Kill any QEMU processes holding ports used by tests.
+    This handles cases where a previous test run or manual testing left
+    orphan QEMU processes that would block test port bindings.
+    """
+    import re
+
+    try:
+        # Get listening sockets
+        result = subprocess.run(
+            ["ss", "-tlnp"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode != 0:
+            return
+
+        for line in result.stdout.splitlines():
+            # Check if any test port is in use
+            for port in TEST_PORTS:
+                if f":{port}" in line and "qemu" in line.lower():
+                    # Extract PID from ss output (format: users:(("qemu...",pid=12345,fd=...)))
+                    match = re.search(r'pid=(\d+)', line)
+                    if match:
+                        pid = int(match.group(1))
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            import time
+                            time.sleep(0.5)
+                            # Force kill if still running
+                            if Path(f"/proc/{pid}").exists():
+                                os.kill(pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                    break
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
 def pytest_addoption(parser):
     """Add custom command line options."""
     # vdkr/vpdmn options
@@ -181,6 +226,59 @@ def pytest_addoption(parser):
         default=24.0,
         help="Max rootfs age in hours before warning (default: 24)",
     )
+
+
+def _cleanup_stale_test_state():
+    """
+    Clean up stale or corrupt test state directories.
+    This ensures tests start with a clean slate if previous runs crashed.
+    """
+    for state_base in [TEST_STATE_BASE, VPDMN_TEST_STATE_BASE]:
+        state_path = Path(state_base)
+        if not state_path.exists():
+            continue
+
+        for arch_dir in state_path.glob("*"):
+            if not arch_dir.is_dir():
+                continue
+
+            docker_state = arch_dir / "docker-state.img"
+            daemon_pid = arch_dir / "daemon.pid"
+
+            # Check if daemon is actually running
+            daemon_running = False
+            if daemon_pid.exists():
+                try:
+                    pid = int(daemon_pid.read_text().strip())
+                    daemon_running = Path(f"/proc/{pid}").exists()
+                except (ValueError, OSError):
+                    pass
+
+            # If daemon not running but state exists, it's stale - clean it
+            if not daemon_running and docker_state.exists():
+                # Check if docker-state.img needs journal recovery (corrupt)
+                try:
+                    result = subprocess.run(
+                        ["file", str(docker_state)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if "needs journal recovery" in result.stdout:
+                        # State is corrupt, clean it up
+                        shutil.rmtree(arch_dir, ignore_errors=True)
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_orphan_qemu():
+    """Clean up orphan QEMU processes and stale test state at session start."""
+    _cleanup_orphan_qemu_on_ports()
+    _cleanup_stale_test_state()
+    yield
+    # Also clean up at end of session
+    _cleanup_orphan_qemu_on_ports()
 
 
 @pytest.fixture(scope="session")
