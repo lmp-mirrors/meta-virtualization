@@ -101,16 +101,16 @@ class TestPortForwarding:
         # Stop any running memres first
         vdkr.memres_stop()
 
-        # Start memres with port forwarding
-        result = vdkr.memres_start(timeout=180, port_forwards=["8080:80"])
+        # Start memres (no static port forwards needed - use dynamic via -p on run)
+        result = vdkr.memres_start(timeout=180)
         assert result.returncode == 0, f"memres start failed: {result.stderr}"
 
         try:
             # Pull nginx:alpine if not present
             vdkr.run("pull", "nginx:alpine", timeout=300)
 
-            # Run nginx (--network=host is the default)
-            result = vdkr.run("run", "-d", "--rm", "nginx:alpine", timeout=60)
+            # Run nginx with port forward - Docker sets up iptables for bridge networking
+            result = vdkr.run("run", "-d", "--rm", "-p", "8080:80", "nginx:alpine", timeout=60)
             assert result.returncode == 0, f"nginx run failed: {result.stderr}"
 
             # Give nginx time to start
