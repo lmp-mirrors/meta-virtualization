@@ -80,8 +80,9 @@ class TestPortForwarding:
     """Test port forwarding with memres.
 
     Port forwarding allows access to services running in containers from the host.
-    --network=host is used by default for all containers since Docker bridge
-    networking is not available inside the QEMU VM.
+    Docker bridge networking (docker0, 172.17.0.0/16) is used by default.
+    Each container gets its own IP, enabling multiple containers to listen
+    on the same internal port with different host port mappings.
     """
 
     @pytest.mark.network
@@ -133,6 +134,73 @@ class TestPortForwarding:
                     vdkr.run("stop", container_id, timeout=10, check=False)
 
             # Stop memres
+            vdkr.memres_stop()
+
+    @pytest.mark.network
+    @pytest.mark.slow
+    def test_multiple_containers_same_internal_port(self, vdkr):
+        """Test multiple containers listening on same internal port.
+
+        This tests the key benefit of bridge networking:
+        - nginx1 listens on container port 80, mapped to host port 8080
+        - nginx2 listens on container port 80, mapped to host port 8081
+        - Both should work simultaneously (impossible with --network=host)
+        """
+        import subprocess
+        import time
+
+        # Stop any running memres first
+        vdkr.memres_stop()
+
+        # Start memres
+        result = vdkr.memres_start(timeout=180)
+        assert result.returncode == 0, f"memres start failed: {result.stderr}"
+
+        try:
+            # Pull nginx:alpine if not present
+            vdkr.run("pull", "nginx:alpine", timeout=300)
+
+            # Run first nginx on host:8080 -> container:80
+            result1 = vdkr.run("run", "-d", "--name", "nginx1", "-p", "8080:80",
+                               "nginx:alpine", timeout=60)
+            assert result1.returncode == 0, f"nginx1 run failed: {result1.stderr}"
+
+            # Run second nginx on host:8081 -> container:80 (same internal port!)
+            result2 = vdkr.run("run", "-d", "--name", "nginx2", "-p", "8081:80",
+                               "nginx:alpine", timeout=60)
+            assert result2.returncode == 0, f"nginx2 run failed: {result2.stderr}"
+
+            # Give nginx time to start
+            time.sleep(3)
+
+            # Test both are accessible
+            curl1 = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "http://localhost:8080"],
+                capture_output=True, text=True, timeout=10
+            )
+            assert curl1.stdout == "200", f"nginx1: Expected HTTP 200, got {curl1.stdout}"
+
+            curl2 = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "http://localhost:8081"],
+                capture_output=True, text=True, timeout=10
+            )
+            assert curl2.stdout == "200", f"nginx2: Expected HTTP 200, got {curl2.stdout}"
+
+            # Verify ps shows both containers with their port mappings
+            ps_result = vdkr.run("ps")
+            assert "nginx1" in ps_result.stdout
+            assert "nginx2" in ps_result.stdout
+            assert "8080" in ps_result.stdout
+            assert "8081" in ps_result.stdout
+
+        finally:
+            # Clean up
+            vdkr.run("stop", "nginx1", timeout=10, check=False)
+            vdkr.run("stop", "nginx2", timeout=10, check=False)
+            vdkr.run("rm", "-f", "nginx1", check=False)
+            vdkr.run("rm", "-f", "nginx2", check=False)
             vdkr.memres_stop()
 
 
