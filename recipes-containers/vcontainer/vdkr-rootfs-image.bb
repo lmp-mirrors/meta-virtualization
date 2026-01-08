@@ -9,8 +9,8 @@
 # to provide a proper rootfs for running Docker in QEMU.
 #
 # Build with:
-#   bitbake mc:vdkr-aarch64:vdkr-rootfs-image
-#   bitbake mc:vdkr-x86-64:vdkr-rootfs-image
+#   bitbake mc:vruntime-aarch64:vdkr-rootfs-image
+#   bitbake mc:vruntime-x86-64:vdkr-rootfs-image
 
 SUMMARY = "Minimal Docker rootfs for vdkr"
 DESCRIPTION = "A minimal image containing Docker tools for use with vdkr. \
@@ -40,6 +40,7 @@ IMAGE_INSTALL = " \
     skopeo \
     busybox \
     iproute2 \
+    iptables \
     util-linux \
 "
 
