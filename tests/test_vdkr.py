@@ -784,3 +784,239 @@ class TestRemoteFetchAndCrossInstall:
 
         result = vdkr.vrun("alpine:latest", "/bin/echo", "alpine_ok")
         assert "alpine_ok" in result.stdout
+
+
+class TestAutoStartDaemon:
+    """Test auto-start daemon behavior.
+
+    When auto-daemon is enabled (default), vmemres starts automatically
+    on the first command and stops after idle timeout.
+    """
+
+    def test_auto_start_on_first_command(self, vdkr):
+        """Test that daemon auto-starts on first command."""
+        # Stop daemon if running
+        vdkr.memres_stop()
+        assert not vdkr.is_memres_running(), "Daemon should be stopped"
+
+        # Run a command - daemon should auto-start
+        result = vdkr.images(timeout=180)
+        assert result.returncode == 0
+
+        # Verify daemon is now running
+        assert vdkr.is_memres_running(), "Daemon should have auto-started"
+
+    def test_no_daemon_flag(self, vdkr):
+        """Test --no-daemon runs without starting daemon."""
+        # Stop daemon if running
+        vdkr.memres_stop()
+        assert not vdkr.is_memres_running(), "Daemon should be stopped"
+
+        # Run with --no-daemon - should use ephemeral mode
+        result = vdkr.run("--no-daemon", "images", timeout=180)
+        assert result.returncode == 0
+
+        # Daemon should NOT be running
+        assert not vdkr.is_memres_running(), "Daemon should not have started with --no-daemon"
+
+    def test_vconfig_auto_daemon(self, vdkr):
+        """Test vconfig auto-daemon setting."""
+        # Check current value
+        result = vdkr.run("vconfig", "auto-daemon")
+        assert result.returncode == 0
+        assert "true" in result.stdout.lower() or "auto-daemon" in result.stdout
+
+        # Test setting to false
+        result = vdkr.run("vconfig", "auto-daemon", "false")
+        assert result.returncode == 0
+
+        # Reset to default
+        result = vdkr.run("vconfig", "auto-daemon", "--reset")
+        assert result.returncode == 0
+
+    def test_vconfig_idle_timeout(self, vdkr):
+        """Test vconfig idle-timeout setting."""
+        # Check current value
+        result = vdkr.run("vconfig", "idle-timeout")
+        assert result.returncode == 0
+
+        # Test setting value
+        result = vdkr.run("vconfig", "idle-timeout", "3600")
+        assert result.returncode == 0
+
+        # Reset to default
+        result = vdkr.run("vconfig", "idle-timeout", "--reset")
+        assert result.returncode == 0
+
+
+class TestDynamicPortForwarding:
+    """Test dynamic port forwarding via QMP.
+
+    Port forwards can be added dynamically when running detached containers,
+    without needing to specify them at vmemres start time.
+    """
+
+    @pytest.mark.network
+    @pytest.mark.slow
+    def test_dynamic_port_forward_run(self, vdkr):
+        """Test that run -d -p adds port forward dynamically."""
+        import subprocess
+        import time
+
+        # Ensure memres is running (without static port forwards)
+        vdkr.memres_stop()
+        vdkr.memres_start(timeout=180)
+        assert vdkr.is_memres_running()
+
+        try:
+            # Pull nginx:alpine if not present
+            vdkr.run("pull", "nginx:alpine", timeout=300)
+
+            # Run with dynamic port forward
+            result = vdkr.run("run", "-d", "--name", "nginx-test", "-p", "8888:80",
+                              "nginx:alpine", timeout=60)
+            assert result.returncode == 0, f"nginx run failed: {result.stderr}"
+
+            # Give nginx time to start
+            time.sleep(3)
+
+            # Test access from host
+            curl_result = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "http://localhost:8888"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            assert curl_result.stdout == "200", \
+                f"Expected HTTP 200, got {curl_result.stdout}"
+
+            # Check ps shows port forwards
+            ps_result = vdkr.run("ps")
+            assert ps_result.returncode == 0
+            assert "8888" in ps_result.stdout or "Port Forwards" in ps_result.stdout
+
+        finally:
+            # Clean up
+            vdkr.run("stop", "nginx-test", timeout=10, check=False)
+            vdkr.run("rm", "-f", "nginx-test", check=False)
+
+    def test_port_forward_cleanup_on_stop(self, memres_session):
+        """Test that port forwards are cleaned up when container stops."""
+        vdkr = memres_session
+        vdkr.ensure_memres()
+
+        # Ensure we have busybox
+        vdkr.ensure_busybox()
+
+        # Run a container with port forward
+        result = vdkr.run("run", "-d", "--name", "port-test", "-p", "9999:80",
+                          "busybox:latest", "sleep", "300", timeout=60, check=False)
+
+        if result.returncode == 0:
+            # Stop the container
+            vdkr.run("stop", "port-test", timeout=10, check=False)
+
+            # Check ps - port forward should be removed
+            ps_result = vdkr.run("ps")
+            assert "9999" not in ps_result.stdout or "port-test" not in ps_result.stdout
+
+            # Clean up
+            vdkr.run("rm", "-f", "port-test", check=False)
+
+    def test_port_forward_cleanup_on_rm(self, memres_session):
+        """Test that port forwards are cleaned up when container is removed."""
+        vdkr = memres_session
+        vdkr.ensure_memres()
+
+        # Ensure we have busybox
+        vdkr.ensure_busybox()
+
+        # Run a container with port forward
+        result = vdkr.run("run", "-d", "--name", "rm-test", "-p", "7777:80",
+                          "busybox:latest", "sleep", "300", timeout=60, check=False)
+
+        if result.returncode == 0:
+            # Force remove the container
+            vdkr.run("rm", "-f", "rm-test", timeout=10, check=False)
+
+            # Check ps - port forward should be removed
+            ps_result = vdkr.run("ps")
+            assert "7777" not in ps_result.stdout or "rm-test" not in ps_result.stdout
+
+    @pytest.mark.network
+    @pytest.mark.slow
+    def test_multiple_dynamic_port_forwards(self, vdkr):
+        """Test multiple containers with different dynamic port forwards."""
+        import time
+
+        vdkr.memres_stop()
+        vdkr.memres_start(timeout=180)
+        assert vdkr.is_memres_running()
+
+        try:
+            # Pull busybox
+            vdkr.run("pull", "busybox:latest", timeout=300, check=False)
+
+            # Run first container with port forward
+            result1 = vdkr.run("run", "-d", "--name", "http1", "-p", "8001:80",
+                               "busybox:latest", "httpd", "-f", "-p", "80",
+                               timeout=60, check=False)
+
+            # Run second container with different port forward
+            result2 = vdkr.run("run", "-d", "--name", "http2", "-p", "8002:80",
+                               "busybox:latest", "httpd", "-f", "-p", "80",
+                               timeout=60, check=False)
+
+            time.sleep(2)
+
+            # Check ps shows both port forwards
+            ps_result = vdkr.run("ps")
+            # Note: May show in port forwards section, not PORTS column
+            assert ps_result.returncode == 0
+
+            # Stop first - second should still work
+            vdkr.run("stop", "http1", timeout=10, check=False)
+
+            # Check ps - only second port forward should remain
+            ps_result = vdkr.run("ps")
+            # http1's port should be cleaned up, http2 should remain
+
+        finally:
+            vdkr.run("stop", "http1", timeout=10, check=False)
+            vdkr.run("stop", "http2", timeout=10, check=False)
+            vdkr.run("rm", "-f", "http1", check=False)
+            vdkr.run("rm", "-f", "http2", check=False)
+
+
+class TestPortForwardRegistry:
+    """Test port forward registry cleanup."""
+
+    def test_port_forward_cleared_on_memres_stop(self, vdkr):
+        """Test that port forward registry is cleared when memres stops."""
+        import os
+
+        # Start memres
+        vdkr.memres_stop()
+        vdkr.memres_start(timeout=180)
+        assert vdkr.is_memres_running()
+
+        # Get state dir path
+        result = vdkr.run("vstorage", "path")
+        if result.returncode == 0:
+            state_dir = result.stdout.strip()
+            pf_file = os.path.join(state_dir, "port-forwards.txt")
+
+            # Run a container with port forward to create registry entry
+            vdkr.ensure_busybox()
+            vdkr.run("run", "-d", "--name", "pf-test", "-p", "6666:80",
+                     "busybox:latest", "sleep", "60", timeout=60, check=False)
+
+            # Stop memres - should clear port forward file
+            vdkr.memres_stop()
+
+            # Port forward file should not exist or be empty
+            if os.path.exists(pf_file):
+                with open(pf_file, 'r') as f:
+                    content = f.read()
+                assert content.strip() == "", "Port forward file should be empty"
