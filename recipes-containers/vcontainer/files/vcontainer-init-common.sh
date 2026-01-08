@@ -329,7 +329,10 @@ run_daemon_mode() {
     # Command loop with idle timeout
     while true; do
         CMD_B64=""
-        if read -t "$RUNTIME_IDLE_TIMEOUT" -r CMD_B64 <&3; then
+        read -t "$RUNTIME_IDLE_TIMEOUT" -r CMD_B64 <&3
+        READ_EXIT=$?
+
+        if [ $READ_EXIT -eq 0 ]; then
             log "Received: '$CMD_B64'"
             # Handle special commands
             case "$CMD_B64" in
@@ -419,14 +422,15 @@ run_daemon_mode() {
 
             log "Command completed (exit code: $EXEC_EXIT_CODE)"
         else
-            # Read returned non-zero: either timeout or error
-            if [ -z "$CMD_B64" ]; then
-                # Timeout expired with no data - shut down
+            # Read returned non-zero: either timeout or EOF
+            # Timeout returns >128 (typically 142), EOF returns 1
+            if [ $READ_EXIT -gt 128 ]; then
+                # Actual timeout - shut down
                 log "Idle timeout (${RUNTIME_IDLE_TIMEOUT}s), shutting down..."
                 echo "===IDLE_SHUTDOWN===" | cat >&3
                 break
             fi
-            # Empty line or other issue - just continue
+            # EOF or empty line - host closed connection, wait for reconnect
             sleep 0.1
         fi
     done
