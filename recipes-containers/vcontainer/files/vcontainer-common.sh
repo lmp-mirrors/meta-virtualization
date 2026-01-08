@@ -743,7 +743,7 @@ qmp_add_hostfwd() {
 
     [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Adding port forward: ${host_port} -> ${guest_port}/${protocol}" >&2
 
-    local result=$(qmp_send "hostfwd_add user.0 ${protocol}::${host_port}-:${guest_port}")
+    local result=$(qmp_send "hostfwd_add net0 ${protocol}::${host_port}-:${guest_port}")
     if echo "$result" | grep -q '"error"'; then
         echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to add port forward: $result" >&2
         return 1
@@ -759,7 +759,7 @@ qmp_remove_hostfwd() {
 
     [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Removing port forward: ${host_port}/${protocol}" >&2
 
-    local result=$(qmp_send "hostfwd_remove user.0 ${protocol}::${host_port}")
+    local result=$(qmp_send "hostfwd_remove net0 ${protocol}::${host_port}")
     if echo "$result" | grep -q '"error"'; then
         echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to remove port forward: $result" >&2
         return 1
