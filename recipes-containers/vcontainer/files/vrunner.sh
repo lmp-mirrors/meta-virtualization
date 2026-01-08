@@ -1073,6 +1073,10 @@ if [ "$DAEMON_MODE" = "start" ]; then
     QEMU_OPTS="$QEMU_OPTS -device virtio-serial-pci"
     QEMU_OPTS="$QEMU_OPTS -device virtserialport,chardev=vdkr,name=vdkr"
 
+    # Add QMP socket for dynamic control (port forwarding, etc.)
+    QMP_SOCKET="$DAEMON_SOCKET_DIR/qmp.sock"
+    QEMU_OPTS="$QEMU_OPTS -qmp unix:$QMP_SOCKET,server,nowait"
+
     # Tell init script to run in daemon mode with idle timeout
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_daemon=1"
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_idle_timeout=$IDLE_TIMEOUT"

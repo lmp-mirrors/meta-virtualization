@@ -355,17 +355,31 @@ ${BOLD}EXTENDED COMMANDS (${VCONTAINER_RUNTIME_NAME}-specific):${NC}
     ${CYAN}clean${NC}                        ${YELLOW}[DEPRECATED]${NC} Use 'vstorage clean' instead
 
 ${BOLD}MEMORY RESIDENT MODE (vmemres):${NC}
-    ${CYAN}vmemres start${NC} [-p port:port] Start memory resident VM in background
+    By default, vmemres auto-starts on the first command and stops after idle timeout.
+    This provides fast command execution without manual daemon management.
+
+    ${CYAN}vmemres start${NC}                Start memory resident VM in background
     ${CYAN}vmemres stop${NC}                 Stop memory resident VM
     ${CYAN}vmemres restart${NC} [--clean]    Restart VM (optionally clean state first)
     ${CYAN}vmemres status${NC}               Show memory resident VM status
     ${CYAN}vmemres list${NC}                 List all running memres instances
     (Note: 'memres' also works as an alias for 'vmemres')
 
-    Port forwarding with vmemres:
-      -p <host_port>:<container_port>[/protocol]
-         Forward host port to container port (protocol: tcp or udp, default: tcp)
-         Multiple -p options can be specified
+    Auto-start and idle timeout:
+      - Daemon auto-starts when you run any command (configurable via vconfig auto-daemon)
+      - Daemon auto-stops after 30 minutes of inactivity (configurable via vconfig idle-timeout)
+      - Use --no-daemon to run commands in ephemeral mode (no daemon)
+
+    ${BOLD}Dynamic Port Forwarding:${NC}
+      When running detached containers with -p, port forwards are added dynamically:
+        ${PROG_NAME} run -d -p 8080:80 nginx        # Adds 8080->80 forward
+        ${PROG_NAME} run -d -p 3000:3000 myapp      # Adds 3000->3000 forward
+        ${PROG_NAME} ps                              # Shows containers AND port forwards
+        ${PROG_NAME} stop nginx                      # Removes 8080->80 forward
+
+      Port format: -p <host_port>:<container_port>[/protocol]
+        - protocol: tcp (default) or udp
+        - Multiple -p options can be specified
 
     ${YELLOW}NOTE:${NC} --network=host is used by default for all containers.
     Docker bridge networking is not available inside the VM. Host networking
@@ -686,6 +700,139 @@ daemon_is_running() {
         fi
     fi
     return 1
+}
+
+# ============================================================================
+# QMP (QEMU Machine Protocol) Helpers for Dynamic Port Forwarding
+# ============================================================================
+# These functions communicate with QEMU's QMP socket to add/remove port
+# forwards at runtime without restarting the daemon.
+
+# Get the QMP socket path
+get_qmp_socket() {
+    local state_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}"
+    echo "$state_dir/qmp.sock"
+}
+
+# Send a QMP command and get the response
+# Usage: qmp_send "command-line"
+qmp_send() {
+    local cmd="$1"
+    local qmp_socket=$(get_qmp_socket)
+
+    if [ ! -S "$qmp_socket" ]; then
+        echo "QMP socket not found: $qmp_socket" >&2
+        return 1
+    fi
+
+    # QMP requires a capabilities negotiation first, then human-monitor-command
+    # We use socat to send the command
+    {
+        echo '{"execute":"qmp_capabilities"}'
+        sleep 0.1
+        echo "{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"$cmd\"}}"
+    } | socat - "unix-connect:$qmp_socket" 2>/dev/null
+}
+
+# Add a port forward to the running daemon
+# Usage: qmp_add_hostfwd <host_port> <guest_port> [protocol]
+qmp_add_hostfwd() {
+    local host_port="$1"
+    local guest_port="$2"
+    local protocol="${3:-tcp}"
+
+    [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Adding port forward: ${host_port} -> ${guest_port}/${protocol}" >&2
+
+    local result=$(qmp_send "hostfwd_add user.0 ${protocol}::${host_port}-:${guest_port}")
+    if echo "$result" | grep -q '"error"'; then
+        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to add port forward: $result" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Remove a port forward from the running daemon
+# Usage: qmp_remove_hostfwd <host_port> [protocol]
+qmp_remove_hostfwd() {
+    local host_port="$1"
+    local protocol="${2:-tcp}"
+
+    [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Removing port forward: ${host_port}/${protocol}" >&2
+
+    local result=$(qmp_send "hostfwd_remove user.0 ${protocol}::${host_port}")
+    if echo "$result" | grep -q '"error"'; then
+        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to remove port forward: $result" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================================
+# Port Forward Registry
+# ============================================================================
+# Track which ports are forwarded for which containers so we can clean up
+# when containers are stopped.
+
+PORT_FORWARD_FILE=""
+
+get_port_forward_file() {
+    if [ -z "$PORT_FORWARD_FILE" ]; then
+        local state_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}"
+        PORT_FORWARD_FILE="$state_dir/port-forwards.txt"
+    fi
+    echo "$PORT_FORWARD_FILE"
+}
+
+# Register a port forward for a container
+# Usage: register_port_forward <container_name> <host_port> <guest_port> [protocol]
+register_port_forward() {
+    local container_name="$1"
+    local host_port="$2"
+    local guest_port="$3"
+    local protocol="${4:-tcp}"
+
+    local pf_file=$(get_port_forward_file)
+    mkdir -p "$(dirname "$pf_file")"
+    echo "${container_name}:${host_port}:${guest_port}:${protocol}" >> "$pf_file"
+}
+
+# Unregister and remove port forwards for a container
+# Usage: unregister_port_forwards <container_name>
+unregister_port_forwards() {
+    local container_name="$1"
+    local pf_file=$(get_port_forward_file)
+
+    if [ ! -f "$pf_file" ]; then
+        return 0
+    fi
+
+    # Find and remove all port forwards for this container
+    local temp_file="${pf_file}.tmp"
+    while IFS=: read -r name host_port guest_port protocol; do
+        if [ "$name" = "$container_name" ]; then
+            qmp_remove_hostfwd "$host_port" "$protocol"
+        else
+            echo "${name}:${host_port}:${guest_port}:${protocol}"
+        fi
+    done < "$pf_file" > "$temp_file"
+    mv "$temp_file" "$pf_file"
+}
+
+# List all registered port forwards
+# Usage: list_port_forwards [container_name]
+list_port_forwards() {
+    local filter_name="$1"
+    local pf_file=$(get_port_forward_file)
+
+    if [ ! -f "$pf_file" ]; then
+        return 0
+    fi
+
+    while IFS=: read -r name host_port guest_port protocol; do
+        if [ -z "$filter_name" ] || [ "$name" = "$filter_name" ]; then
+            echo "0.0.0.0:${host_port}->${guest_port}/${protocol}"
+        fi
+    done < "$pf_file"
 }
 
 # Helper function to run command via daemon or regular mode
@@ -1166,12 +1313,37 @@ case "$COMMAND" in
 
     # Container lifecycle commands
     ps)
-        # List containers
+        # List containers and show port forwards if daemon is running
         run_runtime_command "$VCONTAINER_RUNTIME_CMD ps ${COMMAND_ARGS[*]}"
+        PS_EXIT=$?
+
+        # Show host port forwards if daemon is running and we have any
+        if daemon_is_running; then
+            local pf_file=$(get_port_forward_file)
+            if [ -f "$pf_file" ] && [ -s "$pf_file" ]; then
+                echo ""
+                echo -e "${CYAN}Host Port Forwards (QEMU):${NC}"
+                printf "  %-20s %-15s %-15s %-8s\n" "CONTAINER" "HOST PORT" "GUEST PORT" "PROTO"
+                while IFS=: read -r name host_port guest_port protocol; do
+                    printf "  %-20s %-15s %-15s %-8s\n" "$name" "0.0.0.0:$host_port" "$guest_port" "${protocol:-tcp}"
+                done < "$pf_file"
+            fi
+        fi
+        exit $PS_EXIT
         ;;
 
     rm)
-        # Remove containers
+        # Remove containers and cleanup any registered port forwards
+        for arg in "${COMMAND_ARGS[@]}"; do
+            # Skip flags like -f, --force, etc.
+            case "$arg" in
+                -*) continue ;;
+            esac
+            # This is a container name/id - clean up its port forwards
+            if daemon_is_running; then
+                unregister_port_forwards "$arg"
+            fi
+        done
         run_runtime_command "$VCONTAINER_RUNTIME_CMD rm ${COMMAND_ARGS[*]}"
         ;;
 
@@ -1185,9 +1357,21 @@ case "$COMMAND" in
         run_runtime_command "$VCONTAINER_RUNTIME_CMD inspect ${COMMAND_ARGS[*]}"
         ;;
 
-    start|stop|restart|kill|pause|unpause)
-        # Container state commands
+    start|restart|kill|pause|unpause)
+        # Container state commands (no special handling needed)
         run_runtime_command "$VCONTAINER_RUNTIME_CMD $COMMAND ${COMMAND_ARGS[*]}"
+        ;;
+
+    stop)
+        # Stop container and cleanup any registered port forwards
+        if [ ${#COMMAND_ARGS[@]} -ge 1 ]; then
+            STOP_CONTAINER_NAME="${COMMAND_ARGS[0]}"
+            # Remove port forwards for this container (if any)
+            if daemon_is_running; then
+                unregister_port_forwards "$STOP_CONTAINER_NAME"
+            fi
+        fi
+        run_runtime_command "$VCONTAINER_RUNTIME_CMD stop ${COMMAND_ARGS[*]}"
         ;;
 
     # Image commands
@@ -1335,7 +1519,7 @@ case "$COMMAND" in
 
     vconfig)
         # Configuration management (runs on host, not in VM)
-        VALID_KEYS="arch timeout state-dir verbose"
+        VALID_KEYS="arch timeout state-dir verbose idle-timeout auto-daemon"
 
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             # Show all config
@@ -1800,17 +1984,46 @@ case "$COMMAND" in
             exit 1
         fi
 
-        # Check if any volume mounts are present and if user specified --network
+        # Check if any volume mounts, network, port forwards, or detach are present
         RUN_HAS_VOLUMES=false
         RUN_HAS_NETWORK=false
+        RUN_HAS_PORT_FORWARDS=false
+        RUN_IS_DETACHED=false
+        RUN_CONTAINER_NAME=""
+        RUN_PORT_FORWARDS=()
+
+        # Parse COMMAND_ARGS to extract relevant flags
+        local i=0
+        local prev_arg=""
         for arg in "${COMMAND_ARGS[@]}"; do
-            if [ "$arg" = "-v" ] || [ "$arg" = "--volume" ]; then
-                RUN_HAS_VOLUMES=true
-            fi
-            # Check for explicit --network option (user override)
             case "$arg" in
-                --network=*|--net=*) RUN_HAS_NETWORK=true ;;
+                -v|--volume)
+                    RUN_HAS_VOLUMES=true
+                    ;;
+                --network=*|--net=*)
+                    RUN_HAS_NETWORK=true
+                    ;;
+                -p|--publish)
+                    RUN_HAS_PORT_FORWARDS=true
+                    ;;
+                -d|--detach)
+                    RUN_IS_DETACHED=true
+                    ;;
+                --name=*)
+                    RUN_CONTAINER_NAME="${arg#--name=}"
+                    ;;
             esac
+            # Check if previous arg was -p or --publish
+            if [ "$prev_arg" = "-p" ] || [ "$prev_arg" = "--publish" ]; then
+                # arg is the port specification (e.g., 8080:80)
+                RUN_PORT_FORWARDS+=("$arg")
+            fi
+            # Check if previous arg was --name
+            if [ "$prev_arg" = "--name" ]; then
+                RUN_CONTAINER_NAME="$arg"
+            fi
+            prev_arg="$arg"
+            i=$((i + 1))
         done
 
         # Volume mounts require daemon mode
@@ -1885,6 +2098,54 @@ case "$COMMAND" in
             fi
         else
             # Non-interactive - use daemon mode when available
+
+            # For detached containers with port forwards, add them dynamically via QMP
+            if [ "$RUN_IS_DETACHED" = "true" ] && [ "$RUN_HAS_PORT_FORWARDS" = "true" ] && daemon_is_running; then
+                # Generate container name if not provided (needed for port tracking)
+                if [ -z "$RUN_CONTAINER_NAME" ]; then
+                    # Generate a random name like docker does
+                    RUN_CONTAINER_NAME="$(cat /proc/sys/kernel/random/uuid | cut -c1-12)"
+                    # Update COMMAND_ARGS to include the generated name
+                    RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run --name=$RUN_CONTAINER_NAME $RUN_NETWORK_OPTS ${COMMAND_ARGS[*]}"
+                fi
+
+                # Add port forwards via QMP and register them
+                for port_spec in "${RUN_PORT_FORWARDS[@]}"; do
+                    # Parse port specification: [host_ip:]host_port:container_port[/protocol]
+                    # Examples: 8080:80, 127.0.0.1:8080:80, 8080:80/tcp, 8080:80/udp
+                    local spec="$port_spec"
+                    local protocol="tcp"
+                    local host_port=""
+                    local guest_port=""
+
+                    # Extract protocol if present
+                    if echo "$spec" | grep -q '/'; then
+                        protocol="${spec##*/}"
+                        spec="${spec%/*}"
+                    fi
+
+                    # Count colons to determine format
+                    local colon_count=$(echo "$spec" | tr -cd ':' | wc -c)
+                    if [ "$colon_count" -eq 2 ]; then
+                        # Format: host_ip:host_port:container_port (ignore host_ip for now)
+                        host_port=$(echo "$spec" | cut -d: -f2)
+                        guest_port=$(echo "$spec" | cut -d: -f3)
+                    else
+                        # Format: host_port:container_port
+                        host_port=$(echo "$spec" | cut -d: -f1)
+                        guest_port=$(echo "$spec" | cut -d: -f2)
+                    fi
+
+                    if [ -n "$host_port" ] && [ -n "$guest_port" ]; then
+                        if qmp_add_hostfwd "$host_port" "$guest_port" "$protocol"; then
+                            register_port_forward "$RUN_CONTAINER_NAME" "$host_port" "$guest_port" "$protocol"
+                        else
+                            echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} Warning: Could not add port forward ${host_port}:${guest_port}" >&2
+                        fi
+                    fi
+                done
+            fi
+
             run_runtime_command "$RUNTIME_CMD"
             RUN_EXIT=$?
 
@@ -1970,10 +2231,19 @@ case "$COMMAND" in
                 fi
                 ;;
             stop)
+                # Clear port forward registry when stopping daemon
+                local pf_file=$(get_port_forward_file)
+                if [ -f "$pf_file" ]; then
+                    rm -f "$pf_file"
+                fi
                 "$RUNNER" $RUNNER_ARGS --daemon-stop
                 ;;
             restart)
-                # Stop if running
+                # Stop if running and clear port forward registry
+                local pf_file=$(get_port_forward_file)
+                if [ -f "$pf_file" ]; then
+                    rm -f "$pf_file"
+                fi
                 "$RUNNER" $RUNNER_ARGS --daemon-stop 2>/dev/null || true
 
                 # Clean if --clean was passed
