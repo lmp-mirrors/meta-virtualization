@@ -92,9 +92,10 @@ start_dockerd() {
     log "Starting Docker daemon..."
     DOCKER_OPTS="--data-root=/var/lib/docker"
     DOCKER_OPTS="$DOCKER_OPTS --storage-driver=overlay2"
-    DOCKER_OPTS="$DOCKER_OPTS --iptables=false"
+    # Enable iptables for Docker bridge NAT and port forwarding
+    DOCKER_OPTS="$DOCKER_OPTS --iptables=true"
     DOCKER_OPTS="$DOCKER_OPTS --userland-proxy=false"
-    DOCKER_OPTS="$DOCKER_OPTS --bridge=none"
+    # Use default docker0 bridge (172.17.0.0/16) for container networking
     DOCKER_OPTS="$DOCKER_OPTS --host=unix:///var/run/docker.sock"
     DOCKER_OPTS="$DOCKER_OPTS --exec-opt native.cgroupdriver=cgroupfs"
     DOCKER_OPTS="$DOCKER_OPTS --log-level=info"
