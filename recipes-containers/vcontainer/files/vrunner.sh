@@ -1012,7 +1012,8 @@ if [ "$NETWORK" = "true" ]; then
     # Guest gets 10.0.2.15, gateway is 10.0.2.2, DNS is 10.0.2.3
     NETDEV_OPTS="user,id=net0"
 
-    # Add port forwards (hostfwd=tcp::host_port-:container_port)
+    # Add port forwards - QEMU forwards host:port -> VM:port
+    # Docker's iptables handles VM:port -> container:port
     for pf in "${PORT_FORWARDS[@]}"; do
         # Parse host_port:container_port or host_port:container_port/protocol
         HOST_PORT="${pf%%:*}"
@@ -1026,8 +1027,9 @@ if [ "$NETWORK" = "true" ]; then
             PROTOCOL="tcp"
         fi
 
-        NETDEV_OPTS="$NETDEV_OPTS,hostfwd=$PROTOCOL::$HOST_PORT-:$CONTAINER_PORT"
-        log "INFO" "Port forward: $HOST_PORT -> $CONTAINER_PORT ($PROTOCOL)"
+        # Forward to HOST_PORT on VM; Docker -p handles container port mapping
+        NETDEV_OPTS="$NETDEV_OPTS,hostfwd=$PROTOCOL::$HOST_PORT-:$HOST_PORT"
+        log "INFO" "Port forward: host:$HOST_PORT -> VM:$HOST_PORT (Docker maps to container:$CONTAINER_PORT)"
     done
 
     QEMU_OPTS="$QEMU_OPTS -netdev $NETDEV_OPTS -device virtio-net-pci,netdev=net0"
@@ -1097,8 +1099,9 @@ if [ "$DAEMON_MODE" = "start" ]; then
             else
                 PROTOCOL="tcp"
             fi
-            DAEMON_NETDEV="$DAEMON_NETDEV,hostfwd=$PROTOCOL::$HOST_PORT-:$CONTAINER_PORT"
-            log "INFO" "Port forward: $HOST_PORT -> $CONTAINER_PORT ($PROTOCOL)"
+            # Forward to HOST_PORT on VM; Docker -p handles container port mapping
+            DAEMON_NETDEV="$DAEMON_NETDEV,hostfwd=$PROTOCOL::$HOST_PORT-:$HOST_PORT"
+            log "INFO" "Port forward: host:$HOST_PORT -> VM:$HOST_PORT (Docker maps to container:$CONTAINER_PORT)"
         done
         QEMU_OPTS="$QEMU_OPTS -netdev $DAEMON_NETDEV -device virtio-net-pci,netdev=net0"
     else
