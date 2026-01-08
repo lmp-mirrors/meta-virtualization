@@ -122,7 +122,9 @@ OPTIONS:
     --network, -n        Enable networking (slirp user-mode, outbound only)
     --interactive, -it   Run in interactive mode (connects terminal to container)
     --timeout <secs>     QEMU timeout [default: 300]
+    --idle-timeout <s>   Daemon idle timeout in seconds [default: 1800]
     --no-kvm             Disable KVM acceleration (use TCG emulation)
+    --no-daemon          Placeholder for CLI wrapper (ignored by vrunner)
     --batch-import       Batch import mode: import multiple OCI containers in one session
     --keep-temp          Keep temporary files for debugging
     --verbose, -v        Enable verbose output
@@ -195,6 +197,7 @@ BATCH_IMPORT="false"
 # Daemon mode options
 DAEMON_MODE=""          # start, send, stop, status
 DAEMON_SOCKET_DIR=""    # Directory for daemon socket/PID files
+IDLE_TIMEOUT="1800"     # Default: 30 minutes
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -292,6 +295,15 @@ while [ $# -gt 0 ]; do
         --daemon-socket-dir)
             DAEMON_SOCKET_DIR="$2"
             shift 2
+            ;;
+        --idle-timeout)
+            IDLE_TIMEOUT="$2"
+            shift 2
+            ;;
+        --no-daemon)
+            # Placeholder for CLI wrapper - vrunner.sh itself doesn't use this
+            # but we accept it so callers can pass it through
+            shift
             ;;
         --verbose|-v)
             VERBOSE="true"
@@ -1061,8 +1073,9 @@ if [ "$DAEMON_MODE" = "start" ]; then
     QEMU_OPTS="$QEMU_OPTS -device virtio-serial-pci"
     QEMU_OPTS="$QEMU_OPTS -device virtserialport,chardev=vdkr,name=vdkr"
 
-    # Tell init script to run in daemon mode
+    # Tell init script to run in daemon mode with idle timeout
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_daemon=1"
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_idle_timeout=$IDLE_TIMEOUT"
 
     # Always enable networking for daemon mode
     if [ "$NETWORK" != "true" ]; then

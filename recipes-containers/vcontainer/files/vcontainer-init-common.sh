@@ -106,6 +106,7 @@ parse_cmdline() {
     RUNTIME_NETWORK="0"
     RUNTIME_INTERACTIVE="0"
     RUNTIME_DAEMON="0"
+    RUNTIME_IDLE_TIMEOUT="1800"  # Default: 30 minutes
 
     for param in $(cat /proc/cmdline); do
         case "$param" in
@@ -129,6 +130,9 @@ parse_cmdline() {
                 ;;
             ${VCONTAINER_RUNTIME_PREFIX}_daemon=*)
                 RUNTIME_DAEMON="${param#${VCONTAINER_RUNTIME_PREFIX}_daemon=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_idle_timeout=*)
+                RUNTIME_IDLE_TIMEOUT="${param#${VCONTAINER_RUNTIME_PREFIX}_idle_timeout=}"
                 ;;
         esac
     done
@@ -284,6 +288,7 @@ DNSEOF
 
 run_daemon_mode() {
     log "=== Daemon Mode ==="
+    log "Idle timeout: ${RUNTIME_IDLE_TIMEOUT}s"
 
     # Find the virtio-serial port for command channel
     DAEMON_PORT=""
@@ -321,10 +326,10 @@ run_daemon_mode() {
 
     log "Daemon ready, waiting for commands..."
 
-    # Command loop
+    # Command loop with idle timeout
     while true; do
         CMD_B64=""
-        if read -r CMD_B64 <&3; then
+        if read -t "$RUNTIME_IDLE_TIMEOUT" -r CMD_B64 <&3; then
             log "Received: '$CMD_B64'"
             # Handle special commands
             case "$CMD_B64" in
@@ -414,7 +419,15 @@ run_daemon_mode() {
 
             log "Command completed (exit code: $EXEC_EXIT_CODE)"
         else
-            sleep 1
+            # Read returned non-zero: either timeout or error
+            if [ -z "$CMD_B64" ]; then
+                # Timeout expired with no data - shut down
+                log "Idle timeout (${RUNTIME_IDLE_TIMEOUT}s), shutting down..."
+                echo "===IDLE_SHUTDOWN===" | cat >&3
+                break
+            fi
+            # Empty line or other issue - just continue
+            sleep 0.1
         fi
     done
 
