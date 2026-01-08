@@ -97,7 +97,7 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 
 # Ports used by tests that need to be free
-TEST_PORTS = [8080, 8081, 8888, 8001, 8002, 9999, 7777, 6666]
+TEST_PORTS = [8080, 8081, 8082, 8888, 8001, 8002, 9999, 7777, 6666]
 
 
 def _cleanup_orphan_qemu_on_ports():
