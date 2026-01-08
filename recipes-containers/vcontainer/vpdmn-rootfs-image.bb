@@ -9,8 +9,8 @@
 # to provide a proper rootfs for running Podman in QEMU.
 #
 # Build with:
-#   bitbake mc:vpdmn-aarch64:vpdmn-rootfs-image
-#   bitbake mc:vpdmn-x86-64:vpdmn-rootfs-image
+#   bitbake mc:vruntime-aarch64:vpdmn-rootfs-image
+#   bitbake mc:vruntime-x86-64:vpdmn-rootfs-image
 
 SUMMARY = "Minimal Podman rootfs for vpdmn"
 DESCRIPTION = "A minimal image containing Podman tools for use with vpdmn. \
