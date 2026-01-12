@@ -112,6 +112,8 @@ python do_generate_registry_script() {
     registry_url = d.getVar('CONTAINER_REGISTRY_URL')
     registry_namespace = d.getVar('CONTAINER_REGISTRY_NAMESPACE')
     registry_storage = d.getVar('CONTAINER_REGISTRY_STORAGE')
+    tag_strategy = d.getVar('CONTAINER_REGISTRY_TAG_STRATEGY') or 'latest'
+    target_arch = d.getVar('TARGET_ARCH') or ''
 
     os.makedirs(deploy_dir, exist_ok=True)
 
@@ -122,14 +124,19 @@ python do_generate_registry_script() {
 # This script has all paths pre-configured for your build.
 #
 # Usage:
-#   {script_path} start                # Start registry server
-#   {script_path} stop                 # Stop registry server
-#   {script_path} status               # Check if running
-#   {script_path} push                 # Push OCI images to registry
-#   {script_path} import <image>       # Import 3rd party image
-#   {script_path} list                 # List all images with tags
-#   {script_path} tags <image>         # List tags for an image
-#   {script_path} catalog              # List image names (raw API)
+#   {script_path} start                     # Start registry server
+#   {script_path} stop                      # Stop registry server
+#   {script_path} status                    # Check if running
+#   {script_path} push [options]            # Push OCI images to registry
+#   {script_path} import <image>            # Import 3rd party image
+#   {script_path} list                      # List all images with tags
+#   {script_path} tags <image>              # List tags for an image
+#   {script_path} catalog                   # List image names (raw API)
+#
+# Push options:
+#   --tag <tag>           Explicit tag (can be repeated)
+#   --strategy <strats>   Tag strategy: timestamp, sha, branch, semver, latest, arch
+#   --version <ver>       Version for semver strategy (e.g., 1.2.3)
 
 set -e
 
@@ -142,8 +149,76 @@ REGISTRY_URL="{registry_url}"
 REGISTRY_NAMESPACE="{registry_namespace}"
 DEPLOY_DIR_IMAGE="{deploy_dir_image}"
 
+# Baked-in defaults from bitbake (can be overridden by CLI or env vars)
+DEFAULT_TAG_STRATEGY="{tag_strategy}"
+DEFAULT_TARGET_ARCH="{target_arch}"
+
 PID_FILE="/tmp/container-registry.pid"
 LOG_FILE="/tmp/container-registry.log"
+
+# Generate tags based on strategy
+# Usage: generate_tags "strategy1 strategy2 ..."
+# Strategies: timestamp, sha/git, branch, semver, version, latest, arch
+generate_tags() {{
+    local strategy="${{1:-latest}}"
+    local version="${{IMAGE_VERSION:-}}"
+    local arch="${{TARGET_ARCH:-$DEFAULT_TARGET_ARCH}}"
+    local tags=""
+
+    for strat in $strategy; do
+        case "$strat" in
+            timestamp)
+                tags="$tags $(date +%Y%m%d-%H%M%S)"
+                ;;
+            sha|git)
+                local sha=$(git rev-parse --short HEAD 2>/dev/null || true)
+                [ -n "$sha" ] && tags="$tags $sha"
+                ;;
+            branch)
+                local branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+                if [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+                    # Sanitize: feature/login -> feature-login
+                    tags="$tags $(echo $branch | tr '/_' '--')"
+                fi
+                ;;
+            semver)
+                if [ -n "$version" ]; then
+                    local v="$version"
+                    # Strip any suffix like +gitAUTOINC
+                    v=$(echo "$v" | cut -d'+' -f1)
+                    local major=$(echo "$v" | cut -d. -f1)
+                    local minor=$(echo "$v" | cut -d. -f2)
+                    local patch=$(echo "$v" | cut -d. -f3)
+                    [ -n "$patch" ] && tags="$tags $major.$minor.$patch"
+                    [ -n "$minor" ] && tags="$tags $major.$minor"
+                    [ -n "$major" ] && [ "$major" != "$v" ] && tags="$tags $major"
+                fi
+                ;;
+            version)
+                if [ -n "$version" ]; then
+                    local v=$(echo "$version" | cut -d'+' -f1)
+                    tags="$tags $v"
+                fi
+                ;;
+            latest)
+                tags="$tags latest"
+                ;;
+            arch)
+                if [ -n "$arch" ]; then
+                    local arch_tags=""
+                    for t in $tags; do
+                        [ "$t" != "latest" ] && arch_tags="$arch_tags ${{t}}-${{arch}}"
+                    done
+                    tags="$tags $arch_tags"
+                fi
+                ;;
+        esac
+    done
+
+    # Ensure at least one tag
+    [ -z "$tags" ] && tags="latest"
+    echo $tags
+}}
 
 cmd_start() {{
     if [ -f "$PID_FILE" ] && kill -0 "$(cat $PID_FILE)" 2>/dev/null; then
@@ -213,14 +288,53 @@ cmd_status() {{
 }}
 
 cmd_push() {{
+    shift  # Remove 'push' from args
+
+    # Parse options
+    local explicit_tags=""
+    local strategy="${{CONTAINER_REGISTRY_TAG_STRATEGY:-$DEFAULT_TAG_STRATEGY}}"
+    local version="${{IMAGE_VERSION:-}}"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tag|-t)
+                explicit_tags="$explicit_tags $2"
+                shift 2
+                ;;
+            --strategy|-s)
+                strategy="$2"
+                shift 2
+                ;;
+            --version|-v)
+                version="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Export version for generate_tags
+    export IMAGE_VERSION="$version"
+
     if ! curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
         echo "Registry not responding at http://$REGISTRY_URL"
         echo "Start it first: $0 start"
         return 1
     fi
 
+    # Determine tags to use
+    local tags
+    if [ -n "$explicit_tags" ]; then
+        tags="$explicit_tags"
+    else
+        tags=$(generate_tags "$strategy")
+    fi
+
     echo "Pushing OCI images from $DEPLOY_DIR_IMAGE"
     echo "To registry: $REGISTRY_URL/$REGISTRY_NAMESPACE/"
+    echo "Tags: $tags"
     echo ""
 
     for oci_dir in "$DEPLOY_DIR_IMAGE"/*-oci; do
@@ -234,9 +348,12 @@ cmd_push() {{
         name=$(echo "$name" | sed 's/\\.rootfs-[0-9]*//')
 
         echo "Pushing: $name"
-        "$SKOPEO_BIN" copy --dest-tls-verify=false \\
-            "oci:$oci_dir" \\
-            "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:latest"
+        for tag in $tags; do
+            echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
+            "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+                "oci:$oci_dir" \\
+                "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
+        done
     done
 
     echo ""
@@ -365,39 +482,64 @@ cmd_import() {{
 }}
 
 cmd_help() {{
-    echo "Usage: $0 <command>"
+    echo "Usage: $0 <command> [options]"
     echo ""
     echo "Commands:"
     echo "  start                  Start the container registry server"
     echo "  stop                   Stop the container registry server"
     echo "  status                 Check if registry is running"
-    echo "  push                   Push all OCI images to registry"
+    echo "  push [options]         Push all OCI images to registry"
     echo "  import <image> [name]  Import 3rd party image to registry"
     echo "  list                   List all images with tags"
     echo "  tags <image>           List tags for an image"
     echo "  catalog                List image names (raw API)"
     echo "  help                   Show this help"
     echo ""
+    echo "Push options:"
+    echo "  --tag, -t <tag>        Explicit tag (can be repeated for multiple tags)"
+    echo "  --strategy, -s <str>   Tag strategy (default: $DEFAULT_TAG_STRATEGY)"
+    echo "  --version, -v <ver>    Version for semver strategy (e.g., 1.2.3)"
+    echo ""
+    echo "Tag strategies (can combine: 'sha branch latest'):"
+    echo "  timestamp              YYYYMMDD-HHMMSS format"
+    echo "  sha, git               Short git commit hash"
+    echo "  branch                 Git branch name (sanitized)"
+    echo "  semver                 Nested SemVer (1.2.3 -> 1.2.3, 1.2, 1)"
+    echo "  version                Single version tag from --version"
+    echo "  latest                 The 'latest' tag"
+    echo "  arch                   Append architecture suffix to other tags"
+    echo ""
     echo "Examples:"
     echo "  $0 start"
-    echo "  $0 push"
+    echo "  $0 push                                    # Uses default strategy"
+    echo "  $0 push --tag v1.0.0                       # Explicit tag"
+    echo "  $0 push --tag latest --tag v1.0.0         # Multiple tags"
+    echo "  $0 push --strategy 'sha branch latest'    # Strategy-based"
+    echo "  $0 push --strategy semver --version 1.2.3 # SemVer tags"
     echo "  $0 import docker.io/library/alpine:latest"
     echo "  $0 import docker.io/library/busybox:latest my-busybox"
     echo "  $0 list"
     echo "  $0 tags container-base"
     echo ""
-    echo "Configuration:"
-    echo "  Registry URL:  $REGISTRY_URL"
-    echo "  Namespace:     $REGISTRY_NAMESPACE"
-    echo "  Storage:       $REGISTRY_STORAGE"
-    echo "  Deploy images: $DEPLOY_DIR_IMAGE"
+    echo "Environment variables:"
+    echo "  CONTAINER_REGISTRY_TAG_STRATEGY   Override default tag strategy"
+    echo "  IMAGE_VERSION                     Version for semver/version strategies"
+    echo "  TARGET_ARCH                       Architecture for arch strategy"
+    echo ""
+    echo "Configuration (baked from bitbake):"
+    echo "  Registry URL:   $REGISTRY_URL"
+    echo "  Namespace:      $REGISTRY_NAMESPACE"
+    echo "  Tag strategy:   $DEFAULT_TAG_STRATEGY"
+    echo "  Target arch:    $DEFAULT_TARGET_ARCH"
+    echo "  Storage:        $REGISTRY_STORAGE"
+    echo "  Deploy images:  $DEPLOY_DIR_IMAGE"
 }}
 
 case "${{1:-help}}" in
     start)   cmd_start ;;
     stop)    cmd_stop ;;
     status)  cmd_status ;;
-    push)    cmd_push ;;
+    push)    cmd_push "$@" ;;
     import)  cmd_import "$@" ;;
     list)    cmd_list ;;
     tags)    cmd_tags "$@" ;;

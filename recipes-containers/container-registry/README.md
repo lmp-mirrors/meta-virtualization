@@ -34,11 +34,60 @@ Script location: `${TOPDIR}/container-registry/container-registry.sh` (outside t
 | `start` | Start the container registry server |
 | `stop` | Stop the container registry server |
 | `status` | Check if registry is running |
-| `push` | Push all OCI images from deploy/ to registry |
+| `push [options]` | Push all OCI images from deploy/ to registry |
 | `import <image> [name]` | Import 3rd party image to registry |
 | `list` | List all images with their tags |
 | `tags <image>` | List tags for a specific image |
 | `catalog` | Raw API catalog output |
+
+### Push Options
+
+```bash
+# Explicit tags
+container-registry.sh push --tag v1.0.0
+container-registry.sh push --tag latest --tag v1.0.0
+
+# Strategy-based (see Tag Strategies below)
+container-registry.sh push --strategy "sha branch latest"
+container-registry.sh push --strategy semver --version 1.2.3
+
+# Environment variable override
+CONTAINER_REGISTRY_TAG_STRATEGY="sha latest" container-registry.sh push
+```
+
+## Tag Strategies
+
+Configure tag generation via `CONTAINER_REGISTRY_TAG_STRATEGY` (space-separated):
+
+| Strategy | Output | Description |
+|----------|--------|-------------|
+| `timestamp` | `20260112-143022` | Build timestamp |
+| `sha` / `git` | `8a3f2b1` | Short git commit hash |
+| `branch` | `main`, `feature-login` | Git branch name (sanitized) |
+| `semver` | `1.2.3`, `1.2`, `1` | Nested SemVer from PV |
+| `version` | `1.2.3` | Single version tag |
+| `latest` | `latest` | The "latest" tag |
+| `arch` | `*-x86_64` | Append architecture suffix |
+
+### Example Workflows
+
+**Development builds** (track code changes):
+```bitbake
+CONTAINER_REGISTRY_TAG_STRATEGY = "sha branch latest"
+```
+Result: `my-app:8a3f2b1`, `my-app:feature-login`, `my-app:latest`
+
+**Release builds** (semantic versioning):
+```bitbake
+CONTAINER_REGISTRY_TAG_STRATEGY = "semver latest"
+PV = "1.2.3"
+```
+Result: `my-app:1.2.3`, `my-app:1.2`, `my-app:1`, `my-app:latest`
+
+**CI/CD** (traceability):
+```bash
+IMAGE_VERSION=1.2.3 container-registry.sh push --strategy "semver sha latest"
+```
 
 ## Configuration (local.conf)
 
@@ -51,6 +100,9 @@ CONTAINER_REGISTRY_NAMESPACE = "yocto"
 
 # Mark as insecure (HTTP)
 CONTAINER_REGISTRY_INSECURE = "1"
+
+# Tag strategy (default: "timestamp latest")
+CONTAINER_REGISTRY_TAG_STRATEGY = "sha branch latest"
 
 # For Docker targets
 DOCKER_REGISTRY_INSECURE = "localhost:5000"
