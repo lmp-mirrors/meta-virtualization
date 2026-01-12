@@ -22,16 +22,18 @@
 #
 # IMPORTANT: This recipe:
 #   - Does NOT modify docker-distribution or container-host-config
-#   - Does NOT install automatically - user must add to IMAGE_INSTALL
 #   - Does NOT clobber public registry access (docker.io, quay.io, etc.)
 #   - Uses drop-in files in /etc/containers/registries.conf.d/
 #   - Skips entirely if CONTAINER_REGISTRY_URL is not set
 #
 # Usage:
-#   # In local.conf or image recipe - BOTH required:
+#   # In local.conf or image recipe:
 #   CONTAINER_REGISTRY_URL = "localhost:5000"
 #   CONTAINER_REGISTRY_INSECURE = "1"
-#   IMAGE_INSTALL:append = " container-oci-registry-config"
+#   IMAGE_FEATURES += "container-registry"
+#
+#   The IMAGE_FEATURES mechanism auto-selects this recipe for Podman/CRI-O
+#   or docker-registry-config for Docker based on VIRTUAL-RUNTIME_container_engine.
 #
 # ===========================================================================
 

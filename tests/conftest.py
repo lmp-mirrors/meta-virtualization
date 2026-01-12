@@ -226,6 +226,25 @@ def pytest_addoption(parser):
         default=24.0,
         help="Max rootfs age in hours before warning (default: 24)",
     )
+    # Container registry options
+    parser.addoption(
+        "--registry-url",
+        action="store",
+        default=os.environ.get("TEST_REGISTRY_URL"),
+        help="Registry URL for vdkr registry tests (e.g., 10.0.2.2:5000/yocto)",
+    )
+    parser.addoption(
+        "--registry-script",
+        action="store",
+        default=os.environ.get("CONTAINER_REGISTRY_SCRIPT"),
+        help="Path to container-registry.sh script",
+    )
+    parser.addoption(
+        "--skip-registry-network",
+        action="store_true",
+        default=False,
+        help="Skip registry tests that require network access to docker.io",
+    )
 
 
 def _cleanup_stale_test_state():
