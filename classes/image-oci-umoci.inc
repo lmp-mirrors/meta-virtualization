@@ -15,6 +15,37 @@ IMAGE_CMD:oci() {
     bbdebug 1 "  env vars: ${OCI_IMAGE_ENV_VARS}"
     bbdebug 1 "  ports: ${OCI_IMAGE_PORTS}"
 
+    # Auto-generate OCI standard labels at task time (not parse time)
+    OCI_AUTO_LABELS=""
+    if [ "${OCI_IMAGE_AUTO_LABELS}" = "1" ]; then
+        # Git revision
+        if [ -n "${OCI_IMAGE_REVISION}" ] && [ "${OCI_IMAGE_REVISION}" != "none" ]; then
+            OCI_AUTO_LABELS="$OCI_AUTO_LABELS org.opencontainers.image.revision=${OCI_IMAGE_REVISION}"
+        elif [ "${OCI_IMAGE_REVISION}" != "none" ]; then
+            _rev=$(cd ${TOPDIR} && git rev-parse --short HEAD 2>/dev/null || true)
+            [ -n "$_rev" ] && OCI_AUTO_LABELS="$OCI_AUTO_LABELS org.opencontainers.image.revision=$_rev"
+        fi
+
+        # Git branch
+        if [ -n "${OCI_IMAGE_BRANCH}" ] && [ "${OCI_IMAGE_BRANCH}" != "none" ]; then
+            OCI_AUTO_LABELS="$OCI_AUTO_LABELS org.opencontainers.image.ref.name=${OCI_IMAGE_BRANCH}"
+        elif [ "${OCI_IMAGE_BRANCH}" != "none" ]; then
+            _branch=$(cd ${TOPDIR} && git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+            [ -n "$_branch" ] && [ "$_branch" != "HEAD" ] && \
+                OCI_AUTO_LABELS="$OCI_AUTO_LABELS org.opencontainers.image.ref.name=$_branch"
+        fi
+
+        # Build date (ISO 8601)
+        if [ -n "${OCI_IMAGE_BUILD_DATE}" ] && [ "${OCI_IMAGE_BUILD_DATE}" != "none" ]; then
+            OCI_AUTO_LABELS="$OCI_AUTO_LABELS org.opencontainers.image.created=${OCI_IMAGE_BUILD_DATE}"
+        elif [ "${OCI_IMAGE_BUILD_DATE}" != "none" ]; then
+            _date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            OCI_AUTO_LABELS="$OCI_AUTO_LABELS org.opencontainers.image.created=$_date"
+        fi
+
+        bbdebug 1 "  auto-labels: $OCI_AUTO_LABELS"
+    fi
+
     OCI_REUSE_IMAGE=""
 
     # Change into the image deploy dir to avoid having any output operations capture
@@ -58,6 +89,13 @@ IMAGE_CMD:oci() {
     bbdebug 1 "OCI: configuring image"
     if [ -n "${OCI_IMAGE_LABELS}" ]; then
 	for l in ${OCI_IMAGE_LABELS}; do
+	    bbdebug 1 "OCI: umoci config --image $image_name:${OCI_IMAGE_TAG} --config.label \"$l\""
+	    umoci config --image $image_name:${OCI_IMAGE_TAG} --config.label "$l"
+	done
+    fi
+    # Apply auto-generated OCI standard labels
+    if [ -n "$OCI_AUTO_LABELS" ]; then
+	for l in $OCI_AUTO_LABELS; do
 	    bbdebug 1 "OCI: umoci config --image $image_name:${OCI_IMAGE_TAG} --config.label \"$l\""
 	    umoci config --image $image_name:${OCI_IMAGE_TAG} --config.label "$l"
 	done

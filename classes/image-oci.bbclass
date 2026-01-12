@@ -65,10 +65,52 @@ OCI_IMAGE_STOPSIGNAL ?= ""
 #     format: <port>/tcp, <port>/udp, or <port> (same as <port>/tcp).
 OCI_IMAGE_PORTS ?= ""
 
-# key=value list of labels
+# key=value list of labels (user-defined)
 OCI_IMAGE_LABELS ?= ""
 # key=value list of environment variables
 OCI_IMAGE_ENV_VARS ?= ""
+
+# =============================================================================
+# Build-time metadata for traceability
+# =============================================================================
+#
+# These variables embed source info into OCI image labels for traceability.
+# Standard OCI annotations are used: https://github.com/opencontainers/image-spec/blob/main/annotations.md
+#
+# OCI_IMAGE_APP_RECIPE: Recipe name for the "main application" in the container.
+#   If set, future versions may auto-extract SRCREV/branch from this recipe.
+#   For now, it's documentation and a hook point.
+#
+# OCI_IMAGE_REVISION: Git commit SHA (short or full).
+#   - If set: uses this value
+#   - If empty: auto-detects from TOPDIR git repo
+#   - Set to "none" to disable
+#
+# OCI_IMAGE_BRANCH: Git branch name.
+#   - If set: uses this value
+#   - If empty: auto-detects from TOPDIR git repo
+#   - Set to "none" to disable
+#
+# OCI_IMAGE_BUILD_DATE: ISO 8601 timestamp.
+#   - Auto-generated at build time
+#
+# These become standard OCI labels:
+#   org.opencontainers.image.revision = OCI_IMAGE_REVISION
+#   org.opencontainers.image.ref.name = OCI_IMAGE_BRANCH
+#   org.opencontainers.image.created = OCI_IMAGE_BUILD_DATE
+#   org.opencontainers.image.version = PV (if meaningful)
+
+# Application recipe for traceability (documentation/future use)
+OCI_IMAGE_APP_RECIPE ?= ""
+
+# Explicit overrides - if set, these are used instead of auto-detection
+# Set to "none" to disable a specific label
+OCI_IMAGE_REVISION ?= ""
+OCI_IMAGE_BRANCH ?= ""
+OCI_IMAGE_BUILD_DATE ?= ""
+
+# Enable/disable auto-detection of git metadata (set to "0" to disable)
+OCI_IMAGE_AUTO_LABELS ?= "1"
 
 # whether the oci image dir should be left as a directory, or
 # bundled into a tarball.
