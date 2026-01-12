@@ -134,6 +134,7 @@ config_default() {
         verbose)      echo "false" ;;
         idle-timeout) echo "1800" ;;   # 30 minutes
         auto-daemon)  echo "true" ;;   # Auto-start daemon by default
+        registry)     echo "" ;;       # Default registry for unqualified images
         *)            echo "" ;;
     esac
 }
@@ -404,11 +405,12 @@ ${BOLD}CONFIGURATION (vconfig):${NC}
     ${CYAN}vconfig${NC} <key> <value>        Set configuration value
     ${CYAN}vconfig${NC} <key> --reset        Reset to default value
 
-    Supported keys: arch, timeout, state-dir, verbose, idle-timeout, auto-daemon
+    Supported keys: arch, timeout, state-dir, verbose, idle-timeout, auto-daemon, registry
     Config file: \$CONFIG_DIR/config (default: ~/.config/${VCONTAINER_RUNTIME_NAME}/config)
 
     idle-timeout: Daemon idle timeout in seconds [default: 1800]
     auto-daemon:  Auto-start daemon on first command [default: true]
+    registry:     Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
 
 ${BOLD}GLOBAL OPTIONS:${NC}
     --arch, -a <arch>     Target architecture: x86_64 or aarch64 [default: ${DEFAULT_ARCH}]
@@ -421,6 +423,8 @@ ${BOLD}GLOBAL OPTIONS:${NC}
     --input-storage <tar> Load ${RUNTIME_UPPER} state from tar before command
     --no-kvm              Disable KVM acceleration (use TCG emulation)
     --no-daemon           Run in ephemeral mode (don't auto-start/use daemon)
+    --registry <url>      Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
+    --insecure-registry <host:port>  Mark registry as insecure (HTTP). Can repeat.
     --verbose, -v         Enable verbose output
     --help, -h            Show this help
 
@@ -466,6 +470,13 @@ ${BOLD}EXAMPLES:${NC}
 
     # Pull an image from a registry
     ${PROG_NAME} pull alpine:latest
+
+    # Pull from local registry (configure once, use everywhere)
+    ${PROG_NAME} vconfig registry 10.0.2.2:5000/yocto    # Set default registry
+    ${PROG_NAME} pull container-base                     # Pulls from 10.0.2.2:5000/yocto/container-base
+
+    # Or use --registry for one-off pulls
+    ${PROG_NAME} --registry 10.0.2.2:5000/yocto pull container-base
 
     # vrun: convenience wrapper (clears entrypoint when command given)
     ${PROG_NAME} vrun myapp:latest /bin/ls -la  # Runs /bin/ls directly, not via entrypoint
@@ -538,6 +549,12 @@ build_runner_args() {
         args+=("--port-forward" "$pf")
     done
 
+    # Add registry configuration
+    [ -n "$REGISTRY" ] && args+=("--registry" "$REGISTRY")
+    for reg in "${INSECURE_REGISTRIES[@]}"; do
+        args+=("--insecure-registry" "$reg")
+    done
+
     echo "${args[@]}"
 }
 
@@ -551,6 +568,8 @@ INTERACTIVE="false"
 PORT_FORWARDS=()
 DISABLE_KVM="false"
 NO_DAEMON="false"
+REGISTRY=""
+INSECURE_REGISTRIES=()
 COMMAND=""
 COMMAND_ARGS=()
 
@@ -610,6 +629,14 @@ while [ $# -gt 0 ]; do
         --no-daemon)
             NO_DAEMON="true"
             shift
+            ;;
+        --registry)
+            REGISTRY="$2"
+            shift 2
+            ;;
+        --insecure-registry)
+            INSECURE_REGISTRIES+=("$2")
+            shift 2
             ;;
         -it|--interactive)
             INTERACTIVE="true"
@@ -681,6 +708,11 @@ fi
 # Set up state directory (default to persistent unless --stateless)
 if [ "$STATELESS" != "true" ] && [ -z "$STATE_DIR" ] && [ -z "$INPUT_STORAGE" ]; then
     STATE_DIR="$DEFAULT_STATE_DIR/$TARGET_ARCH"
+fi
+
+# Read registry from config if not set via CLI
+if [ -z "$REGISTRY" ]; then
+    REGISTRY=$(config_get "registry" "")
 fi
 
 # Check runner exists
@@ -1122,6 +1154,65 @@ parse_and_prepare_volumes() {
 
 # Handle commands
 case "$COMMAND" in
+    image)
+        # Handle "docker image *" compound commands
+        # docker image ls → docker images
+        # docker image rm → docker rmi
+        # docker image pull → docker pull
+        # etc.
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} image requires a subcommand (ls, rm, pull, inspect, tag, push, prune)" >&2
+            exit 1
+        fi
+        SUBCMD="${COMMAND_ARGS[0]}"
+        SUBCMD_ARGS=("${COMMAND_ARGS[@]:1}")
+        case "$SUBCMD" in
+            ls|list)
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD images ${SUBCMD_ARGS[*]}"
+                ;;
+            rm|remove)
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD rmi ${SUBCMD_ARGS[*]}"
+                ;;
+            pull)
+                # Reuse pull logic - set COMMAND_ARGS and fall through
+                COMMAND_ARGS=("${SUBCMD_ARGS[@]}")
+                if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+                    echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} image pull requires <image>" >&2
+                    exit 1
+                fi
+                IMAGE_NAME="${COMMAND_ARGS[0]}"
+                if daemon_is_running; then
+                    run_runtime_command "$VCONTAINER_RUNTIME_CMD pull $IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
+                else
+                    NETWORK="true"
+                    RUNNER_ARGS=$(build_runner_args)
+                    "$RUNNER" $RUNNER_ARGS -- "$VCONTAINER_RUNTIME_CMD pull $IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
+                fi
+                ;;
+            inspect)
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD inspect ${SUBCMD_ARGS[*]}"
+                ;;
+            tag)
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD tag ${SUBCMD_ARGS[*]}"
+                ;;
+            push)
+                NETWORK="true"
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD push ${SUBCMD_ARGS[*]}"
+                ;;
+            prune)
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD image prune ${SUBCMD_ARGS[*]}"
+                ;;
+            history)
+                run_runtime_command "$VCONTAINER_RUNTIME_CMD history ${SUBCMD_ARGS[*]}"
+                ;;
+            *)
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Unknown image subcommand: $SUBCMD" >&2
+                echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} Valid subcommands: ls, rm, pull, inspect, tag, push, prune, history" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+
     images)
         # runtime images
         run_runtime_command "$VCONTAINER_RUNTIME_CMD images ${COMMAND_ARGS[*]}"
@@ -1542,7 +1633,7 @@ case "$COMMAND" in
 
     vconfig)
         # Configuration management (runs on host, not in VM)
-        VALID_KEYS="arch timeout state-dir verbose idle-timeout auto-daemon"
+        VALID_KEYS="arch timeout state-dir verbose idle-timeout auto-daemon registry"
 
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             # Show all config

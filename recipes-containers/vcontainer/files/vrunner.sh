@@ -120,6 +120,8 @@ OPTIONS:
     --output <path>      Output file for tar/storage output types
     --blob-dir <path>    Directory containing kernel/initramfs blobs
     --network, -n        Enable networking (slirp user-mode, outbound only)
+    --registry <url>     Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
+    --insecure-registry <host:port>  Mark registry as insecure (HTTP). Can repeat.
     --interactive, -it   Run in interactive mode (connects terminal to container)
     --timeout <secs>     QEMU timeout [default: 300]
     --idle-timeout <s>   Daemon idle timeout in seconds [default: 1800]
@@ -166,6 +168,11 @@ EXAMPLES:
     # Pull an image from a registry (requires --network)
     vrunner.sh --network -- docker pull alpine:latest
 
+    # Pull from local registry using default registry prefix
+    vrunner.sh --network --registry 10.0.2.2:5000/yocto \
+        -- docker pull container-base
+    # This becomes: docker pull 10.0.2.2:5000/yocto/container-base
+
     # Batch import multiple OCI containers in one session
     vrunner.sh --batch-import --output storage.tar \
         -- /path/to/app-oci:myapp:latest /path/to/db-oci:mydb:v1.0
@@ -190,6 +197,10 @@ KEEP_TEMP="false"
 DISABLE_KVM="false"
 DOCKER_CMD=""
 PORT_FORWARDS=()
+
+# Registry configuration
+DOCKER_REGISTRY=""
+INSECURE_REGISTRIES=()
 
 # Batch import mode
 BATCH_IMPORT="false"
@@ -248,6 +259,16 @@ while [ $# -gt 0 ]; do
         --port-forward)
             # Format: host_port:container_port or host_port:container_port/protocol
             PORT_FORWARDS+=("$2")
+            shift 2
+            ;;
+        --registry)
+            # Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
+            DOCKER_REGISTRY="$2"
+            shift 2
+            ;;
+        --insecure-registry)
+            # Mark a registry as insecure (HTTP)
+            INSECURE_REGISTRIES+=("$2")
             shift 2
             ;;
         --interactive|-it)
@@ -983,6 +1004,16 @@ fi
 if [ "$NETWORK" = "true" ]; then
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_network=1"
 fi
+
+# Registry configuration for unqualified image names
+if [ -n "$DOCKER_REGISTRY" ]; then
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_registry=$DOCKER_REGISTRY"
+fi
+
+# Insecure registries (HTTP)
+for reg in "${INSECURE_REGISTRIES[@]}"; do
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_insecure_registry=$reg"
+done
 
 # Tell init script if interactive mode
 if [ "$INTERACTIVE" = "true" ]; then
