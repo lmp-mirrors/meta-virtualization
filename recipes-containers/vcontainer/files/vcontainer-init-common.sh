@@ -380,6 +380,25 @@ run_daemon_mode() {
                 log "Command needs input from shared directory"
             fi
 
+            # Check if this is a pull command that needs fallback handling
+            # (try registry first, fall back to Docker Hub)
+            USE_PULL_FALLBACK=false
+            if type is_pull_command >/dev/null 2>&1 && type execute_pull_with_fallback >/dev/null 2>&1; then
+                if is_pull_command "$CMD"; then
+                    USE_PULL_FALLBACK=true
+                    log "Using pull with registry fallback"
+                fi
+            fi
+
+            # Transform command if runtime provides a transform function
+            # (e.g., vdkr transforms unqualified images to use default registry)
+            # Note: Pull commands are NOT transformed - they use fallback logic
+            if [ "$USE_PULL_FALLBACK" != "true" ]; then
+                if type transform_docker_command >/dev/null 2>&1 && [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
+                    CMD=$(transform_docker_command "$CMD")
+                fi
+            fi
+
             log "Executing: $CMD"
 
             # Verify shared directory has content if needed
@@ -403,7 +422,12 @@ run_daemon_mode() {
             # Execute command
             EXEC_OUTPUT="/tmp/daemon_output.txt"
             EXEC_EXIT_CODE=0
-            eval "$CMD" > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
+            if [ "$USE_PULL_FALLBACK" = "true" ]; then
+                # Pull commands use registry-first, Docker Hub fallback
+                execute_pull_with_fallback "$CMD" > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
+            else
+                eval "$CMD" > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
+            fi
 
             # Clean up shared directory
             if [ "$NEEDS_INPUT" = "true" ]; then

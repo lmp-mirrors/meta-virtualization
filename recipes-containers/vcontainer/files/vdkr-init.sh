@@ -20,8 +20,10 @@
 #   docker_output=<type>   Output type: text, tar, storage (default: text)
 #   docker_state=<type>    State type: none, disk (default: none)
 #   docker_network=1       Enable networking (configure eth0, DNS)
+#   docker_registry=<url>  Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
+#   docker_insecure_registry=<host:port>  Mark registry as insecure (HTTP). Can repeat.
 #
-# Version: 2.3.0
+# Version: 2.4.0
 
 # Set runtime-specific parameters before sourcing common code
 VCONTAINER_RUNTIME_NAME="vdkr"
@@ -29,11 +31,30 @@ VCONTAINER_RUNTIME_CMD="docker"
 VCONTAINER_RUNTIME_PREFIX="docker"
 VCONTAINER_STATE_DIR="/var/lib/docker"
 VCONTAINER_SHARE_NAME="vdkr_share"
-VCONTAINER_VERSION="2.3.0"
+VCONTAINER_VERSION="2.4.0"
+
+# Docker-specific: default registry for unqualified image names
+# Set via kernel param: docker_registry=10.0.2.2:5000/yocto
+# Or baked into rootfs: /etc/vdkr/registry.conf
+DOCKER_DEFAULT_REGISTRY=""
 
 # Source common init functions
 # When installed as /init, common file is at /vcontainer-init-common.sh
 . /vcontainer-init-common.sh
+
+# Load baked-in registry defaults from /etc/vdkr/registry.conf
+# These can be overridden by kernel cmdline parameters
+load_registry_config() {
+    if [ -f /etc/vdkr/registry.conf ]; then
+        . /etc/vdkr/registry.conf
+        # Map config file variables to our internal variables
+        if [ -n "$VDKR_DEFAULT_REGISTRY" ]; then
+            DOCKER_DEFAULT_REGISTRY="$VDKR_DEFAULT_REGISTRY"
+            log "Loaded baked registry: $DOCKER_DEFAULT_REGISTRY"
+        fi
+        # VDKR_INSECURE_REGISTRIES is handled in start_dockerd
+    fi
+}
 
 # ============================================================================
 # Docker-Specific Functions
@@ -100,6 +121,45 @@ start_dockerd() {
     DOCKER_OPTS="$DOCKER_OPTS --exec-opt native.cgroupdriver=cgroupfs"
     DOCKER_OPTS="$DOCKER_OPTS --log-level=info"
 
+    # Parse default registry from kernel cmdline (docker_registry=host:port/namespace)
+    # Kernel cmdline OVERRIDES baked config from /etc/vdkr/registry.conf
+    # This enables: "docker pull container-base" → "docker pull 10.0.2.2:5000/yocto/container-base"
+    GREP_RESULT=$(grep -o 'docker_registry=[^ ]*' /proc/cmdline 2>/dev/null || true)
+    if [ -n "$GREP_RESULT" ]; then
+        DOCKER_DEFAULT_REGISTRY=$(echo "$GREP_RESULT" | sed 's/docker_registry=//')
+        log "Registry from cmdline: $DOCKER_DEFAULT_REGISTRY"
+    elif [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
+        log "Registry from baked config: $DOCKER_DEFAULT_REGISTRY"
+    fi
+    if [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
+        # Extract host:port for insecure registry config (strip path/namespace)
+        REGISTRY_HOST=$(echo "$DOCKER_DEFAULT_REGISTRY" | cut -d'/' -f1)
+        # Auto-add to insecure registries if it looks like a local/private registry
+        if echo "$REGISTRY_HOST" | grep -qE '^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
+            DOCKER_OPTS="$DOCKER_OPTS --insecure-registry=$REGISTRY_HOST"
+            log "Auto-added insecure registry: $REGISTRY_HOST"
+        fi
+    fi
+
+    # Add baked insecure registries from /etc/vdkr/registry.conf
+    if [ -n "$VDKR_INSECURE_REGISTRIES" ]; then
+        for registry in $VDKR_INSECURE_REGISTRIES; do
+            DOCKER_OPTS="$DOCKER_OPTS --insecure-registry=$registry"
+            log "Added baked insecure registry: $registry"
+        done
+    fi
+
+    # Check for additional insecure registries from kernel cmdline (docker_insecure_registry=host:port)
+    # For local registry on build host via QEMU slirp: docker_insecure_registry=10.0.2.2:5000
+    # For remote HTTP registry: docker_insecure_registry=registry.company.com:5000
+    # Multiple registries can be specified by repeating the parameter
+    for registry in $(grep -o 'docker_insecure_registry=[^ ]*' /proc/cmdline 2>/dev/null | sed 's/docker_insecure_registry=//' || true); do
+        if [ -n "$registry" ]; then
+            DOCKER_OPTS="$DOCKER_OPTS --insecure-registry=$registry"
+            log "Added insecure registry: $registry"
+        fi
+    done
+
     if [ "$CONTAINERD_READY" = "true" ]; then
         DOCKER_OPTS="$DOCKER_OPTS --containerd=/run/containerd/containerd.sock"
     fi
@@ -164,6 +224,219 @@ stop_runtime_daemons() {
     fi
 }
 
+# Execute a pull command with registry fallback
+# Tries registry first, falls back to Docker Hub if image not found
+# Usage: execute_pull_with_fallback "docker pull alpine:latest"
+# Returns: exit code of successful pull, or last failure
+execute_pull_with_fallback() {
+    local cmd="$1"
+    local image=""
+    local tag=""
+
+    # Extract image name from pull command
+    # Handles: docker pull <image> or docker pull <image>:tag
+    if echo "$cmd" | grep -qE '^docker pull '; then
+        image=$(echo "$cmd" | awk '{print $3}')
+    else
+        # Not a pull command, just execute it
+        eval "$cmd"
+        return $?
+    fi
+
+    # If no registry configured, just run the original command
+    if [ -z "$DOCKER_DEFAULT_REGISTRY" ]; then
+        log "No registry configured, pulling from Docker Hub"
+        eval "$cmd"
+        return $?
+    fi
+
+    # Check if image is already qualified (has / in it)
+    if echo "$image" | grep -q '/'; then
+        # Already qualified (e.g., docker.io/library/alpine or myregistry/image)
+        log "Image already qualified: $image"
+        eval "$cmd"
+        return $?
+    fi
+
+    # Unqualified image - try registry first, then Docker Hub
+    local registry_image="$DOCKER_DEFAULT_REGISTRY/$image"
+
+    log "Trying registry first: $registry_image"
+    if docker pull "$registry_image" 2>/dev/null; then
+        log "Successfully pulled from registry: $registry_image"
+        docker images | grep -E "REPOSITORY|$image" || true
+        return 0
+    fi
+
+    log "Image not in registry, falling back to Docker Hub: $image"
+    if docker pull "$image"; then
+        log "Successfully pulled from Docker Hub: $image"
+        docker images | grep -E "REPOSITORY|$image" || true
+        return 0
+    fi
+
+    log "ERROR: Failed to pull $image from both registry and Docker Hub"
+    return 1
+}
+
+# Check if a command is a pull command that needs fallback handling
+is_pull_command() {
+    local cmd="$1"
+    echo "$cmd" | grep -qE '^docker pull '
+}
+
+# Helper function to transform an unqualified image name
+# Must be defined before transform_docker_command which uses it
+transform_image_name() {
+    local img="$1"
+    if [ -z "$img" ]; then
+        echo ""
+        return
+    fi
+    # Check if this is an image ID (hex string) - don't transform
+    # Short form: 12 hex chars (e7b39c54cdec)
+    # Long form: sha256:64 hex chars
+    if echo "$img" | grep -qE '^[0-9a-fA-F]{12,64}$'; then
+        echo "$img"
+        return
+    fi
+    if echo "$img" | grep -qE '^sha256:[0-9a-fA-F]{64}$'; then
+        echo "$img"
+        return
+    fi
+    # Check if image is unqualified (no /)
+    if ! echo "$img" | grep -q '/'; then
+        echo "$DOCKER_DEFAULT_REGISTRY/$img"
+    # Check if already has registry with port - don't transform
+    elif echo "$img" | grep -qE '^[^/]+:[0-9]+/'; then
+        echo "$img"
+    # Check if looks like a domain - don't transform
+    elif echo "$img" | grep -qE '^[a-zA-Z0-9-]+\.[a-zA-Z]'; then
+        echo "$img"
+    else
+        echo "$img"
+    fi
+}
+
+# Transform docker commands to use default registry for unqualified images
+# "docker pull container-base" → "docker pull 10.0.2.2:5000/yocto/container-base"
+# "docker pull alpine" → "docker pull 10.0.2.2:5000/yocto/alpine" (if registry set)
+# "docker pull docker.io/library/alpine" → unchanged (already qualified)
+# Also handles "docker image *" compound commands and other image commands
+#
+# NOTE: Pull commands are NOT transformed here - they use execute_pull_with_fallback
+# which tries registry first, then Docker Hub as fallback.
+transform_docker_command() {
+    local cmd="$1"
+
+    # Handle "docker image *" compound commands - convert to standard form
+    # docker image pull → docker pull
+    # docker image rm → docker rmi
+    # docker image ls → docker images
+    # docker image inspect → docker inspect (works for images)
+    if echo "$cmd" | grep -qE '^docker image '; then
+        local subcmd=$(echo "$cmd" | awk '{print $3}')
+        local rest=$(echo "$cmd" | cut -d' ' -f4-)
+        case "$subcmd" in
+            pull)    cmd="docker pull $rest" ;;
+            rm)      cmd="docker rmi $rest" ;;
+            ls)      cmd="docker images $rest" ;;
+            inspect) cmd="docker inspect $rest" ;;
+            tag)     cmd="docker tag $rest" ;;
+            push)    cmd="docker push $rest" ;;
+            prune)   cmd="docker image prune $rest" ;;  # keep as-is, docker supports it
+            history) cmd="docker history $rest" ;;
+            *)       ;;  # pass through unknown subcommands
+        esac
+    fi
+
+    # Only transform if default registry is configured
+    if [ -z "$DOCKER_DEFAULT_REGISTRY" ]; then
+        echo "$cmd"
+        return
+    fi
+
+    # NOTE: docker images, inspect, history, rmi, tag do NOT get transformed.
+    # These commands operate on local images - the user specifies exactly what they have.
+    # Transform only applies to pull/run where we're fetching images.
+    #
+    # If user has:
+    #   - alpine:latest (from Docker Hub via fallback)
+    #   - 10.0.2.2:5000/yocto/myapp:latest (from registry)
+    #
+    # Then:
+    #   - "docker images alpine" → shows alpine:latest (no transform)
+    #   - "docker inspect alpine" → inspects alpine:latest (no transform)
+    #   - "docker rmi alpine" → removes alpine:latest (no transform)
+
+    # Pull commands are handled by execute_pull_with_fallback, not transformed here
+    if echo "$cmd" | grep -qE '^docker pull '; then
+        echo "$cmd"
+        return
+    fi
+
+    # Check if this is a run command
+    if echo "$cmd" | grep -qE '^docker run '; then
+        # Extract the image reference (handles "docker run [opts] img [cmd]")
+        local docker_cmd="run"
+        local rest=""
+
+        if [ "$docker_cmd" = "run" ]; then
+            # docker run [options] <image> [command]
+            # This is trickier - image is the first non-option argument
+            # For simplicity, look for image pattern after run
+            # Skip known options that take arguments
+            local args=$(echo "$cmd" | cut -d' ' -f3-)
+            local image=""
+            local new_args=""
+            local skip_next=false
+
+            for arg in $args; do
+                if [ "$skip_next" = "true" ]; then
+                    new_args="$new_args $arg"
+                    skip_next=false
+                    continue
+                fi
+
+                case "$arg" in
+                    -d|--detach|-i|--interactive|-t|--tty|--rm|--privileged)
+                        new_args="$new_args $arg"
+                        ;;
+                    -p|--publish|-v|--volume|-e|--env|--name|--network|-w|--workdir|--entrypoint)
+                        new_args="$new_args $arg"
+                        skip_next=true
+                        ;;
+                    -p=*|--publish=*|-v=*|--volume=*|-e=*|--env=*|--name=*|--network=*|-w=*|--workdir=*|--entrypoint=*)
+                        new_args="$new_args $arg"
+                        ;;
+                    -*)
+                        # Other options, pass through
+                        new_args="$new_args $arg"
+                        ;;
+                    *)
+                        # First non-option is the image
+                        if [ -z "$image" ]; then
+                            image="$arg"
+                        else
+                            # Rest is the command
+                            rest="$rest $arg"
+                        fi
+                        ;;
+                esac
+            done
+
+            if [ -n "$image" ]; then
+                local transformed=$(transform_image_name "$image")
+                echo "docker run$new_args $transformed$rest"
+                return
+            fi
+        fi
+    fi
+
+    # Return unchanged
+    echo "$cmd"
+}
+
 handle_storage_output() {
     echo "Stopping Docker gracefully..."
     /usr/bin/docker system prune -f >/dev/null 2>&1 || true
@@ -223,15 +496,36 @@ mount_input_disk
 # Configure networking
 configure_networking
 
+# Load baked registry config (can be overridden by kernel cmdline)
+load_registry_config
+
 # Start containerd and dockerd (Docker-specific)
 start_containerd
 start_dockerd
 
 # Handle daemon mode or single command execution
 if [ "$RUNTIME_DAEMON" = "1" ]; then
+    # Export registry for daemon mode
+    # Note: Functions (execute_pull_with_fallback, is_pull_command) are already
+    # available since they're defined in this script before run_daemon_mode is called
+    export DOCKER_DEFAULT_REGISTRY
     run_daemon_mode
 else
     prepare_input_path
+    # Check if this is a pull command - use fallback logic
+    if is_pull_command "$RUNTIME_CMD"; then
+        # Pull commands use registry-first, Docker Hub fallback
+        log "Using pull with registry fallback"
+        execute_pull_with_fallback "$RUNTIME_CMD"
+        EXEC_EXIT_CODE=$?
+        echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        graceful_shutdown
+        exit 0
+    fi
+    # Transform other commands to use default registry for unqualified images
+    if [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
+        RUNTIME_CMD=$(transform_docker_command "$RUNTIME_CMD")
+    fi
     execute_command
 fi
 
