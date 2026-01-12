@@ -20,7 +20,6 @@
 # This config only handles insecure registry trust.
 #
 # IMPORTANT: This recipe:
-#   - Does NOT install automatically - user must add to IMAGE_INSTALL
 #   - Skips entirely if DOCKER_REGISTRY_INSECURE is not set
 #   - Creates /etc/docker/daemon.json (will be merged if docker recipe
 #     also creates one, or may need RCONFLICTS handling)
@@ -28,7 +27,11 @@
 # Usage:
 #   # In local.conf or image recipe:
 #   DOCKER_REGISTRY_INSECURE = "10.0.2.2:5000 myregistry.local:5000"
-#   IMAGE_INSTALL:append = " docker-registry-config"
+#   IMAGE_FEATURES += "container-registry"
+#
+#   The IMAGE_FEATURES mechanism auto-selects this recipe for Docker
+#   or container-oci-registry-config for Podman/CRI-O based on
+#   VIRTUAL-RUNTIME_container_engine.
 #
 # ===========================================================================
 
