@@ -46,10 +46,12 @@ def container_registry_generate_tags(d, image_name):
 
     Strategies:
         timestamp - YYYYMMDD-HHMMSS format
-        git       - Short git hash if in git repo
-        version   - PV from recipe or image name
+        sha/git   - Short git hash if in git repo
+        branch    - Git branch name (sanitized: / and _ become -)
+        semver    - Nested SemVer tags from PV (1.2.3 -> 1.2.3, 1.2, 1)
+        version   - PV from recipe (single tag, not nested)
         latest    - Always includes 'latest' tag
-        arch      - Appends architecture suffix
+        arch      - Appends architecture suffix to other tags
 
     Returns list of tags to apply.
     """
@@ -63,7 +65,7 @@ def container_registry_generate_tags(d, image_name):
         if strat == 'timestamp':
             ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
             tags.append(ts)
-        elif strat == 'git':
+        elif strat in ('git', 'sha'):
             try:
                 git_hash = subprocess.check_output(
                     ['git', 'rev-parse', '--short', 'HEAD'],
@@ -74,9 +76,35 @@ def container_registry_generate_tags(d, image_name):
                     tags.append(git_hash)
             except (subprocess.CalledProcessError, FileNotFoundError):
                 pass
+        elif strat == 'branch':
+            try:
+                branch = subprocess.check_output(
+                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    stderr=subprocess.DEVNULL,
+                    cwd=d.getVar('TOPDIR')
+                ).decode().strip()
+                if branch and branch != 'HEAD':
+                    # Sanitize: feature/login -> feature-login
+                    safe_branch = branch.replace('/', '-').replace('_', '-')
+                    tags.append(safe_branch)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+        elif strat == 'semver':
+            pv = d.getVar('PV') or ''
+            # Strip any suffix like +gitAUTOINC+xxx
+            pv = pv.split('+')[0]
+            parts = pv.split('.')
+            if len(parts) >= 1 and parts[0].isdigit():
+                if len(parts) >= 3:
+                    tags.append('.'.join(parts[:3]))  # 1.2.3
+                if len(parts) >= 2:
+                    tags.append('.'.join(parts[:2]))  # 1.2
+                tags.append(parts[0])                  # 1
         elif strat == 'version':
             pv = d.getVar('PV')
             if pv and pv != '1.0':
+                # Strip suffix for cleaner tag
+                pv = pv.split('+')[0]
                 tags.append(pv)
         elif strat == 'latest':
             tags.append('latest')
