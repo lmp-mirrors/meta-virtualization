@@ -93,6 +93,7 @@ CONTAINER_REGISTRY_SCRIPT = "${CONTAINER_REGISTRY_STORAGE}/container-registry.sh
 python do_generate_registry_script() {
     import os
     import stat
+    import shutil
 
     script_path = d.getVar('CONTAINER_REGISTRY_SCRIPT')
     deploy_dir = d.getVar('DEPLOY_DIR')
@@ -105,9 +106,6 @@ python do_generate_registry_script() {
     # Find skopeo binary path
     skopeo_bin = os.path.join(d.getVar('STAGING_SBINDIR_NATIVE') or '', 'skopeo')
 
-    # Config file path
-    config_file = os.path.join(d.getVar('THISDIR'), 'files', 'container-registry-dev.yml')
-
     # Registry settings
     registry_url = d.getVar('CONTAINER_REGISTRY_URL')
     registry_namespace = d.getVar('CONTAINER_REGISTRY_NAMESPACE')
@@ -115,7 +113,22 @@ python do_generate_registry_script() {
     tag_strategy = d.getVar('CONTAINER_REGISTRY_TAG_STRATEGY') or 'latest'
     target_arch = d.getVar('TARGET_ARCH') or ''
 
+    # Create storage directory
+    os.makedirs(registry_storage, exist_ok=True)
     os.makedirs(deploy_dir, exist_ok=True)
+
+    # Copy config file to storage directory and update storage path
+    src_config = os.path.join(d.getVar('THISDIR'), 'files', 'container-registry-dev.yml')
+    config_file = os.path.join(registry_storage, 'registry-config.yml')
+    with open(src_config, 'r') as f:
+        config_content = f.read()
+    # Replace the default storage path with actual path
+    config_content = config_content.replace(
+        'rootdirectory: /tmp/container-registry',
+        f'rootdirectory: {registry_storage}'
+    )
+    with open(config_file, 'w') as f:
+        f.write(config_content)
 
     script = f'''#!/bin/bash
 # Container Registry Helper Script
@@ -233,7 +246,6 @@ cmd_start() {{
     fi
 
     mkdir -p "$REGISTRY_STORAGE"
-    export REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY="$REGISTRY_STORAGE"
 
     echo "Starting container registry..."
     echo "  URL:     http://$REGISTRY_URL"
@@ -290,10 +302,11 @@ cmd_status() {{
 cmd_push() {{
     shift  # Remove 'push' from args
 
-    # Parse options
+    # Parse options and positional args
     local explicit_tags=""
     local strategy="${{CONTAINER_REGISTRY_TAG_STRATEGY:-$DEFAULT_TAG_STRATEGY}}"
     local version="${{IMAGE_VERSION:-}}"
+    local image_filter=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -309,11 +322,33 @@ cmd_push() {{
                 version="$2"
                 shift 2
                 ;;
+            -*)
+                echo "Unknown option: $1"
+                return 1
+                ;;
             *)
+                # Positional arg = image name filter
+                if [ -z "$image_filter" ]; then
+                    image_filter="$1"
+                fi
                 shift
                 ;;
         esac
     done
+
+    # Explicit tags require an image name
+    if [ -n "$explicit_tags" ] && [ -z "$image_filter" ]; then
+        echo "Error: --tag requires an image name"
+        echo "Usage: $0 push <image> --tag <tag>"
+        echo ""
+        echo "Examples:"
+        echo "  $0 push container-base --tag v1.0.0"
+        echo "  $0 push container-base --tag latest --tag v1.0.0"
+        echo ""
+        echo "To push all images, use a strategy instead:"
+        echo "  $0 push --strategy 'timestamp latest'"
+        return 1
+    fi
 
     # Export version for generate_tags
     export IMAGE_VERSION="$version"
@@ -332,11 +367,16 @@ cmd_push() {{
         tags=$(generate_tags "$strategy")
     fi
 
-    echo "Pushing OCI images from $DEPLOY_DIR_IMAGE"
+    if [ -n "$image_filter" ]; then
+        echo "Pushing image: $image_filter"
+    else
+        echo "Pushing all OCI images from $DEPLOY_DIR_IMAGE"
+    fi
     echo "To registry: $REGISTRY_URL/$REGISTRY_NAMESPACE/"
     echo "Tags: $tags"
     echo ""
 
+    local found=0
     for oci_dir in "$DEPLOY_DIR_IMAGE"/*-oci; do
         [ -d "$oci_dir" ] || continue
         [ -f "$oci_dir/index.json" ] || continue
@@ -347,6 +387,20 @@ cmd_push() {{
         # Remove rootfs timestamp
         name=$(echo "$name" | sed 's/\\.rootfs-[0-9]*//')
 
+        # Filter by image name if specified
+        if [ -n "$image_filter" ]; then
+            # Match exact name or name.rootfs variant
+            case "$name" in
+                "$image_filter"|"$image_filter.rootfs")
+                    : # match
+                    ;;
+                *)
+                    continue
+                    ;;
+            esac
+        fi
+
+        found=1
         echo "Pushing: $name"
         for tag in $tags; do
             echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
@@ -355,6 +409,19 @@ cmd_push() {{
                 "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
         done
     done
+
+    if [ -n "$image_filter" ] && [ "$found" = "0" ]; then
+        echo "Error: Image '$image_filter' not found in $DEPLOY_DIR_IMAGE"
+        echo ""
+        echo "Available images:"
+        for oci_dir in "$DEPLOY_DIR_IMAGE"/*-oci; do
+            [ -d "$oci_dir" ] || continue
+            [ -f "$oci_dir/index.json" ] || continue
+            n=$(basename "$oci_dir" | sed 's/-latest-oci$//' | sed 's/-oci$//' | sed 's/-qemux86-64//' | sed 's/-qemuarm64//' | sed 's/\\.rootfs-[0-9]*//')
+            echo "  $n"
+        done
+        return 1
+    fi
 
     echo ""
     echo "Done. Catalog:"
@@ -481,6 +548,124 @@ cmd_import() {{
     echo "  # then: vdkr pull $dest_name"
 }}
 
+cmd_delete() {{
+    local image="${{2:-}}"
+
+    if [ -z "$image" ]; then
+        echo "Usage: $0 delete <image>[:<tag>]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 delete container-base:v1.0.0     # Delete specific tag"
+        echo "  $0 delete container-base:20260112-143022"
+        echo "  $0 delete yocto/alpine:latest       # With namespace"
+        echo ""
+        echo "Note: Deleting a tag removes the manifest reference."
+        echo "Run garbage collection to reclaim disk space."
+        return 1
+    fi
+
+    if ! curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
+        echo "Registry not responding at http://$REGISTRY_URL"
+        return 1
+    fi
+
+    # Parse image:tag
+    local name tag
+    if echo "$image" | grep -q ':'; then
+        name=$(echo "$image" | rev | cut -d':' -f2- | rev)
+        tag=$(echo "$image" | rev | cut -d':' -f1 | rev)
+    else
+        echo "Error: Tag required. Use format: <image>:<tag>"
+        echo "Example: $0 delete container-base:v1.0.0"
+        return 1
+    fi
+
+    # Add namespace if not already qualified
+    if ! echo "$name" | grep -q '/'; then
+        name="$REGISTRY_NAMESPACE/$name"
+    fi
+
+    echo "Deleting: $name:$tag"
+
+    # Get the digest for the tag (try OCI format first, then Docker V2)
+    local digest=""
+    for accept in "application/vnd.oci.image.manifest.v1+json" \
+                  "application/vnd.docker.distribution.manifest.v2+json"; do
+        digest=$(curl -s -I -H "Accept: $accept" \
+            "http://$REGISTRY_URL/v2/$name/manifests/$tag" 2>/dev/null \
+            | grep -i "docker-content-digest" | awk '{{print $2}}' | tr -d '\r\n')
+        [ -n "$digest" ] && break
+    done
+
+    if [ -z "$digest" ]; then
+        echo "Error: Tag not found: $name:$tag"
+        return 1
+    fi
+
+    echo "  Digest: $digest"
+
+    # Delete by digest
+    local status=$(curl -s -o /dev/null -w "%{{http_code}}" -X DELETE \
+        "http://$REGISTRY_URL/v2/$name/manifests/$digest")
+
+    if [ "$status" = "202" ]; then
+        echo "  Deleted successfully"
+        echo ""
+        echo "Note: Run garbage collection to reclaim disk space:"
+        echo "  $0 gc"
+    elif [ "$status" = "405" ]; then
+        echo "Error: Deletion not enabled in registry config"
+        echo "Add 'storage.delete.enabled: true' to registry config and restart"
+        return 1
+    else
+        echo "Error: Delete failed (HTTP $status)"
+        return 1
+    fi
+}}
+
+cmd_gc() {{
+    echo "Running garbage collection..."
+    echo ""
+
+    if [ ! -x "$REGISTRY_BIN" ]; then
+        echo "Error: Registry binary not found at $REGISTRY_BIN"
+        echo "Build it with: bitbake docker-distribution-native"
+        return 1
+    fi
+
+    # Check if registry is running
+    local was_running=0
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat $PID_FILE)" 2>/dev/null; then
+        was_running=1
+        echo "Stopping registry for garbage collection..."
+        cmd_stop
+        sleep 1
+    fi
+
+    echo "Collecting garbage from: $REGISTRY_STORAGE"
+    echo ""
+
+    # Run garbage collection (dry-run first to show what would be deleted)
+    "$REGISTRY_BIN" garbage-collect --dry-run "$REGISTRY_CONFIG" 2>&1 || true
+    echo ""
+
+    read -p "Proceed with garbage collection? [y/N] " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        "$REGISTRY_BIN" garbage-collect "$REGISTRY_CONFIG"
+        echo ""
+        echo "Garbage collection complete."
+    else
+        echo "Cancelled."
+    fi
+
+    # Restart if it was running
+    if [ "$was_running" = "1" ]; then
+        echo ""
+        echo "Restarting registry..."
+        cmd_start
+    fi
+}}
+
 cmd_help() {{
     echo "Usage: $0 <command> [options]"
     echo ""
@@ -488,15 +673,18 @@ cmd_help() {{
     echo "  start                  Start the container registry server"
     echo "  stop                   Stop the container registry server"
     echo "  status                 Check if registry is running"
-    echo "  push [options]         Push all OCI images to registry"
+    echo "  push [image] [opts]    Push OCI images to registry"
     echo "  import <image> [name]  Import 3rd party image to registry"
+    echo "  delete <image>:<tag>   Delete a tagged image from registry"
+    echo "  gc                     Garbage collect unreferenced blobs"
     echo "  list                   List all images with tags"
     echo "  tags <image>           List tags for an image"
     echo "  catalog                List image names (raw API)"
     echo "  help                   Show this help"
     echo ""
     echo "Push options:"
-    echo "  --tag, -t <tag>        Explicit tag (can be repeated for multiple tags)"
+    echo "  <image>                Image name (required when using --tag)"
+    echo "  --tag, -t <tag>        Explicit tag (can be repeated, requires image name)"
     echo "  --strategy, -s <str>   Tag strategy (default: $DEFAULT_TAG_STRATEGY)"
     echo "  --version, -v <ver>    Version for semver strategy (e.g., 1.2.3)"
     echo ""
@@ -511,13 +699,15 @@ cmd_help() {{
     echo ""
     echo "Examples:"
     echo "  $0 start"
-    echo "  $0 push                                    # Uses default strategy"
-    echo "  $0 push --tag v1.0.0                       # Explicit tag"
-    echo "  $0 push --tag latest --tag v1.0.0         # Multiple tags"
-    echo "  $0 push --strategy 'sha branch latest'    # Strategy-based"
-    echo "  $0 push --strategy semver --version 1.2.3 # SemVer tags"
+    echo "  $0 push                                    # Push all, default strategy"
+    echo "  $0 push container-base                     # Push one, default strategy"
+    echo "  $0 push container-base --tag v1.0.0        # Explicit tag (one image)"
+    echo "  $0 push container-base -t latest -t v1.0.0 # Multiple explicit tags"
+    echo "  $0 push --strategy 'sha branch latest'     # All images, strategy"
+    echo "  $0 push --strategy semver --version 1.2.3  # All images, SemVer"
     echo "  $0 import docker.io/library/alpine:latest"
     echo "  $0 import docker.io/library/busybox:latest my-busybox"
+    echo "  $0 delete container-base:20260112-143022"
     echo "  $0 list"
     echo "  $0 tags container-base"
     echo ""
@@ -541,6 +731,8 @@ case "${{1:-help}}" in
     status)  cmd_status ;;
     push)    cmd_push "$@" ;;
     import)  cmd_import "$@" ;;
+    delete)  cmd_delete "$@" ;;
+    gc)      cmd_gc ;;
     list)    cmd_list ;;
     tags)    cmd_tags "$@" ;;
     catalog) cmd_catalog ;;

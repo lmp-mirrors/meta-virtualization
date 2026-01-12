@@ -33,6 +33,9 @@ storage:
   filesystem:
     # Storage directory - override with REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY env var
     rootdirectory: /tmp/container-registry
+  # Enable deletion of images/tags
+  delete:
+    enabled: true
   # Don't redirect to external storage
   redirect:
     disable: true

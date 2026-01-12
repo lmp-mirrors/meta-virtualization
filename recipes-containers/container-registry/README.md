@@ -34,8 +34,10 @@ Script location: `${TOPDIR}/container-registry/container-registry.sh` (outside t
 | `start` | Start the container registry server |
 | `stop` | Stop the container registry server |
 | `status` | Check if registry is running |
-| `push [options]` | Push all OCI images from deploy/ to registry |
+| `push [image] [options]` | Push OCI images from deploy/ to registry |
 | `import <image> [name]` | Import 3rd party image to registry |
+| `delete <image>:<tag>` | Delete a tagged image from registry |
+| `gc` | Garbage collect unreferenced blobs |
 | `list` | List all images with their tags |
 | `tags <image>` | List tags for a specific image |
 | `catalog` | Raw API catalog output |
@@ -43,9 +45,9 @@ Script location: `${TOPDIR}/container-registry/container-registry.sh` (outside t
 ### Push Options
 
 ```bash
-# Explicit tags
-container-registry.sh push --tag v1.0.0
-container-registry.sh push --tag latest --tag v1.0.0
+# Explicit tags (require image name)
+container-registry.sh push container-base --tag v1.0.0
+container-registry.sh push container-base --tag latest --tag v1.0.0
 
 # Strategy-based (see Tag Strategies below)
 container-registry.sh push --strategy "sha branch latest"
@@ -87,6 +89,64 @@ Result: `my-app:1.2.3`, `my-app:1.2`, `my-app:1`, `my-app:latest`
 **CI/CD** (traceability):
 ```bash
 IMAGE_VERSION=1.2.3 container-registry.sh push --strategy "semver sha latest"
+```
+
+## Development Loop
+
+The default strategy (`timestamp latest`) supports a simple development workflow:
+
+```bash
+# Build
+bitbake container-base
+
+# Push (creates both timestamp tag AND :latest)
+./container-registry/container-registry.sh push
+
+# Pull on target - :latest is implicit, gets your most recent push
+vdkr pull container-base
+
+# Test
+vdkr run container-base /bin/sh
+
+# Repeat: rebuild, push, pull - no tag hunting needed
+```
+
+Each push overwrites `:latest` with your newest build. The timestamp tags (`20260112-143022`) remain for rollback/debugging.
+
+## Build-Time OCI Labels
+
+Container images automatically include standard OCI traceability labels:
+
+```bash
+$ skopeo inspect oci:container-base-oci | jq '.Labels'
+{
+  "org.opencontainers.image.revision": "8a3f2b1",
+  "org.opencontainers.image.ref.name": "master",
+  "org.opencontainers.image.created": "2026-01-12T20:32:24Z"
+}
+```
+
+| Label | Source | Description |
+|-------|--------|-------------|
+| `org.opencontainers.image.revision` | git SHA from TOPDIR | Code traceability |
+| `org.opencontainers.image.ref.name` | git branch from TOPDIR | Branch tracking |
+| `org.opencontainers.image.created` | Build timestamp | When image was built |
+| `org.opencontainers.image.version` | PV (if set) | Semantic version |
+
+### Customizing Labels
+
+```bitbake
+# In local.conf or image recipe
+
+# Explicit override (e.g., from CI/CD)
+OCI_IMAGE_REVISION = "${CI_COMMIT_SHA}"
+OCI_IMAGE_BRANCH = "${CI_BRANCH}"
+
+# Disable specific label
+OCI_IMAGE_REVISION = "none"
+
+# Disable all auto-labels
+OCI_IMAGE_AUTO_LABELS = "0"
 ```
 
 ## Configuration (local.conf)
