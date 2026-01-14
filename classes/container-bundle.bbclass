@@ -160,6 +160,9 @@ CONTAINER_BUNDLE_RUNTIME ?= "${@get_bundle_runtime(d)}"
 # Inherit shared functions for multiconfig/machine/arch mapping
 inherit container-common
 
+# Inherit deploy for optional OCI base layer deployment (see CONTAINER_BUNDLE_DEPLOY)
+inherit deploy
+
 # Dependencies on native tools
 # vcontainer-native provides vrunner.sh
 # Blobs come from multiconfig builds (vdkr-initramfs-create, vpdmn-initramfs-create)
@@ -409,3 +412,65 @@ FILES:${PN} = "${datadir}/container-bundles"
 # from container image recipes. Circular deps only occur if bundle packages are
 # globally added to all images (including container images themselves).
 do_compile[mcdepends] = "mc::${VRUNTIME_MULTICONFIG}:vdkr-initramfs-create:do_deploy mc::${VRUNTIME_MULTICONFIG}:vpdmn-initramfs-create:do_deploy"
+
+# ===========================================================================
+# Optional Deploy for OCI Base Layer Usage
+# ===========================================================================
+#
+# When CONTAINER_BUNDLE_DEPLOY = "1", this class also deploys fetched remote
+# containers to DEPLOY_DIR_IMAGE for use as base layers with OCI_BASE_IMAGE.
+#
+# This enables dual-use recipes that both:
+#   1. Create installable packages for target container storage
+#   2. Provide OCI base layers for building layered containers
+#
+# Example:
+#   # alpine-oci-base.bb
+#   inherit container-bundle
+#   CONTAINER_BUNDLES = "docker.io/library/alpine:3.19"
+#   CONTAINER_DIGESTS[docker.io_library_alpine_3.19] = "sha256:..."
+#   CONTAINER_BUNDLE_DEPLOY = "1"
+#
+#   # Then in another recipe:
+#   OCI_BASE_IMAGE = "alpine-oci-base"
+#
+CONTAINER_BUNDLE_DEPLOY ?= ""
+
+python () {
+    if d.getVar('CONTAINER_BUNDLE_DEPLOY') == "1":
+        # Inherit deploy class dynamically
+        bb.build.addtask('do_deploy', 'do_build', 'do_compile', d)
+}
+
+do_deploy() {
+    if [ "${CONTAINER_BUNDLE_DEPLOY}" != "1" ]; then
+        bbnote "CONTAINER_BUNDLE_DEPLOY not set, skipping deploy"
+        return 0
+    fi
+
+    # Deploy fetched OCI directories to DEPLOY_DIR_IMAGE for use as base layers
+    # Format: ${PN}-latest-oci/ (matches what image-oci.bbclass expects)
+
+    if [ ! -d "${WORKDIR}/fetched" ]; then
+        bbwarn "No fetched containers to deploy"
+        return 0
+    fi
+
+    # Find the first (primary) fetched OCI directory
+    oci_dir=$(ls -d ${WORKDIR}/fetched/*/ 2>/dev/null | head -1)
+    if [ -z "$oci_dir" ] || [ ! -f "$oci_dir/index.json" ]; then
+        bbfatal "No valid OCI directory found in ${WORKDIR}/fetched/"
+    fi
+
+    bbnote "Deploying OCI base layer: $oci_dir -> ${DEPLOYDIR}/${PN}-latest-oci"
+
+    install -d ${DEPLOYDIR}
+    cp -rL "$oci_dir" ${DEPLOYDIR}/${PN}-${PV}-oci
+
+    # Create symlinks for OCI_BASE_IMAGE lookup
+    ln -sfn ${PN}-${PV}-oci ${DEPLOYDIR}/${PN}-latest-oci
+}
+do_deploy[dirs] = "${DEPLOYDIR}"
+
+# Only add sstate for deploy when enabled
+SSTATE_SKIP_CREATION:task-deploy = "${@'' if d.getVar('CONTAINER_BUNDLE_DEPLOY') == '1' else '1'}"
