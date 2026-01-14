@@ -109,30 +109,89 @@ OCI Multi-Layer Images
 ----------------------
 
 By default, OCI images are single-layer (the entire rootfs in one layer).
-To create multi-layer images with shared base layers, set `OCI_BASE_IMAGE`.
+Multi-layer images enable:
+- Shared base layers across images
+- Faster rebuilds via layer caching
+- Smaller delta updates when only app layer changes
 
-### Single vs Multi-Layer
+### Layer Modes
 
-    # Single layer (default) - full rootfs in one layer
-    inherit image image-oci
-    IMAGE_INSTALL = "base-files busybox myapp"
+| Mode | Variable | Layers | Use Case |
+|------|----------|--------|----------|
+| Single | (default) | 1 | Simple containers, backward compat |
+| Two-layer | `OCI_BASE_IMAGE` | 2 | Base + app (shared base across images) |
+| Multi-layer | `OCI_LAYER_MODE="multi"` | 3+ | Fine-grained layers (base, deps, app) |
 
-    # Multi-layer - app layer on top of base layer
+### Two-Layer Mode (OCI_BASE_IMAGE)
+
+Build on top of another OCI image recipe:
+
+    # myapp-container.bb
     inherit image image-oci
     OCI_BASE_IMAGE = "container-base"
     IMAGE_INSTALL = "base-files busybox myapp"
 
-### OCI_BASE_IMAGE
+Result: 2 layers (container-base layer + myapp layer)
 
-Specifies the base image to build on top of:
-
-| Value | Description |
-|-------|-------------|
+| OCI_BASE_IMAGE Value | Description |
+|----------------------|-------------|
 | Recipe name | `"container-base"` - uses OCI output from another recipe |
 | Absolute path | `"/path/to/oci-dir"` - uses existing OCI layout |
 
 For external images (docker.io, quay.io), use `container-bundle` with
 `CONTAINER_BUNDLE_DEPLOY = "1"` to fetch and deploy them first.
+
+### Multi-Layer Mode (OCI_LAYERS)
+
+Create explicit layers with fine-grained control:
+
+    # app-container-multilayer.bb
+    inherit image image-oci
+
+    OCI_LAYER_MODE = "multi"
+    OCI_LAYERS = "\
+        base:packages:base-files+base-passwd+netbase \
+        shell:packages:busybox \
+        app:packages:curl \
+    "
+
+    # IMAGE_INSTALL must include all packages to trigger builds
+    IMAGE_INSTALL = "base-files base-passwd netbase busybox curl"
+
+Result: 3 layers (base, shell, app)
+
+#### Layer Definition Format
+
+    name:type:content
+
+| Type | Content Format | Description |
+|------|----------------|-------------|
+| `packages` | `pkg1+pkg2+pkg3` | Install packages (use + delimiter) |
+| `directories` | `/path1+/path2` | Copy directories from IMAGE_ROOTFS |
+| `files` | `/file1+/file2` | Copy specific files from IMAGE_ROOTFS |
+
+#### Example Recipes
+
+**Three-layer with explicit packages:**
+```bitbake
+OCI_LAYER_MODE = "multi"
+OCI_LAYERS = "\
+    base:packages:base-files+base-passwd+netbase \
+    python:packages:python3+python3-pip \
+    app:directories:/opt/myapp \
+"
+IMAGE_INSTALL = "base-files base-passwd netbase python3 python3-pip myapp"
+```
+
+**Two-layer with base image + multi-layer app:**
+```bitbake
+OCI_BASE_IMAGE = "container-base"
+OCI_LAYER_MODE = "multi"
+OCI_LAYERS = "\
+    deps:packages:python3+python3-pip \
+    app:directories:/opt/myapp \
+"
+```
 
 ### OCI_IMAGE_CMD vs OCI_IMAGE_ENTRYPOINT
 
@@ -148,6 +207,21 @@ For external images (docker.io, quay.io), use `container-bundle` with
     # docker run image google.com → curl google.com
 
 Use CMD for base images (flexible). Use ENTRYPOINT for wrapper tools.
+
+### Verifying Layer Count
+
+    # Check layer count with skopeo
+    skopeo inspect oci:tmp/deploy/images/qemux86-64/myapp-latest-oci | jq '.Layers | length'
+
+### Testing Multi-Layer OCI
+
+    cd /opt/bruce/poky/meta-virtualization
+
+    # Quick tests (no builds)
+    pytest tests/test_multilayer_oci.py -v -k "not slow"
+
+    # Full tests (with builds)
+    pytest tests/test_multilayer_oci.py -v --poky-dir /opt/bruce/poky
 
 
 Using BUNDLED_CONTAINERS
