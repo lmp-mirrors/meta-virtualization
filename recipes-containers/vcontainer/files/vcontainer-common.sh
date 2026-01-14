@@ -330,6 +330,7 @@ ${BOLD}${RUNTIME_UPPER}-COMPATIBLE COMMANDS:${NC}
     ${CYAN}unpause${NC} <container>          Unpause a container
     ${CYAN}commit${NC} <container> <image>   Create image from container
     ${CYAN}exec${NC} [opts] <container> <cmd>  Execute command in container
+    ${CYAN}vshell${NC}                       Open interactive shell in VM (debug)
     ${CYAN}cp${NC} <src> <dest>              Copy files to/from container
 
   ${BOLD}Registry:${NC}
@@ -1563,6 +1564,25 @@ case "$COMMAND" in
             # Non-interactive exec via daemon
             run_runtime_command "$VCONTAINER_RUNTIME_CMD exec ${EXEC_ARGS[*]}"
         fi
+        ;;
+
+    # VM shell - interactive shell into the VM itself (not a container)
+    vshell)
+        # Opens a shell directly in the vdkr/vpdmn VM for debugging
+        # This runs /bin/sh in the VM, not inside a container
+        # Useful for:
+        #   - Running docker commands directly to see full error output
+        #   - Debugging VM-level issues
+        #   - Inspecting the VM filesystem
+        if ! daemon_is_running; then
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} vshell requires daemon mode" >&2
+            echo "Start daemon with: $VCONTAINER_RUNTIME_NAME vmemres start" >&2
+            exit 1
+        fi
+
+        echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Opening VM shell (type 'exit' to return)..." >&2
+        RUNNER_ARGS=$(build_runner_args)
+        "$RUNNER" $RUNNER_ARGS --daemon-interactive -- "/bin/sh"
         ;;
 
     # Runtime cp - copy files to/from container
