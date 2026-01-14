@@ -105,6 +105,51 @@ work together:
 - Usage: `BUNDLED_CONTAINERS = "autostart-test-container:docker:autostart"`
 
 
+OCI Multi-Layer Images
+----------------------
+
+By default, OCI images are single-layer (the entire rootfs in one layer).
+To create multi-layer images with shared base layers, set `OCI_BASE_IMAGE`.
+
+### Single vs Multi-Layer
+
+    # Single layer (default) - full rootfs in one layer
+    inherit image image-oci
+    IMAGE_INSTALL = "base-files busybox myapp"
+
+    # Multi-layer - app layer on top of base layer
+    inherit image image-oci
+    OCI_BASE_IMAGE = "container-base"
+    IMAGE_INSTALL = "base-files busybox myapp"
+
+### OCI_BASE_IMAGE
+
+Specifies the base image to build on top of:
+
+| Value | Description |
+|-------|-------------|
+| Recipe name | `"container-base"` - uses OCI output from another recipe |
+| Absolute path | `"/path/to/oci-dir"` - uses existing OCI layout |
+
+For external images (docker.io, quay.io), use `container-bundle` with
+`CONTAINER_BUNDLE_DEPLOY = "1"` to fetch and deploy them first.
+
+### OCI_IMAGE_CMD vs OCI_IMAGE_ENTRYPOINT
+
+    # CMD (default) - replaced when user passes arguments
+    OCI_IMAGE_CMD = "/bin/sh"
+    # docker run image           → /bin/sh
+    # docker run image /bin/bash → /bin/bash
+
+    # ENTRYPOINT - always runs, args appended
+    OCI_IMAGE_ENTRYPOINT = "curl"
+    OCI_IMAGE_ENTRYPOINT_ARGS = "http://localhost"
+    # docker run image           → curl http://localhost
+    # docker run image google.com → curl google.com
+
+Use CMD for base images (flexible). Use ENTRYPOINT for wrapper tools.
+
+
 Using BUNDLED_CONTAINERS
 ------------------------
 
@@ -245,6 +290,7 @@ Commands
 |---------|-------------|
 | `vimport <path> [name:tag]` | Import OCI directory or tarball |
 | `vrun [opts] <image> [cmd]` | Run with entrypoint cleared |
+| `vshell` | Open interactive shell inside VM (requires vmemres) |
 | `clean` | Remove persistent state |
 | `vmemres start/stop/status` | Memory resident VM control |
 
