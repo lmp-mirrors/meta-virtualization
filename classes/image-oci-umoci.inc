@@ -1,3 +1,187 @@
+# Fix merged-usr whiteout issues in OCI layer
+# When a directory becomes a symlink, umoci creates whiteouts inside it, but
+# puts them after the symlink in the tar. Docker fails because it can't create
+# files inside a symlink. This function replaces individual whiteouts with
+# opaque whiteouts and fixes tar ordering.
+oci_fix_merged_usr_whiteouts() {
+    local image_dir="$1"
+    local tag="$2"
+    local needs_fix=false
+
+    # Find the manifest for this tag
+    local manifest_digest=$(jq -r '.manifests[] | select(.annotations["org.opencontainers.image.ref.name"] == "'"$tag"'") | .digest' "$image_dir/index.json" | sed 's/sha256://')
+    if [ -z "$manifest_digest" ]; then
+        bbdebug 1 "OCI fix: Could not find manifest for tag $tag"
+        return 0
+    fi
+
+    # Get the last layer (newest, the one we just added)
+    local layer_digest=$(jq -r '.layers[-1].digest' "$image_dir/blobs/sha256/$manifest_digest" | sed 's/sha256://')
+    if [ -z "$layer_digest" ]; then
+        bbdebug 1 "OCI fix: Could not find layer digest"
+        return 0
+    fi
+
+    local layer_blob="$image_dir/blobs/sha256/$layer_digest"
+    if [ ! -f "$layer_blob" ]; then
+        bbdebug 1 "OCI fix: Layer blob not found: $layer_blob"
+        return 0
+    fi
+
+    # Convert to absolute path before we cd elsewhere
+    layer_blob=$(readlink -f "$layer_blob")
+    image_dir=$(readlink -f "$image_dir")
+
+    # Get tar listing with details to identify symlinks and whiteouts
+    local layer_listing=$(tar -tvzf "$layer_blob" 2>/dev/null || true)
+    local layer_files=$(tar -tzf "$layer_blob" 2>/dev/null || true)
+
+    # Find directories that are symlinks but have whiteouts listed inside
+    # Include merged-usr dirs (bin, sbin, lib) and var/* symlinks
+    local dirs_to_fix=""
+    for dir in bin sbin lib lib64 var/lock var/log var/run var/tmp; do
+        # Check if $dir is a symlink in the tar (line starts with 'l')
+        if echo "$layer_listing" | grep -q "^l.* ${dir} -> "; then
+            # Check if there are whiteouts "inside" it
+            if echo "$layer_files" | grep -q "^${dir}/\.wh\."; then
+                bbnote "OCI fix: Found problematic whiteout pattern in $dir"
+                dirs_to_fix="$dirs_to_fix $dir"
+                needs_fix=true
+            fi
+        fi
+    done
+
+    if [ "$needs_fix" != "true" ]; then
+        bbdebug 1 "OCI fix: No merged-usr whiteout issues detected"
+        return 0
+    fi
+
+    bbnote "OCI fix: Fixing merged-usr whiteout ordering in layer"
+    bbnote "OCI fix: Directories to fix:$dirs_to_fix"
+
+    # Save current directory
+    local orig_dir=$(pwd)
+
+    # Create temp directory for fix
+    local fix_dir=$(mktemp -d)
+    local fixed_tar="$fix_dir/fixed-layer.tar"
+
+    cd "$fix_dir"
+
+    # Strategy: Simply remove the problematic whiteouts
+    # The symlink itself will hide the base directory contents.
+    # We don't need opaque whiteouts - they would hide ALL base content.
+
+    # Build exclude pattern - whiteouts in symlinked dirs
+    local exclude_pattern=""
+    for dir in $dirs_to_fix; do
+        exclude_pattern="${exclude_pattern}|^${dir}/\\.wh\\."
+    done
+    exclude_pattern="${exclude_pattern#|}"  # Remove leading |
+
+    # Use Python to filter the tar - just remove problematic whiteouts
+    python3 << PYEOF
+import tarfile
+import gzip
+import re
+
+src_blob = "$layer_blob"
+dst_tar = "$fixed_tar"
+exclude_re = re.compile(r'$exclude_pattern')
+
+removed_count = 0
+
+# Read source tar and filter out problematic whiteouts
+with gzip.open(src_blob, 'rb') as gz:
+    with tarfile.open(fileobj=gz, mode='r:') as src:
+        with tarfile.open(dst_tar, 'w') as dst:
+            for member in src.getmembers():
+                # Skip whiteouts in dirs that became symlinks
+                if exclude_re.match(member.name):
+                    removed_count += 1
+                    continue
+
+                # Copy the member
+                if member.isfile():
+                    dst.addfile(member, src.extractfile(member))
+                else:
+                    dst.addfile(member)
+
+print(f"Removed {removed_count} problematic whiteouts from layer")
+PYEOF
+
+    # Calculate diff_id (uncompressed digest) before compressing
+    local new_diff_id=$(sha256sum "$fixed_tar" | cut -d' ' -f1)
+    local old_diff_id=$(gunzip -c "$layer_blob" | sha256sum | cut -d' ' -f1)
+
+    # Compress the fixed tar
+    gzip -n -f "$fixed_tar"
+    local fixed_blob="$fixed_tar.gz"
+
+    # Calculate new digest (compressed)
+    local new_digest=$(sha256sum "$fixed_blob" | cut -d' ' -f1)
+    local new_size=$(stat -c%s "$fixed_blob")
+
+    bbnote "OCI fix: New layer digest: sha256:$new_digest (was sha256:$layer_digest)"
+    bbnote "OCI fix: New diff_id: sha256:$new_diff_id (was sha256:$old_diff_id)"
+
+    # Replace the blob
+    cp "$fixed_blob" "$image_dir/blobs/sha256/$new_digest"
+    rm -f "$image_dir/blobs/sha256/$layer_digest"
+
+    # Update manifest with new layer digest and size
+    local manifest_file="$image_dir/blobs/sha256/$manifest_digest"
+    jq --arg old "sha256:$layer_digest" --arg new "sha256:$new_digest" --argjson size "$new_size" \
+        '(.layers[] | select(.digest == $old)) |= (.digest = $new | .size = $size)' \
+        "$manifest_file" > "$manifest_file.new"
+    mv "$manifest_file.new" "$manifest_file"
+
+    # Get config digest from manifest and update diff_ids in config
+    local config_digest=$(jq -r '.config.digest' "$manifest_file" | sed 's/sha256://')
+    local config_file="$image_dir/blobs/sha256/$config_digest"
+
+    bbnote "OCI fix: Updating config $config_digest"
+
+    # Update the last diff_id in the config (our layer)
+    # Use direct index replacement since we know which layer we fixed
+    jq --arg new "sha256:$new_diff_id" \
+        '.rootfs.diff_ids[-1] = $new' \
+        "$config_file" > "$config_file.new"
+    mv "$config_file.new" "$config_file"
+
+    # Recalculate config digest
+    local new_config_digest=$(sha256sum "$config_file" | cut -d' ' -f1)
+    local new_config_size=$(stat -c%s "$config_file")
+
+    if [ "$new_config_digest" != "$config_digest" ]; then
+        mv "$config_file" "$image_dir/blobs/sha256/$new_config_digest"
+        # Update manifest with new config digest
+        jq --arg old "sha256:$config_digest" --arg new "sha256:$new_config_digest" --argjson size "$new_config_size" \
+            '.config |= (if .digest == $old then .digest = $new | .size = $size else . end)' \
+            "$manifest_file" > "$manifest_file.new"
+        mv "$manifest_file.new" "$manifest_file"
+    fi
+
+    # Recalculate manifest digest
+    local new_manifest_digest=$(sha256sum "$manifest_file" | cut -d' ' -f1)
+    local new_manifest_size=$(stat -c%s "$manifest_file")
+
+    if [ "$new_manifest_digest" != "$manifest_digest" ]; then
+        mv "$manifest_file" "$image_dir/blobs/sha256/$new_manifest_digest"
+        # Update index.json
+        jq --arg old "sha256:$manifest_digest" --arg new "sha256:$new_manifest_digest" --argjson size "$new_manifest_size" \
+            '(.manifests[] | select(.digest == $old)) |= (.digest = $new | .size = $size)' \
+            "$image_dir/index.json" > "$image_dir/index.json.new"
+        mv "$image_dir/index.json.new" "$image_dir/index.json"
+    fi
+
+    # Restore original directory and cleanup
+    cd "$orig_dir"
+    rm -rf "$fix_dir"
+
+    bbnote "OCI fix: Layer whiteout fix complete"
+}
+
 IMAGE_CMD:oci() {
     umoci_options=""
 
@@ -69,22 +253,97 @@ IMAGE_CMD:oci() {
 	OCI_IMAGE_TAG="initial-tag"
     fi
 
-    if [ -n "$new_image" ]; then
-	bbdebug 1 "OCI: umoci init --layout $image_name"
-	umoci init --layout $image_name
-	umoci new --image $image_name:${OCI_IMAGE_TAG}
-	umoci unpack --rootless --image $image_name:${OCI_IMAGE_TAG} $image_bundle_name
+    # ========================================================================
+    # PHASE 1: Initialize OCI layout (from scratch or from base image)
+    # ========================================================================
+    if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
+        # Using a base image
+        base_oci_dir=""
+        base_tag="${OCI_BASE_IMAGE_TAG}"
+
+        if [ -n "${_OCI_BASE_RECIPE}" ]; then
+            # Use exact symlink naming: ${recipe}-${tag}-oci
+            base_oci_dir="${DEPLOY_DIR_IMAGE}/${_OCI_BASE_RECIPE}-${base_tag}-oci"
+
+            if [ ! -d "$base_oci_dir" ] || [ ! -f "$base_oci_dir/index.json" ]; then
+                bbfatal "OCI: Base image '${_OCI_BASE_RECIPE}' not found at expected path: $base_oci_dir"
+            fi
+        elif [ -n "${_OCI_BASE_PATH}" ]; then
+            base_oci_dir="${_OCI_BASE_PATH}"
+            if [ ! -d "$base_oci_dir" ] || [ ! -f "$base_oci_dir/index.json" ]; then
+                bbfatal "OCI: Base image path not valid: $base_oci_dir"
+            fi
+        fi
+
+        # Resolve symlinks to get actual directory
+        base_oci_dir=$(readlink -f "$base_oci_dir")
+        bbnote "OCI: Using base image from: $base_oci_dir"
+
+        # Copy base image layout to our image directory (-L to follow symlinks)
+        cp -rL "$base_oci_dir" "$image_name"
+
+        # Count existing layers for logging (simplified)
+        base_layers=$(ls "$image_name/blobs/sha256/" 2>/dev/null | wc -l)
+        bbnote "OCI: Base image has approximately $base_layers blob(s)"
+
+        # Unpack base image for modification
+        umoci unpack --rootless --image "$image_name:$base_tag" "$image_bundle_name"
+    elif [ -n "$new_image" ]; then
+        # No base image - create empty OCI layout
+        bbdebug 1 "OCI: umoci init --layout $image_name"
+        umoci init --layout $image_name
+        umoci new --image $image_name:${OCI_IMAGE_TAG}
+        umoci unpack --rootless --image $image_name:${OCI_IMAGE_TAG} $image_bundle_name
     else
-	# todo: create a different tag, after checking if the passed one exists
-	true
+        # todo: create a different tag, after checking if the passed one exists
+        true
     fi
 
+    # ========================================================================
+    # PHASE 2: Add content layer(s)
+    # ========================================================================
     bbdebug 1 "OCI: populating rootfs"
-    bbdebug 1 "OCI: cp -r ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs/"
-    cp -r -a --no-preserve=ownership ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs
 
-    bbdebug 1 "OCI: umoci repack --image $image_name:${OCI_IMAGE_TAG} $image_bundle_name"
-    umoci repack --image $image_name:${OCI_IMAGE_TAG} $image_bundle_name
+    # Use rsync for robust merging when base image exists (handles symlink vs dir conflicts)
+    # For no-base builds, cp is sufficient and faster
+    # Note: When source has symlinks replacing dest directories, we first remove conflicting dirs
+    if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
+        # Handle Yocto's merged-usr symlinks (/bin -> /usr/bin) and /var symlinks
+        # replacing Alpine's or other base image directories
+        for p in bin lib lib64 sbin var/lock var/log var/tmp; do
+            src="${IMAGE_ROOTFS}/$p"
+            dst="$image_bundle_name/rootfs/$p"
+            if [ -L "$src" ] && [ -d "$dst" ] && [ ! -L "$dst" ]; then
+                bbdebug 1 "OCI: removing directory $dst to replace with symlink"
+                rm -rf "$dst"
+            fi
+        done
+        bbdebug 1 "OCI: rsync -a --no-owner --no-group ${IMAGE_ROOTFS}/ $image_bundle_name/rootfs/"
+        rsync -a --no-owner --no-group ${IMAGE_ROOTFS}/ $image_bundle_name/rootfs/
+    else
+        bbdebug 1 "OCI: cp -r ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs/"
+        cp -r -a --no-preserve=ownership ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs
+    fi
+
+    # Determine which tag to use for repack
+    repack_tag="${OCI_IMAGE_TAG}"
+    if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
+        repack_tag="${OCI_BASE_IMAGE_TAG}"
+    fi
+
+    bbdebug 1 "OCI: umoci repack --image $image_name:$repack_tag $image_bundle_name"
+    umoci repack --image $image_name:$repack_tag $image_bundle_name
+
+    # If we used a base image with different tag, re-tag to our target tag
+    if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
+        if [ "$repack_tag" != "${OCI_IMAGE_TAG}" ]; then
+            umoci tag --image "$image_name:$repack_tag" "${OCI_IMAGE_TAG}"
+        fi
+
+        # Log final layer count (simplified - count blobs minus config/manifest)
+        final_blobs=$(ls "$image_name/blobs/sha256/" 2>/dev/null | wc -l)
+        bbnote "OCI: Final image has approximately $final_blobs blob(s)"
+    fi
 
     bbdebug 1 "OCI: configuring image"
     if [ -n "${OCI_IMAGE_LABELS}" ]; then
@@ -137,12 +396,30 @@ IMAGE_CMD:oci() {
 	bbnote "OCI: image subarch is set to: ${OCI_IMAGE_SUBARCH}, but umoci does not"
 	bbnote "     expose variants. use sloci instead if this is important"
     fi
-    umoci config --image $image_name:${OCI_IMAGE_TAG} \
-	  ${@" ".join("--config.entrypoint %s" % s for s in d.getVar("OCI_IMAGE_ENTRYPOINT").split())}
+    # Set entrypoint if specified (for wrapper script patterns)
+    if [ -n "${OCI_IMAGE_ENTRYPOINT}" ]; then
+	umoci config --image $image_name:${OCI_IMAGE_TAG} \
+	    ${@" ".join("--config.entrypoint '%s'" % s for s in __import__('shlex').split(d.getVar("OCI_IMAGE_ENTRYPOINT")))}
+    fi
+    # Set CMD: use OCI_IMAGE_ENTRYPOINT_ARGS if set (legacy), otherwise OCI_IMAGE_CMD
     if [ -n "${OCI_IMAGE_ENTRYPOINT_ARGS}" ]; then
-	umoci config --image $image_name:${OCI_IMAGE_TAG} ${@" ".join("--config.cmd %s" % s for s in d.getVar("OCI_IMAGE_ENTRYPOINT_ARGS").split())}
+	umoci config --image $image_name:${OCI_IMAGE_TAG} ${@" ".join("--config.cmd '%s'" % s for s in __import__('shlex').split(d.getVar("OCI_IMAGE_ENTRYPOINT_ARGS")))}
+    elif [ -n "${OCI_IMAGE_CMD}" ]; then
+	umoci config --image $image_name:${OCI_IMAGE_TAG} ${@" ".join("--config.cmd '%s'" % s for s in __import__('shlex').split(d.getVar("OCI_IMAGE_CMD")))}
     fi
     umoci config --image $image_name:${OCI_IMAGE_TAG} --author ${OCI_IMAGE_AUTHOR_EMAIL}
+
+    # ========================================================================
+    # PHASE 3: Fix merged-usr whiteout issues for non-merged-usr base images
+    # ========================================================================
+    # When layering merged-usr (symlinks) on traditional layout (directories),
+    # umoci creates whiteouts like bin/.wh.file but puts them AFTER the bin symlink
+    # in the tar. Docker can't create files inside a symlink, causing pull failures.
+    # Fix: Replace individual whiteouts with opaque whiteouts, reorder tar entries.
+    # NOTE: Must run AFTER all umoci config commands since they create new config blobs.
+    if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
+        oci_fix_merged_usr_whiteouts "$image_name" "${OCI_IMAGE_TAG}"
+    fi
 
     # OCI_IMAGE_TAG may contain ":", but these are not allowed in OCI file
     # names so replace them
