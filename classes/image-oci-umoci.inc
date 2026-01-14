@@ -1,3 +1,69 @@
+# =============================================================================
+# Python function to pre-install packages for multi-layer OCI
+# =============================================================================
+# This function runs before IMAGE_CMD:oci and installs packages to temp rootfs
+# directories using Yocto's package manager classes. The shell code then copies
+# from these pre-installed directories.
+
+python oci_multilayer_install_packages() {
+    """
+    Pre-install packages for each packages layer in OCI_LAYERS.
+
+    Creates temp rootfs directories with packages installed using Yocto's PM.
+    The shell IMAGE_CMD:oci then copies from these directories.
+    """
+    import os
+    import shutil
+
+    layer_mode = d.getVar('OCI_LAYER_MODE') or 'single'
+    if layer_mode != 'multi':
+        bb.debug(1, "OCI: Not in multi-layer mode, skipping pre-install")
+        return
+
+    oci_layers = d.getVar('OCI_LAYERS') or ''
+    if not oci_layers.strip():
+        return
+
+    workdir = d.getVar('WORKDIR')
+    layer_rootfs_base = os.path.join(workdir, 'oci-layer-rootfs')
+
+    # Clean up any previous layer rootfs directories
+    if os.path.exists(layer_rootfs_base):
+        shutil.rmtree(layer_rootfs_base)
+    bb.utils.mkdirhier(layer_rootfs_base)
+
+    bb.note("OCI: Pre-installing packages for multi-layer mode")
+
+    # Parse OCI_LAYERS and install packages for each packages layer
+    layer_num = 0
+    for layer_def in oci_layers.split():
+        parts = layer_def.split(':')
+        if len(parts) < 3:
+            continue
+        layer_name = parts[0]
+        layer_type = parts[1]
+        layer_content = ':'.join(parts[2:]).replace('+', ' ')
+
+        if layer_type == 'packages':
+            layer_num += 1
+            layer_rootfs = os.path.join(layer_rootfs_base, f'layer-{layer_num}-{layer_name}')
+
+            bb.note(f"OCI: Pre-installing layer {layer_num} '{layer_name}' to {layer_rootfs}")
+
+            # Call the package installation function
+            oci_install_layer_packages(d, layer_rootfs, layer_content, layer_name)
+
+            # Store the path for the shell code to use
+            d.setVar(f'OCI_LAYER_{layer_num}_ROOTFS', layer_rootfs)
+            d.setVar(f'OCI_LAYER_{layer_num}_NAME', layer_name)
+
+    d.setVar('OCI_LAYER_COUNT', str(layer_num))
+    bb.note(f"OCI: Pre-installed packages for {layer_num} layers")
+}
+
+# Run the Python function before IMAGE_CMD:oci
+do_image_oci[prefuncs] += "oci_multilayer_install_packages"
+
 # Fix merged-usr whiteout issues in OCI layer
 # When a directory becomes a symlink, umoci creates whiteouts inside it, but
 # puts them after the symlink in the tar. Docker fails because it can't create
@@ -304,35 +370,113 @@ IMAGE_CMD:oci() {
     # ========================================================================
     bbdebug 1 "OCI: populating rootfs"
 
-    # Use rsync for robust merging when base image exists (handles symlink vs dir conflicts)
-    # For no-base builds, cp is sufficient and faster
-    # Note: When source has symlinks replacing dest directories, we first remove conflicting dirs
-    if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
-        # Handle Yocto's merged-usr symlinks (/bin -> /usr/bin) and /var symlinks
-        # replacing Alpine's or other base image directories
-        for p in bin lib lib64 sbin var/lock var/log var/tmp; do
-            src="${IMAGE_ROOTFS}/$p"
-            dst="$image_bundle_name/rootfs/$p"
-            if [ -L "$src" ] && [ -d "$dst" ] && [ ! -L "$dst" ]; then
-                bbdebug 1 "OCI: removing directory $dst to replace with symlink"
-                rm -rf "$dst"
-            fi
-        done
-        bbdebug 1 "OCI: rsync -a --no-owner --no-group ${IMAGE_ROOTFS}/ $image_bundle_name/rootfs/"
-        rsync -a --no-owner --no-group ${IMAGE_ROOTFS}/ $image_bundle_name/rootfs/
-    else
-        bbdebug 1 "OCI: cp -r ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs/"
-        cp -r -a --no-preserve=ownership ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs
-    fi
-
     # Determine which tag to use for repack
     repack_tag="${OCI_IMAGE_TAG}"
     if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
         repack_tag="${OCI_BASE_IMAGE_TAG}"
     fi
 
-    bbdebug 1 "OCI: umoci repack --image $image_name:$repack_tag $image_bundle_name"
-    umoci repack --image $image_name:$repack_tag $image_bundle_name
+    if [ "${OCI_LAYER_MODE}" = "multi" ]; then
+        # ==================================================================
+        # Multi-layer mode: Use pre-installed layer rootfs from Python
+        # ==================================================================
+        # The Python prefunc oci_multilayer_install_packages() has already
+        # installed packages to temp rootfs directories using Yocto's PM classes.
+        # We just need to copy from those directories and repack each layer.
+
+        bbnote "OCI: Using multi-layer mode (packages pre-installed by Python PM classes)"
+
+        # Process each layer from OCI_LAYERS
+        oci_layer_num=0
+        oci_pkg_layer_num=0
+        oci_total_layers=0
+        for oci_tmp in ${OCI_LAYERS}; do
+            oci_total_layers=`expr $oci_total_layers + 1`
+        done
+
+        for oci_layer_def in ${OCI_LAYERS}; do
+            oci_layer_num=`expr $oci_layer_num + 1`
+            oci_layer_name=$(echo "$oci_layer_def" | cut -d: -f1)
+            oci_layer_type=$(echo "$oci_layer_def" | cut -d: -f2)
+            oci_layer_content=$(echo "$oci_layer_def" | cut -d: -f3- | tr '+' ' ')
+
+            bbnote "OCI: Processing layer $oci_layer_num/$oci_total_layers: $oci_layer_name ($oci_layer_type)"
+
+            if [ "$oci_layer_type" = "packages" ]; then
+                # Packages were pre-installed by Python. Copy from temp rootfs.
+                oci_pkg_layer_num=`expr $oci_pkg_layer_num + 1`
+                oci_preinstall_rootfs="${WORKDIR}/oci-layer-rootfs/layer-${oci_pkg_layer_num}-${oci_layer_name}"
+
+                if [ -d "$oci_preinstall_rootfs" ]; then
+                    bbnote "OCI: Copying pre-installed packages from $oci_preinstall_rootfs"
+                    # Use rsync to merge into bundle rootfs (handles symlinks properly)
+                    rsync -a --no-owner --no-group "$oci_preinstall_rootfs/" "$image_bundle_name/rootfs/"
+                else
+                    bbwarn "OCI: Pre-installed rootfs not found at $oci_preinstall_rootfs"
+                fi
+
+            elif [ "$oci_layer_type" = "directories" ]; then
+                # Copy directories from IMAGE_ROOTFS
+                for oci_dir in $oci_layer_content; do
+                    if [ -d "${IMAGE_ROOTFS}$oci_dir" ]; then
+                        mkdir -p "$image_bundle_name/rootfs$(dirname $oci_dir)"
+                        cp -a "${IMAGE_ROOTFS}$oci_dir" "$image_bundle_name/rootfs$oci_dir"
+                        bbnote "OCI: Added directory $oci_dir"
+                    fi
+                done
+
+            elif [ "$oci_layer_type" = "files" ]; then
+                # Copy specific files from IMAGE_ROOTFS
+                for oci_file in $oci_layer_content; do
+                    if [ -e "${IMAGE_ROOTFS}$oci_file" ]; then
+                        mkdir -p "$image_bundle_name/rootfs$(dirname $oci_file)"
+                        cp -a "${IMAGE_ROOTFS}$oci_file" "$image_bundle_name/rootfs$oci_file"
+                        bbnote "OCI: Added file $oci_file"
+                    fi
+                done
+            fi
+
+            # Repack to create layer
+            bbnote "OCI: Repacking layer $oci_layer_name"
+            umoci repack --image "$image_name:$repack_tag" "$image_bundle_name"
+
+            # Re-unpack for next layer if not the last one
+            if [ "$oci_layer_num" -lt "$oci_total_layers" ]; then
+                rm -rf "$image_bundle_name"
+                umoci unpack --rootless --image "$image_name:$repack_tag" "$image_bundle_name"
+            fi
+        done
+
+        bbnote "OCI: Created $oci_layer_num layers"
+
+    else
+        # ==================================================================
+        # Single-layer mode: Copy entire rootfs as one layer
+        # ==================================================================
+        # Use rsync for robust merging when base image exists (handles symlink vs dir conflicts)
+        # For no-base builds, cp is sufficient and faster
+        # Note: When source has symlinks replacing dest directories, we first remove conflicting dirs
+        if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then
+            # Handle Yocto's merged-usr symlinks (/bin -> /usr/bin) and /var symlinks
+            # replacing Alpine's or other base image directories
+            for p in bin lib lib64 sbin var/lock var/log var/tmp; do
+                src="${IMAGE_ROOTFS}/$p"
+                dst="$image_bundle_name/rootfs/$p"
+                if [ -L "$src" ] && [ -d "$dst" ] && [ ! -L "$dst" ]; then
+                    bbdebug 1 "OCI: removing directory $dst to replace with symlink"
+                    rm -rf "$dst"
+                fi
+            done
+            bbdebug 1 "OCI: rsync -a --no-owner --no-group ${IMAGE_ROOTFS}/ $image_bundle_name/rootfs/"
+            rsync -a --no-owner --no-group ${IMAGE_ROOTFS}/ $image_bundle_name/rootfs/
+        else
+            bbdebug 1 "OCI: cp -r ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs/"
+            cp -r -a --no-preserve=ownership ${IMAGE_ROOTFS}/* $image_bundle_name/rootfs
+        fi
+
+        bbdebug 1 "OCI: umoci repack --image $image_name:$repack_tag $image_bundle_name"
+        umoci repack --image $image_name:$repack_tag $image_bundle_name
+    fi
 
     # If we used a base image with different tag, re-tag to our target tag
     if [ -n "${_OCI_BASE_RECIPE}" ] || [ -n "${_OCI_BASE_PATH}" ]; then

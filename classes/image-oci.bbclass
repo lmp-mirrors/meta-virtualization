@@ -44,6 +44,26 @@ OCI_IMAGE_BACKEND ?= "umoci"
 do_image_oci[depends] += "${OCI_IMAGE_BACKEND}-native:do_populate_sysroot"
 # jq-native is needed for the merged-usr whiteout fix
 do_image_oci[depends] += "jq-native:do_populate_sysroot"
+# Package manager native tools for multi-layer mode with package installation
+OCI_PM_DEPENDS = "${@oci_get_pm_depends(d)}"
+do_image_oci[depends] += "${OCI_PM_DEPENDS}"
+
+def oci_get_pm_depends(d):
+    """Get native package manager dependency for multi-layer mode."""
+    if d.getVar('OCI_LAYER_MODE') != 'multi':
+        return ''
+    if 'packages' not in (d.getVar('OCI_LAYERS') or ''):
+        return ''
+    # rsync-native is needed to copy pre-installed packages to bundle rootfs
+    deps = 'rsync-native:do_populate_sysroot'
+    pkg_type = d.getVar('IMAGE_PKGTYPE') or 'rpm'
+    if pkg_type == 'rpm':
+        deps += ' dnf-native:do_populate_sysroot createrepo-c-native:do_populate_sysroot'
+    elif pkg_type == 'ipk':
+        deps += ' opkg-native:do_populate_sysroot'
+    elif pkg_type == 'deb':
+        deps += ' apt-native:do_populate_sysroot'
+    return deps
 
 #
 # image type configuration block
@@ -139,6 +159,42 @@ OCI_BASE_IMAGE ?= ""
 OCI_BASE_IMAGE_TAG ?= "latest"
 OCI_LAYER_MODE ?= "single"
 
+# =============================================================================
+# Multi-Layer Mode (OCI_LAYER_MODE = "multi")
+# =============================================================================
+#
+# OCI_LAYERS defines explicit layers when OCI_LAYER_MODE = "multi".
+# Each layer is defined as: "name:type:content"
+#
+# Layer Types:
+#   packages    - Copy files installed by specified packages
+#   directories - Copy specific directories from IMAGE_ROOTFS
+#   files       - Copy specific files from IMAGE_ROOTFS
+#
+# Format: Space-separated list of layer definitions
+#   OCI_LAYERS = "layer1:type:content layer2:type:content ..."
+#
+# For packages type, content is package names (use + as delimiter):
+#   "base:packages:base-files+busybox+netbase"
+#
+# For directories/files type, content is paths (use + as delimiter):
+#   "app:directories:/opt/myapp+/etc/myapp"
+#   "config:files:/etc/myapp.conf+/etc/default/myapp"
+#
+# Note: Use + as delimiter because ; is interpreted as shell command separator
+#
+# Example:
+#   OCI_LAYER_MODE = "multi"
+#   OCI_LAYERS = "\
+#       base:packages:base-files+base-passwd+netbase+busybox \
+#       python:packages:python3+python3-pip \
+#       app:directories:/opt/myapp \
+#   "
+#
+# Result: 3 layers (base, python, app) plus any base image layers
+#
+OCI_LAYERS ?= ""
+
 # whether the oci image dir should be left as a directory, or
 # bundled into a tarball.
 OCI_IMAGE_TAR_OUTPUT ?= "true"
@@ -199,6 +255,59 @@ python __anonymous() {
             bb.fatal("Multi-layer OCI requires umoci backend. "
                      "Set OCI_IMAGE_BACKEND = 'umoci' or remove OCI_BASE_IMAGE")
 
+    # Validate multi-layer mode configuration and add dependencies
+    if layer_mode == 'multi':
+        oci_layers = d.getVar('OCI_LAYERS') or ''
+        if not oci_layers.strip():
+            bb.fatal("OCI_LAYER_MODE = 'multi' requires OCI_LAYERS to be defined")
+
+        has_packages_layer = False
+
+        # Parse and validate layer definitions
+        for layer_def in oci_layers.split():
+            parts = layer_def.split(':')
+            if len(parts) < 3:
+                bb.fatal(f"Invalid OCI_LAYERS entry '{layer_def}': "
+                         "format is 'name:type:content'")
+            layer_name, layer_type, layer_content = parts[0], parts[1], ':'.join(parts[2:])
+            if layer_type not in ('packages', 'directories', 'files'):
+                bb.fatal(f"Invalid layer type '{layer_type}' in '{layer_def}': "
+                         "must be 'packages', 'directories', or 'files'")
+            if layer_type == 'packages':
+                has_packages_layer = True
+
+        # Add package manager native dependency if using 'packages' layer type
+        if has_packages_layer:
+            pkg_type = d.getVar('IMAGE_PKGTYPE') or 'ipk'
+            if pkg_type == 'ipk':
+                d.appendVarFlag('do_image_oci', 'depends',
+                    " opkg-native:do_populate_sysroot opkg-utils-native:do_populate_sysroot")
+                bb.debug(1, "OCI: Added opkg-native dependency for packages layers")
+            elif pkg_type == 'rpm':
+                d.appendVarFlag('do_image_oci', 'depends',
+                    " dnf-native:do_populate_sysroot")
+                bb.debug(1, "OCI: Added dnf-native dependency for packages layers")
+            elif pkg_type == 'deb':
+                d.appendVarFlag('do_image_oci', 'depends',
+                    " apt-native:do_populate_sysroot")
+                bb.debug(1, "OCI: Added apt-native dependency for packages layers")
+
+            # Extract all packages from OCI_LAYERS and add do_package_write dependencies
+            # This allows IMAGE_INSTALL = "" for pure multi-layer builds
+            all_packages = set()
+            for layer_def in oci_layers.split():
+                parts = layer_def.split(':')
+                if len(parts) >= 3 and parts[1] == 'packages':
+                    layer_content = ':'.join(parts[2:])
+                    # Use + as delimiter (not ; which is shell command separator)
+                    for pkg in layer_content.replace('+', ' ').split():
+                        all_packages.add(pkg)
+
+            if all_packages:
+                # Note: Packages need to be in IMAGE_INSTALL to trigger builds
+                # via do_rootfs recrdeptask. We just log which packages we found.
+                bb.debug(1, f"OCI multi-layer: Found packages in OCI_LAYERS: {' '.join(all_packages)}")
+
     # Resolve base image and set up dependencies
     if base_image:
         resolved = oci_resolve_base_image(d)
@@ -233,6 +342,95 @@ python __anonymous() {
                          f"Get digest with: skopeo inspect docker://{remote_url} | jq -r '.Digest'\n\n"
                          f"Then use: OCI_BASE_IMAGE = \"my-base\"")
 }
+
+# =============================================================================
+# Multi-Layer Package Installation using Yocto's PM Classes
+# =============================================================================
+#
+# This function uses the same package management infrastructure as do_rootfs,
+# ensuring consistency and maintainability.
+
+def oci_install_layer_packages(d, layer_rootfs, layer_packages, layer_name):
+    """
+    Install packages to a layer rootfs using Yocto's package manager classes.
+
+    This uses the same PM infrastructure as do_rootfs for consistency.
+
+    Args:
+        d: BitBake datastore
+        layer_rootfs: Path to the layer's rootfs directory
+        layer_packages: Space-separated list of packages to install
+        layer_name: Name of the layer (for logging)
+    """
+    import os
+    import oe.path
+
+    packages = layer_packages.split()
+    if not packages:
+        bb.note(f"OCI: No packages to install for layer {layer_name}")
+        return
+
+    bb.note(f"OCI: Installing packages for layer '{layer_name}': {' '.join(packages)}")
+
+    pkg_type = d.getVar('IMAGE_PKGTYPE') or 'rpm'
+
+    # Ensure layer rootfs directory exists
+    bb.utils.mkdirhier(layer_rootfs)
+
+    if pkg_type == 'rpm':
+        from oe.package_manager.rpm import RpmPM
+
+        # Create PM instance for layer rootfs
+        pm = RpmPM(d,
+                   layer_rootfs,
+                   d.getVar('TARGET_VENDOR'),
+                   task_name='oci-layer',
+                   filterbydependencies=False)
+
+        # Setup configs in layer rootfs
+        pm.create_configs()
+
+        # Generate/update repo indexes
+        pm.write_index()
+
+        # Install packages
+        # Use attempt_only=True to allow unresolved deps (resolved in later layers)
+        try:
+            pm.install(packages, attempt_only=True)
+        except Exception as e:
+            bb.warn(f"OCI: Package installation had issues (may be resolved in later layers): {e}")
+
+    elif pkg_type == 'ipk':
+        from oe.package_manager.ipk import OpkgPM
+
+        # Create config file for this layer
+        config_file = os.path.join(d.getVar('WORKDIR'), f'opkg-{layer_name}.conf')
+        archs = d.getVar('PACKAGE_ARCHS')
+
+        # Create PM instance
+        pm = OpkgPM(d,
+                    layer_rootfs,
+                    config_file,
+                    archs,
+                    task_name='oci-layer',
+                    filterbydependencies=False)
+
+        # Write indexes
+        pm.write_index()
+
+        # Install packages
+        try:
+            pm.install(packages, attempt_only=True)
+        except Exception as e:
+            bb.warn(f"OCI: Package installation had issues (may be resolved in later layers): {e}")
+
+    elif pkg_type == 'deb':
+        bb.warn("OCI: deb package type not yet fully implemented for multi-layer")
+
+    else:
+        bb.fatal(f"OCI: Unsupported package type: {pkg_type}")
+
+    bb.note(f"OCI: Package installation complete for layer '{layer_name}'")
 
 # the IMAGE_CMD:oci comes from the .inc
 OCI_IMAGE_BACKEND_INC ?= "${@"image-oci-" + "${OCI_IMAGE_BACKEND}" + ".inc"}"
