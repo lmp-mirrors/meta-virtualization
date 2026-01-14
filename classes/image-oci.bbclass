@@ -42,6 +42,8 @@ IMAGE_TYPEDEP:oci = "container tar.bz2"
 # OCI_IMAGE_BACKEND ?= "sloci-image"
 OCI_IMAGE_BACKEND ?= "umoci"
 do_image_oci[depends] += "${OCI_IMAGE_BACKEND}-native:do_populate_sysroot"
+# jq-native is needed for the merged-usr whiteout fix
+do_image_oci[depends] += "jq-native:do_populate_sysroot"
 
 #
 # image type configuration block
@@ -55,8 +57,12 @@ OCI_IMAGE_RUNTIME_UID ?= ""
 OCI_IMAGE_ARCH ?= "${@oe.go.map_arch(d.getVar('TARGET_ARCH'))}"
 OCI_IMAGE_SUBARCH ?= "${@oci_map_subarch(d.getVar('TARGET_ARCH'), d.getVar('TUNE_FEATURES'), d)}"
 
-OCI_IMAGE_ENTRYPOINT ?= "sh"
+# OCI_IMAGE_ENTRYPOINT: If set, this command always runs (args appended).
+# OCI_IMAGE_CMD: Default command (replaced when user passes arguments).
+# Most base images use CMD only for flexibility. Use ENTRYPOINT for wrapper scripts.
+OCI_IMAGE_ENTRYPOINT ?= ""
 OCI_IMAGE_ENTRYPOINT_ARGS ?= ""
+OCI_IMAGE_CMD ?= "/bin/sh"
 OCI_IMAGE_WORKINGDIR ?= ""
 OCI_IMAGE_STOPSIGNAL ?= ""
 
@@ -112,6 +118,27 @@ OCI_IMAGE_BUILD_DATE ?= ""
 # Enable/disable auto-detection of git metadata (set to "0" to disable)
 OCI_IMAGE_AUTO_LABELS ?= "1"
 
+# =============================================================================
+# Multi-Layer OCI Support
+# =============================================================================
+#
+# OCI_BASE_IMAGE: Base image to build on top of
+#   - Recipe name: "container-base" (uses local recipe's OCI output)
+#   - Path: "/path/to/oci-dir" (uses existing OCI layout)
+#   - Registry URL: "docker.io/library/alpine:3.19" (fetches external image)
+#
+# OCI_LAYER_MODE: How to create layers
+#   - "single" (default): Single layer with complete rootfs (backward compatible)
+#   - "multi": Multiple layers from OCI_LAYERS definitions
+#
+# When OCI_BASE_IMAGE is set:
+#   - Base image layers are preserved
+#   - New content from IMAGE_ROOTFS is added as additional layer(s)
+#
+OCI_BASE_IMAGE ?= ""
+OCI_BASE_IMAGE_TAG ?= "latest"
+OCI_LAYER_MODE ?= "single"
+
 # whether the oci image dir should be left as a directory, or
 # bundled into a tarball.
 OCI_IMAGE_TAR_OUTPUT ?= "true"
@@ -130,6 +157,82 @@ def oci_map_subarch(a, f, d):
             return 'v5'
             return ''
     return ''
+
+# =============================================================================
+# Base Image Resolution and Dependency Setup
+# =============================================================================
+
+def oci_resolve_base_image(d):
+    """Resolve OCI_BASE_IMAGE to determine its type.
+
+    Returns dict with 'type' key:
+      - {'type': 'recipe', 'name': 'container-base'}
+      - {'type': 'path', 'path': '/path/to/oci-dir'}
+      - {'type': 'remote', 'url': 'docker.io/library/alpine:3.19'}
+      - None if no base image
+    """
+    base = d.getVar('OCI_BASE_IMAGE') or ''
+    if not base:
+        return None
+
+    # Check if it's a path (starts with /)
+    if base.startswith('/'):
+        return {'type': 'path', 'path': base}
+
+    # Check if it looks like a registry URL (contains / or has registry prefix)
+    if '/' in base or '.' in base.split(':')[0]:
+        return {'type': 'remote', 'url': base}
+
+    # Assume it's a recipe name
+    return {'type': 'recipe', 'name': base}
+
+python __anonymous() {
+    import os
+
+    backend = d.getVar('OCI_IMAGE_BACKEND') or 'umoci'
+    base_image = d.getVar('OCI_BASE_IMAGE') or ''
+    layer_mode = d.getVar('OCI_LAYER_MODE') or 'single'
+
+    # sloci doesn't support multi-layer
+    if backend == 'sloci-image':
+        if layer_mode != 'single' or base_image:
+            bb.fatal("Multi-layer OCI requires umoci backend. "
+                     "Set OCI_IMAGE_BACKEND = 'umoci' or remove OCI_BASE_IMAGE")
+
+    # Resolve base image and set up dependencies
+    if base_image:
+        resolved = oci_resolve_base_image(d)
+        if resolved:
+            if resolved['type'] == 'recipe':
+                # Add dependency on base recipe's OCI output
+                # Use do_build as it works for both image recipes and oci-fetch recipes
+                base_recipe = resolved['name']
+                d.setVar('_OCI_BASE_RECIPE', base_recipe)
+                d.appendVarFlag('do_image_oci', 'depends',
+                    f" {base_recipe}:do_build rsync-native:do_populate_sysroot")
+                bb.debug(1, f"OCI: Using base image from recipe: {base_recipe}")
+
+            elif resolved['type'] == 'path':
+                d.setVar('_OCI_BASE_PATH', resolved['path'])
+                d.appendVarFlag('do_image_oci', 'depends',
+                    " rsync-native:do_populate_sysroot")
+                bb.debug(1, f"OCI: Using base image from path: {resolved['path']}")
+
+            elif resolved['type'] == 'remote':
+                # Remote URLs are not supported directly - use a container-bundle recipe
+                remote_url = resolved['url']
+                # Create sanitized key for CONTAINER_DIGESTS varflag
+                sanitized_key = remote_url.replace('/', '_').replace(':', '_')
+                bb.fatal(f"Remote base images cannot be used directly: {remote_url}\n\n"
+                         f"Create a container-bundle recipe to fetch the external image:\n\n"
+                         f"  # recipes-containers/oci-base-images/my-base.bb\n"
+                         f"  inherit container-bundle\n"
+                         f"  CONTAINER_BUNDLES = \"{remote_url}\"\n"
+                         f"  CONTAINER_DIGESTS[{sanitized_key}] = \"sha256:...\"\n"
+                         f"  CONTAINER_BUNDLE_DEPLOY = \"1\"\n\n"
+                         f"Get digest with: skopeo inspect docker://{remote_url} | jq -r '.Digest'\n\n"
+                         f"Then use: OCI_BASE_IMAGE = \"my-base\"")
+}
 
 # the IMAGE_CMD:oci comes from the .inc
 OCI_IMAGE_BACKEND_INC ?= "${@"image-oci-" + "${OCI_IMAGE_BACKEND}" + ".inc"}"
