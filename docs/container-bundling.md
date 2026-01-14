@@ -193,6 +193,70 @@ OCI_LAYERS = "\
 "
 ```
 
+### Layer Caching
+
+Multi-layer builds cache pre-installed package layers for faster rebuilds.
+Installing packages requires configuring the package manager, resolving
+dependencies, and running post-install scripts - this is slow. Caching
+saves the fully-installed layer rootfs after the first build so subsequent
+builds can skip package installation entirely.
+
+#### Configuration
+
+    # Enabled by default
+    OCI_LAYER_CACHE ?= "1"
+    OCI_LAYER_CACHE_DIR ?= "${TOPDIR}/oci-layer-cache/${MACHINE}"
+
+#### Cache Key Components
+
+The cache key is a SHA256 hash of:
+
+| Component | Why It Matters |
+|-----------|----------------|
+| Layer name | Different layers cached separately |
+| Layer type | `packages` vs `directories` vs `files` |
+| Package list (sorted) | Adding/removing packages invalidates cache |
+| Package versions | Upgrading a package invalidates cache |
+| MACHINE, TUNE_PKGARCH | Architecture-specific packages |
+
+#### Advantages
+
+**Faster rebuilds**: Subsequent builds restore cached layers in ~1 second
+instead of ~10-30 seconds per layer for package installation.
+
+**Efficient development**: When only your app layer changes, base and
+dependency layers are restored from cache:
+
+    OCI_LAYERS = "\
+        base:packages:base-files+busybox \      # Cached - stable
+        deps:packages:python3+python3-pip \     # Cached - stable
+        app:packages:myapp \                    # Rebuilt - changes often
+    "
+
+**Automatic invalidation**: Cache invalidates when packages change version,
+layers are modified, or architecture changes. No manual clearing needed.
+
+**Shared across recipes**: Cache stored in `${TOPDIR}/oci-layer-cache/` so
+recipes with identical layers share the same cached content.
+
+#### Build Log Example
+
+    # First build - cache misses
+    NOTE: OCI Cache MISS: Layer 'base' (base:base-files=3.0.14 ...)
+    NOTE: OCI Cache: Saving layer 'base' to cache (be88c180f651416b)
+    NOTE: OCI: Pre-installed packages for 3 layers (cache: 0 hits, 3 misses)
+
+    # Second build - cache hits
+    NOTE: OCI Cache HIT: Layer 'base' (be88c180f651416b)
+    NOTE: OCI: Pre-installed packages for 3 layers (cache: 3 hits, 0 misses)
+
+#### When to Disable
+
+Disable caching with `OCI_LAYER_CACHE = "0"` if you:
+- Suspect cache corruption
+- Need fully reproducible builds with no local state
+- Are debugging package installation issues
+
 ### OCI_IMAGE_CMD vs OCI_IMAGE_ENTRYPOINT
 
     # CMD (default) - replaced when user passes arguments

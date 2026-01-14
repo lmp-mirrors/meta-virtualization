@@ -5,12 +5,152 @@
 # directories using Yocto's package manager classes. The shell code then copies
 # from these pre-installed directories.
 
+def oci_compute_layer_cache_key(d, layer_name, layer_type, layer_packages):
+    """
+    Compute a cache key for a layer based on its definition and package versions.
+
+    The cache key is a SHA256 hash of:
+    - Layer name and type
+    - Sorted package list
+    - Package versions from PKGDATA_DIR
+    - Machine and architecture info
+
+    Returns: (cache_key, cache_info) tuple where cache_info is human-readable
+    """
+    import hashlib
+    import os
+    import json
+
+    packages = sorted(layer_packages.split())
+    pkgdata_dir = d.getVar('PKGDATA_DIR')
+    machine = d.getVar('MACHINE')
+    tune_pkgarch = d.getVar('TUNE_PKGARCH')
+
+    # Build cache key components
+    cache_components = {
+        'layer_name': layer_name,
+        'layer_type': layer_type,
+        'packages': packages,
+        'machine': machine,
+        'tune_pkgarch': tune_pkgarch,
+        'pkg_versions': {}
+    }
+
+    # Get package versions from pkgdata
+    for pkg in packages:
+        pkg_info_file = os.path.join(pkgdata_dir, 'runtime', pkg)
+        if os.path.exists(pkg_info_file):
+            try:
+                with open(pkg_info_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('PKGV:'):
+                            cache_components['pkg_versions'][pkg] = line.split(':', 1)[1].strip()
+                            break
+                        elif line.startswith(f'PKGV_{pkg}:'):
+                            cache_components['pkg_versions'][pkg] = line.split(':', 1)[1].strip()
+                            break
+            except Exception:
+                pass
+
+    # Create deterministic JSON for hashing
+    cache_json = json.dumps(cache_components, sort_keys=True)
+    cache_key = hashlib.sha256(cache_json.encode()).hexdigest()[:16]
+
+    # Human-readable info for logging
+    pkg_vers = [f"{p}={cache_components['pkg_versions'].get(p, '?')}" for p in packages[:3]]
+    if len(packages) > 3:
+        pkg_vers.append(f"...+{len(packages)-3} more")
+    cache_info = f"{layer_name}:{' '.join(pkg_vers)}"
+
+    return cache_key, cache_info
+
+
+def oci_check_layer_cache(d, cache_key, layer_name):
+    """
+    Check if a cached layer exists.
+
+    Returns: path to cached layer rootfs if found, None otherwise
+    """
+    import os
+
+    cache_dir = d.getVar('OCI_LAYER_CACHE_DIR')
+    if not cache_dir:
+        return None
+
+    cached_path = os.path.join(cache_dir, f'{cache_key}-{layer_name}')
+    marker_file = os.path.join(cached_path, '.oci-layer-cache')
+
+    if os.path.isdir(cached_path) and os.path.exists(marker_file):
+        return cached_path
+
+    return None
+
+
+def oci_cache_layer(d, cache_key, layer_name, layer_rootfs):
+    """
+    Save a layer rootfs to the cache.
+    """
+    import os
+    import shutil
+    import time
+
+    cache_dir = d.getVar('OCI_LAYER_CACHE_DIR')
+    if not cache_dir:
+        return
+
+    bb.utils.mkdirhier(cache_dir)
+
+    cached_path = os.path.join(cache_dir, f'{cache_key}-{layer_name}')
+
+    # Remove any existing cache for this key
+    if os.path.exists(cached_path):
+        shutil.rmtree(cached_path)
+
+    # Copy layer rootfs to cache
+    bb.note(f"OCI Cache: Saving layer '{layer_name}' to cache ({cache_key})")
+    shutil.copytree(layer_rootfs, cached_path, symlinks=True)
+
+    # Write cache marker with metadata
+    marker_file = os.path.join(cached_path, '.oci-layer-cache')
+    with open(marker_file, 'w') as f:
+        f.write(f"cache_key={cache_key}\n")
+        f.write(f"layer_name={layer_name}\n")
+        f.write(f"created={time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
+        f.write(f"machine={d.getVar('MACHINE')}\n")
+
+
+def oci_restore_layer_from_cache(d, cached_path, layer_rootfs):
+    """
+    Restore a layer rootfs from the cache.
+    """
+    import os
+    import shutil
+
+    # Ensure target directory exists and is empty
+    if os.path.exists(layer_rootfs):
+        shutil.rmtree(layer_rootfs)
+    bb.utils.mkdirhier(layer_rootfs)
+
+    # Copy cached content (excluding the cache marker)
+    for item in os.listdir(cached_path):
+        if item == '.oci-layer-cache':
+            continue
+        src = os.path.join(cached_path, item)
+        dst = os.path.join(layer_rootfs, item)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+
+
 python oci_multilayer_install_packages() {
     """
     Pre-install packages for each packages layer in OCI_LAYERS.
 
     Creates temp rootfs directories with packages installed using Yocto's PM.
     The shell IMAGE_CMD:oci then copies from these directories.
+
+    Supports layer caching when OCI_LAYER_CACHE = "1" to speed up rebuilds.
     """
     import os
     import shutil
@@ -32,7 +172,15 @@ python oci_multilayer_install_packages() {
         shutil.rmtree(layer_rootfs_base)
     bb.utils.mkdirhier(layer_rootfs_base)
 
-    bb.note("OCI: Pre-installing packages for multi-layer mode")
+    # Check if caching is enabled
+    cache_enabled = d.getVar('OCI_LAYER_CACHE') == '1'
+    if cache_enabled:
+        bb.note("OCI: Pre-installing packages for multi-layer mode (caching enabled)")
+    else:
+        bb.note("OCI: Pre-installing packages for multi-layer mode (caching disabled)")
+
+    cache_hits = 0
+    cache_misses = 0
 
     # Parse OCI_LAYERS and install packages for each packages layer
     layer_num = 0
@@ -48,17 +196,42 @@ python oci_multilayer_install_packages() {
             layer_num += 1
             layer_rootfs = os.path.join(layer_rootfs_base, f'layer-{layer_num}-{layer_name}')
 
+            # Check cache if enabled
+            if cache_enabled:
+                cache_key, cache_info = oci_compute_layer_cache_key(d, layer_name, layer_type, layer_content)
+                cached_path = oci_check_layer_cache(d, cache_key, layer_name)
+
+                if cached_path:
+                    bb.note(f"OCI Cache HIT: Layer '{layer_name}' ({cache_key})")
+                    oci_restore_layer_from_cache(d, cached_path, layer_rootfs)
+                    cache_hits += 1
+                    # Store the path for the shell code to use
+                    d.setVar(f'OCI_LAYER_{layer_num}_ROOTFS', layer_rootfs)
+                    d.setVar(f'OCI_LAYER_{layer_num}_NAME', layer_name)
+                    continue
+                else:
+                    bb.note(f"OCI Cache MISS: Layer '{layer_name}' ({cache_info})")
+                    cache_misses += 1
+
             bb.note(f"OCI: Pre-installing layer {layer_num} '{layer_name}' to {layer_rootfs}")
 
             # Call the package installation function
             oci_install_layer_packages(d, layer_rootfs, layer_content, layer_name)
+
+            # Cache the installed layer if caching is enabled
+            if cache_enabled:
+                oci_cache_layer(d, cache_key, layer_name, layer_rootfs)
 
             # Store the path for the shell code to use
             d.setVar(f'OCI_LAYER_{layer_num}_ROOTFS', layer_rootfs)
             d.setVar(f'OCI_LAYER_{layer_num}_NAME', layer_name)
 
     d.setVar('OCI_LAYER_COUNT', str(layer_num))
-    bb.note(f"OCI: Pre-installed packages for {layer_num} layers")
+
+    if cache_enabled:
+        bb.note(f"OCI: Pre-installed packages for {layer_num} layers (cache: {cache_hits} hits, {cache_misses} misses)")
+    else:
+        bb.note(f"OCI: Pre-installed packages for {layer_num} layers")
 }
 
 # Run the Python function before IMAGE_CMD:oci

@@ -195,6 +195,32 @@ OCI_LAYER_MODE ?= "single"
 #
 OCI_LAYERS ?= ""
 
+# =============================================================================
+# Layer Caching (for multi-layer mode)
+# =============================================================================
+#
+# OCI_LAYER_CACHE: Enable/disable layer caching ("1" or "0")
+#   When enabled, pre-installed package layers are cached to avoid
+#   reinstalling packages on subsequent builds.
+#
+# OCI_LAYER_CACHE_DIR: Directory for storing cached layers
+#   Default: ${TOPDIR}/oci-layer-cache/${MACHINE}
+#   Cache is keyed by: layer definition + package versions + architecture
+#
+# Cache key components:
+#   - Layer name and type
+#   - Sorted package list
+#   - Package versions (from PKGDATA_DIR)
+#   - MACHINE and TUNE_PKGARCH
+#
+# Cache invalidation:
+#   - Any package version change invalidates layers containing that package
+#   - Layer definition changes invalidate that specific layer
+#   - MACHINE/arch changes use separate cache directories
+#
+OCI_LAYER_CACHE ?= "1"
+OCI_LAYER_CACHE_DIR ?= "${TOPDIR}/oci-layer-cache/${MACHINE}"
+
 # whether the oci image dir should be left as a directory, or
 # bundled into a tarball.
 OCI_IMAGE_TAR_OUTPUT ?= "true"
