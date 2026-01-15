@@ -106,6 +106,7 @@ parse_cmdline() {
     RUNTIME_NETWORK="0"
     RUNTIME_INTERACTIVE="0"
     RUNTIME_DAEMON="0"
+    RUNTIME_9P="0"  # virtio-9p available for fast I/O
     RUNTIME_IDLE_TIMEOUT="1800"  # Default: 30 minutes
 
     for param in $(cat /proc/cmdline); do
@@ -133,6 +134,9 @@ parse_cmdline() {
                 ;;
             ${VCONTAINER_RUNTIME_PREFIX}_idle_timeout=*)
                 RUNTIME_IDLE_TIMEOUT="${param#${VCONTAINER_RUNTIME_PREFIX}_idle_timeout=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_9p=*)
+                RUNTIME_9P="${param#${VCONTAINER_RUNTIME_PREFIX}_9p=}"
                 ;;
         esac
     done

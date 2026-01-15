@@ -123,11 +123,18 @@ start_dockerd() {
 
     # Parse default registry from kernel cmdline (docker_registry=host:port/namespace)
     # Kernel cmdline OVERRIDES baked config from /etc/vdkr/registry.conf
+    # Use docker_registry=none to explicitly disable baked registry
     # This enables: "docker pull container-base" → "docker pull 10.0.2.2:5000/yocto/container-base"
     GREP_RESULT=$(grep -o 'docker_registry=[^ ]*' /proc/cmdline 2>/dev/null || true)
     if [ -n "$GREP_RESULT" ]; then
-        DOCKER_DEFAULT_REGISTRY=$(echo "$GREP_RESULT" | sed 's/docker_registry=//')
-        log "Registry from cmdline: $DOCKER_DEFAULT_REGISTRY"
+        CMDLINE_REGISTRY=$(echo "$GREP_RESULT" | sed 's/docker_registry=//')
+        if [ "$CMDLINE_REGISTRY" = "none" ] || [ -z "$CMDLINE_REGISTRY" ]; then
+            DOCKER_DEFAULT_REGISTRY=""
+            log "Registry disabled via cmdline"
+        else
+            DOCKER_DEFAULT_REGISTRY="$CMDLINE_REGISTRY"
+            log "Registry from cmdline: $DOCKER_DEFAULT_REGISTRY"
+        fi
     elif [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
         log "Registry from baked config: $DOCKER_DEFAULT_REGISTRY"
     fi
@@ -285,8 +292,26 @@ is_pull_command() {
     echo "$cmd" | grep -qE '^docker pull '
 }
 
+# Helper function to check if an image exists locally
+# Returns 0 if exists, 1 if not
+image_exists_locally() {
+    local img="$1"
+    # Try exact match first, then with :latest suffix
+    if docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -qE "^${img}$"; then
+        return 0
+    fi
+    # If no tag specified, try with :latest
+    if ! echo "$img" | grep -q ':'; then
+        if docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -qE "^${img}:latest$"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Helper function to transform an unqualified image name
 # Must be defined before transform_docker_command which uses it
+# Priority: 1) local image as-is, 2) with registry prefix, 3) unchanged
 transform_image_name() {
     local img="$1"
     if [ -z "$img" ]; then
@@ -306,7 +331,18 @@ transform_image_name() {
     fi
     # Check if image is unqualified (no /)
     if ! echo "$img" | grep -q '/'; then
-        echo "$DOCKER_DEFAULT_REGISTRY/$img"
+        # First check if image exists locally as-is
+        if image_exists_locally "$img"; then
+            echo "$img"
+            return
+        fi
+        # If not local and we have a default registry, use it
+        if [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
+            echo "$DOCKER_DEFAULT_REGISTRY/$img"
+            return
+        fi
+        # No registry configured, use as-is (Docker will try Docker Hub)
+        echo "$img"
     # Check if already has registry with port - don't transform
     elif echo "$img" | grep -qE '^[^/]+:[0-9]+/'; then
         echo "$img"
@@ -392,6 +428,12 @@ transform_docker_command() {
             local skip_next=false
 
             for arg in $args; do
+                # Once we have the image, everything else is the container command
+                if [ -n "$image" ]; then
+                    rest="$rest $arg"
+                    continue
+                fi
+
                 if [ "$skip_next" = "true" ]; then
                     new_args="$new_args $arg"
                     skip_next=false
@@ -402,11 +444,11 @@ transform_docker_command() {
                     -d|--detach|-i|--interactive|-t|--tty|--rm|--privileged)
                         new_args="$new_args $arg"
                         ;;
-                    -p|--publish|-v|--volume|-e|--env|--name|--network|-w|--workdir|--entrypoint)
+                    -p|--publish|-v|--volume|-e|--env|--name|--network|-w|--workdir|--entrypoint|-m|--memory|--cpus|--cpu-shares)
                         new_args="$new_args $arg"
                         skip_next=true
                         ;;
-                    -p=*|--publish=*|-v=*|--volume=*|-e=*|--env=*|--name=*|--network=*|-w=*|--workdir=*|--entrypoint=*)
+                    -p=*|--publish=*|-v=*|--volume=*|-e=*|--env=*|--name=*|--network=*|-w=*|--workdir=*|--entrypoint=*|-m=*|--memory=*)
                         new_args="$new_args $arg"
                         ;;
                     -*)
@@ -415,12 +457,7 @@ transform_docker_command() {
                         ;;
                     *)
                         # First non-option is the image
-                        if [ -z "$image" ]; then
-                            image="$arg"
-                        else
-                            # Rest is the command
-                            rest="$rest $arg"
-                        fi
+                        image="$arg"
                         ;;
                 esac
             done
@@ -452,11 +489,21 @@ handle_storage_output() {
     echo "Storage size: $STORAGE_SIZE bytes"
 
     if [ "$STORAGE_SIZE" -gt 1000 ]; then
-        dmesg -n 1
-        echo "===STORAGE_START==="
-        base64 /tmp/storage.tar
-        echo "===STORAGE_END==="
-        echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        # Use virtio-9p if available (much faster than console base64)
+        if [ "$RUNTIME_9P" = "1" ] && mountpoint -q /mnt/share 2>/dev/null; then
+            echo "Using virtio-9p for storage output (fast path)"
+            cp /tmp/storage.tar /mnt/share/storage.tar
+            sync
+            echo "===9P_STORAGE_DONE==="
+            echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        else
+            # Fallback: base64 to console (slow)
+            dmesg -n 1
+            echo "===STORAGE_START==="
+            base64 /tmp/storage.tar
+            echo "===STORAGE_END==="
+            echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        fi
     else
         echo "===ERROR==="
         echo "Storage too small"
@@ -483,6 +530,17 @@ setup_cgroups
 
 # Parse kernel command line
 parse_cmdline
+
+# Mount virtio-9p share if available (for fast storage output in batch-import mode)
+if [ "$RUNTIME_9P" = "1" ]; then
+    mkdir -p /mnt/share
+    if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none ${VCONTAINER_SHARE_NAME} /mnt/share 2>/dev/null; then
+        log "Mounted virtio-9p share at /mnt/share (fast I/O enabled)"
+    else
+        log "WARNING: Could not mount virtio-9p share, falling back to console output"
+        RUNTIME_9P="0"
+    fi
+fi
 
 # Detect and configure disks
 detect_disks
