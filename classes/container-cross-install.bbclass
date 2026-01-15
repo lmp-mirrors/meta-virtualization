@@ -103,6 +103,17 @@
 # Inherit shared functions for multiconfig/machine/arch mapping
 inherit container-common
 
+# Default runtime based on CONTAINER_PROFILE (same logic as container-bundle.bbclass)
+def get_default_container_runtime(d):
+    """Determine default container runtime from CONTAINER_PROFILE"""
+    profile = d.getVar('CONTAINER_PROFILE') or 'docker'
+    if profile in ['podman']:
+        return 'podman'
+    # docker, containerd, k3s-*, default all use docker storage format
+    return 'docker'
+
+CONTAINER_DEFAULT_RUNTIME ?= "${@get_default_container_runtime(d)}"
+
 # Dependencies on native tools
 # vcontainer-native provides vrunner.sh
 # Blobs come from multiconfig builds (vdkr-initramfs-create, vpdmn-initramfs-create)
@@ -199,6 +210,11 @@ KERNEL_IMAGETYPE_QEMU = "${@get_kernel_name(d)}"
 # BLOB_ARCH uses get_blob_arch() from container-common.bbclass
 BLOB_ARCH = "${@get_blob_arch(d)}"
 
+# Timeout scaling: base startup + per-container time
+# QEMU boot is ~180s, larger containers (multi-layer with deps) can take ~600s
+CONTAINER_IMPORT_TIMEOUT_BASE ?= "180"
+CONTAINER_IMPORT_TIMEOUT_PER ?= "600"
+
 # ============================================================================
 # Merge container bundles installed via IMAGE_INSTALL
 # This function processes packages created by container-bundle.bbclass
@@ -260,12 +276,18 @@ merge_installed_bundles() {
 
         local docker_storage="${WORKDIR}/docker-storage-$$.tar"
 
+        # Calculate timeout: base startup + per-container time
+        local num_containers=$(echo "${docker_containers}" | wc -w)
+        local import_timeout=$(expr ${CONTAINER_IMPORT_TIMEOUT_BASE} + $num_containers \* ${CONTAINER_IMPORT_TIMEOUT_PER})
+        bbnote "Docker batch import timeout: ${import_timeout}s (${num_containers} containers)"
+
         ${VRUNNER_PATH} \
             --no-daemon \
             --runtime docker \
             --arch ${BLOB_ARCH} \
             --blob-dir ${VDKR_BLOB_DIR} \
             --batch-import \
+            --timeout ${import_timeout} \
             --output "${docker_storage}" \
             --verbose \
             -- ${docker_containers}
@@ -292,12 +314,18 @@ merge_installed_bundles() {
 
         local podman_storage="${WORKDIR}/podman-storage-$$.tar"
 
+        # Calculate timeout: base startup + per-container time
+        local num_containers=$(echo "${podman_containers}" | wc -w)
+        local import_timeout=$(expr ${CONTAINER_IMPORT_TIMEOUT_BASE} + $num_containers \* ${CONTAINER_IMPORT_TIMEOUT_PER})
+        bbnote "Podman batch import timeout: ${import_timeout}s (${num_containers} containers)"
+
         ${VRUNNER_PATH} \
             --no-daemon \
             --runtime podman \
             --arch ${BLOB_ARCH} \
             --blob-dir ${VPDMN_BLOB_DIR} \
             --batch-import \
+            --timeout ${import_timeout} \
             --output "${podman_storage}" \
             --verbose \
             -- ${podman_containers}
@@ -489,7 +517,8 @@ bundle_containers() {
 
     # Extract container image name and tag from OCI directory name
     # Sets: CONTAINER_IMAGE_NAME, CONTAINER_IMAGE_TAG
-    # Input: /path/to/container-base-latest-oci
+    # Input: /path/to/container-base-latest-oci or /path/to/app-container-multilayer-latest-oci
+    # Output: container-base:latest or app-container-multilayer:latest
     # Note: Use _cci_ prefix to avoid conflicts with bitbake's environment variables
     extract_container_info() {
         _cci_oci_path="$1"
@@ -498,19 +527,17 @@ bundle_containers() {
         CONTAINER_IMAGE_NAME=""
         CONTAINER_IMAGE_TAG="latest"
 
-        # Three-part pattern: part1-part2-part3 (e.g., container-base-latest)
-        if echo "$_cci_dir_name" | grep -qE '^[^-]+-[^-]+-[^-]+$'; then
-            _cci_part1=$(echo "$_cci_dir_name" | cut -d- -f1)
-            _cci_part2=$(echo "$_cci_dir_name" | cut -d- -f2)
-            _cci_part3=$(echo "$_cci_dir_name" | cut -d- -f3)
-            CONTAINER_IMAGE_NAME="${_cci_part1}-${_cci_part2}"
-            CONTAINER_IMAGE_TAG="$_cci_part3"
-        # Two-part pattern: name-tag (e.g., myapp-1.0)
-        elif echo "$_cci_dir_name" | grep -qE '^[^-]+-[^-]+$'; then
-            CONTAINER_IMAGE_NAME=$(echo "$_cci_dir_name" | cut -d- -f1)
-            CONTAINER_IMAGE_TAG=$(echo "$_cci_dir_name" | cut -d- -f2)
-        # Single name (e.g., myapp)
+        # Check if name ends with -latest or a version tag (-X.Y, -X.Y.Z, -vX.Y, etc.)
+        # The last hyphen-separated part is the tag if it looks like a version or is "latest"
+        _cci_last_part=$(echo "$_cci_dir_name" | rev | cut -d- -f1 | rev)
+
+        # Check if last part is a tag (latest, or version-like: 1.0, v1.0, 1.0.0, etc.)
+        if echo "$_cci_last_part" | grep -qE '^(latest|v?[0-9]+\.[0-9]+(\.[0-9]+)?|[0-9]+)$'; then
+            # Strip the tag from the end to get the image name
+            CONTAINER_IMAGE_TAG="$_cci_last_part"
+            CONTAINER_IMAGE_NAME=$(echo "$_cci_dir_name" | sed "s/-${_cci_last_part}$//")
         else
+            # No recognizable tag suffix, use whole name with default tag
             CONTAINER_IMAGE_NAME="$_cci_dir_name"
             CONTAINER_IMAGE_TAG="latest"
         fi
@@ -635,9 +662,9 @@ EOF
             local runtime_type="$(echo $bc | cut -d: -f2)"
             local autostart_policy="$(echo $bc | cut -d: -f3)"
 
-            # Default runtime to docker if not specified
+            # Default runtime from CONTAINER_PROFILE if not specified
             if [ "$container_name" = "$runtime_type" ]; then
-                runtime_type="docker"
+                runtime_type="${CONTAINER_DEFAULT_RUNTIME}"
                 autostart_policy=""
             fi
 
@@ -719,9 +746,9 @@ EOF
         container_name="$(echo $bc_clean | cut -d: -f1)"
         runtime_type="$(echo $bc_clean | cut -d: -f2)"
 
-        # Default runtime to docker if not specified
+        # Default runtime from CONTAINER_PROFILE if not specified
         if [ "$container_name" = "$runtime_type" ]; then
-            runtime_type="docker"
+            runtime_type="${CONTAINER_DEFAULT_RUNTIME}"
         fi
 
         bbnote "Collecting container: $container_name (runtime: $runtime_type)"
@@ -781,12 +808,18 @@ Or remove it from BUNDLED_CONTAINERS if not needed.
             tar -cf "${EXISTING_DOCKER_STORAGE}" -C "${IMAGE_ROOTFS}/var/lib" docker
         fi
 
+        # Calculate timeout: base startup + per-container time
+        NUM_DOCKER=$(echo "${DOCKER_CONTAINERS}" | wc -w)
+        DOCKER_TIMEOUT=$(expr ${CONTAINER_IMPORT_TIMEOUT_BASE} + $NUM_DOCKER \* ${CONTAINER_IMPORT_TIMEOUT_PER})
+        bbnote "Docker batch import timeout: ${DOCKER_TIMEOUT}s (${NUM_DOCKER} containers)"
+
         # Build vrunner batch-import command
         VRUNNER_CMD="${VRUNNER} \
             --runtime docker \
             --arch ${BLOB_ARCH} \
             --blob-dir ${VDKR_BLOB_DIR} \
             --batch-import \
+            --timeout ${DOCKER_TIMEOUT} \
             --output ${DOCKER_STORAGE_TAR} \
             --verbose"
 
@@ -839,12 +872,18 @@ Or remove it from BUNDLED_CONTAINERS if not needed.
             tar -cf "${EXISTING_PODMAN_STORAGE}" -C "${IMAGE_ROOTFS}/var/lib/containers" storage
         fi
 
+        # Calculate timeout: base startup + per-container time
+        NUM_PODMAN=$(echo "${PODMAN_CONTAINERS}" | wc -w)
+        PODMAN_TIMEOUT=$(expr ${CONTAINER_IMPORT_TIMEOUT_BASE} + $NUM_PODMAN \* ${CONTAINER_IMPORT_TIMEOUT_PER})
+        bbnote "Podman batch import timeout: ${PODMAN_TIMEOUT}s (${NUM_PODMAN} containers)"
+
         # Build vrunner batch-import command
         VRUNNER_CMD="${VRUNNER} \
             --runtime podman \
             --arch ${BLOB_ARCH} \
             --blob-dir ${VPDMN_BLOB_DIR} \
             --batch-import \
+            --timeout ${PODMAN_TIMEOUT} \
             --output ${PODMAN_STORAGE_TAR} \
             --verbose"
 
