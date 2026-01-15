@@ -33,10 +33,10 @@ source oe-init-build-env
 
 # 3. Build the standalone SDK tarball (includes blobs + QEMU)
 MACHINE=qemux86-64 bitbake vcontainer-tarball
-# Output: tmp/deploy/sdk/vcontainer-standalone-x86_64.sh
+# Output: tmp/deploy/sdk/vcontainer-standalone.sh
 
 # 4. Extract the tarball (self-extracting installer)
-/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone-x86_64.sh -d /tmp/vcontainer -y
+/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y
 
 # 5. Set up the environment
 cd /tmp/vcontainer
@@ -441,6 +441,20 @@ tests/
 │   ├── TestVdkrRecipes              # vdkr builds
 │   ├── TestMulticonfig              # multiconfig setup
 │   └── TestBundledContainersBoot    # boot and verify containers
+├── test_multiarch_oci.py            # Multi-architecture OCI tests
+│   ├── TestOCIImageIndexDetection   # multi-arch OCI detection
+│   ├── TestPlatformSelection        # arch selection (aarch64/x86_64)
+│   ├── TestGetOCIPlatforms          # platform listing
+│   ├── TestExtractPlatformOCI       # single-platform extraction
+│   ├── TestMultiArchOCIClass        # oci-multiarch.bbclass tests
+│   ├── TestBackwardCompatibility    # single-arch OCI compat
+│   ├── TestVrunnerMultiArch         # vrunner.sh multi-arch support
+│   ├── TestVcontainerCommonMultiArch # vcontainer-common.sh support
+│   └── TestContainerRegistryMultiArch # registry manifest list support
+├── test_multilayer_oci.py           # Multi-layer OCI tests
+│   ├── TestMultiLayerOCIClass       # OCI_LAYERS support
+│   ├── TestMultiLayerOCIBuild       # layer build verification
+│   └── TestLayerCaching             # layer cache tests
 └── README.md                        # This file
 ```
 
@@ -448,7 +462,46 @@ tests/
 
 ## Quick Reference
 
-### Full vdkr + vpdmn test run (recommended)
+### Full Multi-Architecture Regression Test (recommended)
+
+This builds everything needed for comprehensive testing of both x86_64 and aarch64:
+
+```bash
+# Build all components (blobs, SDK, images, containers for both architectures)
+cd /opt/bruce/poky && source oe-init-build-env && \
+bitbake mc:vruntime-aarch64:vdkr-initramfs-create && \
+bitbake mc:vruntime-x86-64:vdkr-initramfs-create && \
+bitbake mc:vruntime-aarch64:vpdmn-initramfs-create && \
+bitbake mc:vruntime-x86-64:vpdmn-initramfs-create && \
+MACHINE=qemux86-64 bitbake vcontainer-tarball && \
+MACHINE=qemux86-64 bitbake container-image-host && \
+MACHINE=qemuarm64 bitbake container-image-host && \
+MACHINE=qemux86-64 bitbake container-app-base && \
+MACHINE=qemuarm64 bitbake container-app-base
+```
+
+Then extract the SDK and run the full test suite:
+
+```bash
+# Extract SDK and run all tests
+/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y && \
+cd /opt/bruce/poky/meta-virtualization && \
+pytest tests/ -v --vdkr-dir /tmp/vcontainer --poky-dir /opt/bruce/poky
+```
+
+To test a specific architecture:
+
+```bash
+# Test x86_64
+pytest tests/ -v --vdkr-dir /tmp/vcontainer --poky-dir /opt/bruce/poky --arch x86_64
+
+# Test aarch64
+pytest tests/ -v --vdkr-dir /tmp/vcontainer --poky-dir /opt/bruce/poky --arch aarch64
+```
+
+---
+
+### Full vdkr + vpdmn test run (single architecture)
 
 ```bash
 # 1. Build the unified standalone SDK (includes both vdkr and vpdmn)
@@ -457,7 +510,7 @@ source oe-init-build-env
 MACHINE=qemux86-64 bitbake vcontainer-tarball
 
 # 2. Extract the tarball (self-extracting installer)
-/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone-x86_64.sh -d /tmp/vcontainer -y
+/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y
 
 # 3. Run fast tests for both tools (skips network and slow tests)
 cd /opt/bruce/poky/meta-virtualization
@@ -474,7 +527,7 @@ pytest tests/test_vdkr.py tests/test_vpdmn.py -v --vdkr-dir /tmp/vcontainer
 MACHINE=qemux86-64 bitbake vcontainer-tarball
 
 # Extract
-/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone-x86_64.sh -d /tmp/vcontainer -y
+/opt/bruce/poky/build/tmp/deploy/sdk/vcontainer-standalone.sh -d /tmp/vcontainer -y
 
 # Run vdkr tests only
 pytest tests/test_vdkr.py -v --vdkr-dir /tmp/vcontainer

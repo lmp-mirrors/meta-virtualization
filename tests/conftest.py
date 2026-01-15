@@ -416,14 +416,17 @@ class VdkrRunner:
             raise AssertionError(error_msg)
         return result
 
-    def memres_start(self, timeout=120, port_forwards=None):
+    def memres_start(self, timeout=120, port_forwards=None, no_registry=False):
         """Start memory resident mode.
 
         Args:
             timeout: Command timeout in seconds
             port_forwards: List of port forwards, e.g., ["8080:80", "2222:22"]
+            no_registry: Disable baked-in registry (default False - registry check is now smart)
         """
         args = ["memres", "start"]
+        if no_registry:
+            args.append("--no-registry")
         if port_forwards:
             for pf in port_forwards:
                 args.extend(["-p", pf])
@@ -646,14 +649,17 @@ class VpdmnRunner:
             raise AssertionError(error_msg)
         return result
 
-    def memres_start(self, timeout=120, port_forwards=None):
+    def memres_start(self, timeout=120, port_forwards=None, no_registry=False):
         """Start memory resident mode.
 
         Args:
             timeout: Command timeout in seconds
             port_forwards: List of port forwards, e.g., ["8080:80", "2222:22"]
+            no_registry: Disable baked-in registry (default False - registry check is now smart)
         """
         args = ["memres", "start"]
+        if no_registry:
+            args.append("--no-registry")
         if port_forwards:
             for pf in port_forwards:
                 args.extend(["-p", pf])
