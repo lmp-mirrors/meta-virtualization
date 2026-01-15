@@ -103,6 +103,116 @@ log() {
     esac
 }
 
+# ============================================================================
+# Multi-Architecture OCI Support for Batch Import
+# ============================================================================
+
+# Normalize architecture name to OCI convention
+normalize_arch_to_oci() {
+    local arch="$1"
+    case "$arch" in
+        aarch64) echo "arm64" ;;
+        x86_64)  echo "amd64" ;;
+        *)       echo "$arch" ;;
+    esac
+}
+
+# Check if OCI directory contains a multi-architecture Image Index
+is_oci_image_index() {
+    local oci_dir="$1"
+    [ -f "$oci_dir/index.json" ] || return 1
+    grep -q '"platform"' "$oci_dir/index.json" 2>/dev/null
+}
+
+# Get list of available platforms in a multi-arch OCI Image Index
+get_oci_platforms() {
+    local oci_dir="$1"
+    [ -f "$oci_dir/index.json" ] || return 1
+    grep -o '"architecture"[[:space:]]*:[[:space:]]*"[^"]*"' "$oci_dir/index.json" 2>/dev/null | \
+        sed 's/.*"\([^"]*\)"$/\1/' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Select manifest digest for a specific platform from OCI Image Index
+# Returns the sha256 digest (without prefix)
+select_platform_manifest() {
+    local oci_dir="$1"
+    local target_arch="$2"
+    local oci_arch=$(normalize_arch_to_oci "$target_arch")
+
+    [ -f "$oci_dir/index.json" ] || return 1
+
+    local in_manifest=0 current_digest="" current_arch="" matched_digest=""
+
+    while IFS= read -r line; do
+        if echo "$line" | grep -q '"manifests"'; then
+            in_manifest=1
+            continue
+        fi
+        if [ "$in_manifest" = "1" ]; then
+            if echo "$line" | grep -q '"digest"'; then
+                current_digest=$(echo "$line" | sed 's/.*"sha256:\([a-f0-9]*\)".*/\1/')
+            fi
+            # Handle both: "architecture": "arm64" or {"architecture": "arm64", ...}
+            if echo "$line" | grep -q '"architecture"'; then
+                current_arch=$(echo "$line" | sed 's/.*"architecture"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+                if [ "$current_arch" = "$oci_arch" ]; then
+                    matched_digest="$current_digest"
+                    break
+                fi
+            fi
+            if echo "$line" | grep -q '^[[:space:]]*}'; then
+                current_digest=""
+                current_arch=""
+            fi
+        fi
+    done < "$oci_dir/index.json"
+
+    [ -n "$matched_digest" ] && echo "$matched_digest"
+}
+
+# Extract a single platform from multi-arch OCI to a new OCI directory
+extract_platform_oci() {
+    local src_dir="$1"
+    local dest_dir="$2"
+    local manifest_digest="$3"
+
+    mkdir -p "$dest_dir/blobs/sha256"
+    cp "$src_dir/blobs/sha256/$manifest_digest" "$dest_dir/blobs/sha256/"
+
+    local manifest_file="$src_dir/blobs/sha256/$manifest_digest"
+
+    # Copy config blob
+    local config_digest=$(grep -o '"config"[[:space:]]*:[[:space:]]*{[^}]*"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' "$manifest_file" | \
+        sed 's/.*sha256:\([a-f0-9]*\)".*/\1/')
+    [ -n "$config_digest" ] && [ -f "$src_dir/blobs/sha256/$config_digest" ] && \
+        cp "$src_dir/blobs/sha256/$config_digest" "$dest_dir/blobs/sha256/"
+
+    # Copy layer blobs
+    grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' "$manifest_file" | \
+        sed 's/.*sha256:\([a-f0-9]*\)".*/\1/' | while read -r layer_digest; do
+        [ -f "$src_dir/blobs/sha256/$layer_digest" ] && \
+            cp "$src_dir/blobs/sha256/$layer_digest" "$dest_dir/blobs/sha256/"
+    done
+
+    local manifest_size=$(stat -c%s "$manifest_file" 2>/dev/null || stat -f%z "$manifest_file" 2>/dev/null)
+
+    cat > "$dest_dir/index.json" << EOF
+{
+  "schemaVersion": 2,
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:$manifest_digest",
+      "size": $manifest_size
+    }
+  ]
+}
+EOF
+
+    [ -f "$src_dir/oci-layout" ] && cp "$src_dir/oci-layout" "$dest_dir/" || \
+        echo '{"imageLayoutVersion": "1.0.0"}' > "$dest_dir/oci-layout"
+}
+
 show_usage() {
     cat << 'EOF'
 vrunner.sh - Execute docker commands in QEMU-emulated environment
@@ -700,8 +810,30 @@ if [ "$BATCH_IMPORT" = "true" ]; then
         src="${BATCH_PATHS[$i]}"
         dest="$BATCH_INPUT_DIR/$i"
         log "DEBUG" "Copying $src -> $dest"
-        # Use cp -rL to dereference symlinks (OCI containers often use hardlinks)
-        cp -rL "$src" "$dest"
+
+        # Check for multi-architecture OCI Image Index
+        if is_oci_image_index "$src"; then
+            available_platforms=$(get_oci_platforms "$src")
+            log "INFO" "Multi-arch OCI detected: $src (platforms: $available_platforms)"
+
+            # Select manifest for target architecture
+            manifest_digest=$(select_platform_manifest "$src" "$TARGET_ARCH")
+            if [ -z "$manifest_digest" ]; then
+                log "ERROR" "Architecture $TARGET_ARCH not found in multi-arch image: $src"
+                log "ERROR" "Available platforms: $available_platforms"
+                exit 1
+            fi
+
+            log "INFO" "Selected platform $(normalize_arch_to_oci "$TARGET_ARCH") from multi-arch image"
+
+            # Extract single-platform OCI instead of copying full multi-arch
+            mkdir -p "$dest"
+            extract_platform_oci "$src" "$dest" "$manifest_digest"
+        else
+            # Single-arch OCI - copy as-is
+            # Use cp -rL to dereference symlinks (OCI containers often use hardlinks)
+            cp -rL "$src" "$dest"
+        fi
     done
 
     # Override INPUT_PATH to point to combined directory
@@ -1069,6 +1201,16 @@ else
     QEMU_OPTS="$QEMU_OPTS -nic none"
 fi
 
+# Batch-import mode: add virtio-9p for fast output (instead of slow console base64)
+if [ "$BATCH_IMPORT" = "true" ]; then
+    BATCH_SHARE_DIR="$TEMP_DIR/share"
+    mkdir -p "$BATCH_SHARE_DIR"
+    SHARE_TAG="${TOOL_NAME}_share"
+    QEMU_OPTS="$QEMU_OPTS -virtfs local,path=$BATCH_SHARE_DIR,mount_tag=$SHARE_TAG,security_model=none,id=$SHARE_TAG"
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
+    log "INFO" "Using virtio-9p for fast storage output"
+fi
+
 # Daemon mode: add virtio-serial for command channel
 if [ "$DAEMON_MODE" = "start" ]; then
     # Check for required tools
@@ -1272,7 +1414,8 @@ for i in $(seq 1 $TIMEOUT); do
             fi
             ;;
         storage)
-            if grep -q "===STORAGE_END===" "$QEMU_OUTPUT" 2>/dev/null; then
+            # Check for both console (STORAGE_END) and virtio-9p (9P_STORAGE_DONE) markers
+            if grep -qE "===STORAGE_END===|===9P_STORAGE_DONE===" "$QEMU_OUTPUT" 2>/dev/null; then
                 COMPLETE=true
                 break
             fi
@@ -1355,33 +1498,41 @@ if [ "$COMPLETE" = "true" ]; then
 
         storage)
             log "INFO" "Extracting storage..."
-            # Use awk for precise extraction: capture lines between markers (not including markers)
-            # This avoids grep -v "===" which could accidentally remove valid base64 lines
-            # Pipeline:
-            # 1. awk: extract lines between STORAGE_START and STORAGE_END markers
-            # 2. tr -d '\r': remove carriage returns
-            # 3. sed: remove ANSI escape codes
-            # 4. grep -v: remove kernel log messages (lines starting with [ followed by timestamp)
-            # 5. tr -cd: keep only valid base64 characters
-            awk '/===STORAGE_START===/{capture=1; next} /===STORAGE_END===/{capture=0} capture' "$QEMU_OUTPUT" | \
-                tr -d '\r' | \
-                sed 's/\x1b\[[0-9;]*m//g' | \
-                grep -v '^\[[[:space:]]*[0-9]' | \
-                tr -cd 'A-Za-z0-9+/=\n' > "${TEMP_DIR}/storage_b64.txt"
 
-            B64_SIZE=$(wc -c < "${TEMP_DIR}/storage_b64.txt")
-            log "DEBUG" "Base64 data extracted: $B64_SIZE bytes"
+            # Check for virtio-9p shared directory first (fast path)
+            if [ -n "$BATCH_SHARE_DIR" ] && [ -f "$BATCH_SHARE_DIR/storage.tar" ]; then
+                log "INFO" "Using virtio-9p storage output (fast path)"
+                cp "$BATCH_SHARE_DIR/storage.tar" "$OUTPUT_FILE"
+            else
+                # Fallback: extract from console base64 (slow path)
+                log "INFO" "Using console base64 output (slow path)"
+                # Use awk for precise extraction: capture lines between markers (not including markers)
+                # Pipeline:
+                # 1. awk: extract lines between STORAGE_START and STORAGE_END markers
+                # 2. tr -d '\r': remove carriage returns
+                # 3. sed: remove ANSI escape codes
+                # 4. grep -v: remove kernel log messages (lines starting with [ followed by timestamp)
+                # 5. tr -cd: keep only valid base64 characters
+                awk '/===STORAGE_START===/{capture=1; next} /===STORAGE_END===/{capture=0} capture' "$QEMU_OUTPUT" | \
+                    tr -d '\r' | \
+                    sed 's/\x1b\[[0-9;]*m//g' | \
+                    grep -v '^\[[[:space:]]*[0-9]' | \
+                    tr -cd 'A-Za-z0-9+/=\n' > "${TEMP_DIR}/storage_b64.txt"
 
-            # Decode with error reporting (not suppressed)
-            if ! base64 -d < "${TEMP_DIR}/storage_b64.txt" > "$OUTPUT_FILE" 2>"${TEMP_DIR}/b64_errors.txt"; then
-                log "ERROR" "Base64 decode failed"
-                if [ -s "${TEMP_DIR}/b64_errors.txt" ]; then
-                    log "ERROR" "Decode errors: $(cat "${TEMP_DIR}/b64_errors.txt")"
+                B64_SIZE=$(wc -c < "${TEMP_DIR}/storage_b64.txt")
+                log "DEBUG" "Base64 data extracted: $B64_SIZE bytes"
+
+                # Decode with error reporting (not suppressed)
+                if ! base64 -d < "${TEMP_DIR}/storage_b64.txt" > "$OUTPUT_FILE" 2>"${TEMP_DIR}/b64_errors.txt"; then
+                    log "ERROR" "Base64 decode failed"
+                    if [ -s "${TEMP_DIR}/b64_errors.txt" ]; then
+                        log "ERROR" "Decode errors: $(cat "${TEMP_DIR}/b64_errors.txt")"
+                    fi
+                    # Show a sample of the base64 data for debugging
+                    log "DEBUG" "First 200 chars of base64: $(head -c 200 "${TEMP_DIR}/storage_b64.txt")"
+                    log "DEBUG" "Last 200 chars of base64: $(tail -c 200 "${TEMP_DIR}/storage_b64.txt")"
+                    exit 1
                 fi
-                # Show a sample of the base64 data for debugging
-                log "DEBUG" "First 200 chars of base64: $(head -c 200 "${TEMP_DIR}/storage_b64.txt")"
-                log "DEBUG" "Last 200 chars of base64: $(tail -c 200 "${TEMP_DIR}/storage_b64.txt")"
-                exit 1
             fi
 
             DECODED_SIZE=$(wc -c < "$OUTPUT_FILE")

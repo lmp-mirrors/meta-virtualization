@@ -120,11 +120,21 @@ handle_storage_output() {
     echo "Storage size: $STORAGE_SIZE bytes"
 
     if [ "$STORAGE_SIZE" -gt 1000 ]; then
-        dmesg -n 1
-        echo "===STORAGE_START==="
-        base64 /tmp/storage.tar
-        echo "===STORAGE_END==="
-        echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        # Use virtio-9p if available (much faster than console base64)
+        if [ "$RUNTIME_9P" = "1" ] && mountpoint -q /mnt/share 2>/dev/null; then
+            echo "Using virtio-9p for storage output (fast path)"
+            cp /tmp/storage.tar /mnt/share/storage.tar
+            sync
+            echo "===9P_STORAGE_DONE==="
+            echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        else
+            # Fallback: base64 to console (slow)
+            dmesg -n 1
+            echo "===STORAGE_START==="
+            base64 /tmp/storage.tar
+            echo "===STORAGE_END==="
+            echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+        fi
     else
         echo "===ERROR==="
         echo "Storage too small"
@@ -153,6 +163,17 @@ setup_cgroups
 
 # Parse kernel command line
 parse_cmdline
+
+# Mount virtio-9p share if available (for fast storage output in batch-import mode)
+if [ "$RUNTIME_9P" = "1" ]; then
+    mkdir -p /mnt/share
+    if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none ${VCONTAINER_SHARE_NAME} /mnt/share 2>/dev/null; then
+        log "Mounted virtio-9p share at /mnt/share (fast I/O enabled)"
+    else
+        log "WARNING: Could not mount virtio-9p share, falling back to console output"
+        RUNTIME_9P="0"
+    fi
+fi
 
 # Detect and configure disks
 detect_disks
