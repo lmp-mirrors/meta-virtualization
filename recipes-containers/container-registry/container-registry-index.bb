@@ -98,6 +98,8 @@ python do_generate_registry_script() {
     script_path = d.getVar('CONTAINER_REGISTRY_SCRIPT')
     deploy_dir = d.getVar('DEPLOY_DIR')
     deploy_dir_image = d.getVar('DEPLOY_DIR_IMAGE')
+    # Parent of DEPLOY_DIR_IMAGE (e.g., tmp/deploy/images/) for multi-arch discovery
+    deploy_dir_images = os.path.dirname(deploy_dir_image)
 
     # Find registry binary path
     native_sysroot = d.getVar('STAGING_DIR_NATIVE') or ''
@@ -160,7 +162,12 @@ REGISTRY_CONFIG="{config_file}"
 REGISTRY_STORAGE="{registry_storage}"
 REGISTRY_URL="{registry_url}"
 REGISTRY_NAMESPACE="{registry_namespace}"
-DEPLOY_DIR_IMAGE="{deploy_dir_image}"
+
+# Deploy directories - can be overridden via environment
+# DEPLOY_DIR_IMAGES: parent directory containing per-machine deploy dirs
+# DEPLOY_DIR_IMAGE: single machine deploy dir (legacy, still supported)
+DEPLOY_DIR_IMAGES="${{DEPLOY_DIR_IMAGES:-{deploy_dir_images}}}"
+DEPLOY_DIR_IMAGE="${{DEPLOY_DIR_IMAGE:-{deploy_dir_image}}}"
 
 # Baked-in defaults from bitbake (can be overridden by CLI or env vars)
 DEFAULT_TAG_STRATEGY="{tag_strategy}"
@@ -299,6 +306,189 @@ cmd_status() {{
     fi
 }}
 
+# ============================================================================
+# Multi-Architecture Manifest List Support
+# ============================================================================
+# Always creates/updates manifest lists for tags, enabling multi-arch images.
+# When pushing the same image name from different architectures, each push
+# adds to the manifest list instead of overwriting.
+# ============================================================================
+
+# Get architecture from OCI image config
+# Usage: get_oci_arch <oci_dir>
+get_oci_arch() {{
+    local oci_dir="$1"
+    [ -f "$oci_dir/index.json" ] || return 1
+
+    # Get manifest digest from index.json
+    local manifest_digest=$(grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' "$oci_dir/index.json" | head -1 | sed 's/.*sha256:\\([a-f0-9]*\\)".*/\\1/')
+    [ -z "$manifest_digest" ] && return 1
+
+    # Get config digest from manifest
+    local manifest_file="$oci_dir/blobs/sha256/$manifest_digest"
+    [ -f "$manifest_file" ] || return 1
+    local config_digest=$(grep -o '"config"[^}}]*"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' "$manifest_file" | sed 's/.*sha256:\\([a-f0-9]*\\)".*/\\1/')
+    [ -z "$config_digest" ] && return 1
+
+    # Get architecture from config
+    local config_file="$oci_dir/blobs/sha256/$config_digest"
+    [ -f "$config_file" ] || return 1
+    grep -o '"architecture"[[:space:]]*:[[:space:]]*"[^"]*"' "$config_file" | head -1 | sed 's/.*"\\([^"]*\\)"$/\\1/'
+}}
+
+# Check if a tag points to a manifest list (vs single manifest)
+# Usage: is_manifest_list <image_ref>
+# Returns: 0 if manifest list, 1 if single manifest or not found
+is_manifest_list() {{
+    local image="$1"
+    local tag="$2"
+
+    local content_type=$(curl -s -I -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \\
+        "http://$REGISTRY_URL/v2/$image/manifests/$tag" 2>/dev/null | grep -i "content-type" | head -1)
+
+    echo "$content_type" | grep -qE "manifest.list|image.index"
+}}
+
+# Get existing manifest list for a tag (if any)
+# Usage: get_manifest_list <image> <tag>
+# Returns: JSON manifest list or empty string
+get_manifest_list() {{
+    local image="$1"
+    local tag="$2"
+
+    curl -s -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \\
+        "http://$REGISTRY_URL/v2/$image/manifests/$tag" 2>/dev/null
+}}
+
+# Get manifest digest and size for an image by tag
+# Usage: get_manifest_info <image> <tag>
+# Returns: digest:size or empty
+get_manifest_info() {{
+    local image="$1"
+    local tag="$2"
+
+    local headers=$(curl -s -I -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \\
+        "http://$REGISTRY_URL/v2/$image/manifests/$tag" 2>/dev/null)
+
+    local digest=$(echo "$headers" | grep -i "docker-content-digest" | awk '{{print $2}}' | tr -d '\\r\\n')
+    local size=$(echo "$headers" | grep -i "content-length" | awk '{{print $2}}' | tr -d '\\r\\n')
+
+    [ -n "$digest" ] && [ -n "$size" ] && echo "$digest:$size"
+}}
+
+# Push image by digest (returns the digest)
+# Usage: push_by_digest <oci_dir> <image_name>
+push_by_digest() {{
+    local oci_dir="$1"
+    local image_name="$2"
+    local temp_tag="temp-${{RANDOM}}-$(date +%s)"
+
+    # Push with temporary tag
+    "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+        "oci:$oci_dir" \\
+        "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$image_name:$temp_tag" >/dev/null 2>&1
+
+    # Get digest for the pushed image
+    local info=$(get_manifest_info "$REGISTRY_NAMESPACE/$image_name" "$temp_tag")
+    local digest=$(echo "$info" | cut -d: -f1-2)  # sha256:xxx
+    local size=$(echo "$info" | cut -d: -f3)
+
+    # Delete the temp tag (leave the blobs)
+    curl -s -X DELETE "http://$REGISTRY_URL/v2/$REGISTRY_NAMESPACE/$image_name/manifests/$temp_tag" >/dev/null 2>&1 || true
+
+    echo "$digest:$size"
+}}
+
+# Create or update manifest list for a tag
+# Usage: update_manifest_list <image> <tag> <new_digest> <new_size> <new_arch>
+update_manifest_list() {{
+    local image="$1"
+    local tag="$2"
+    local new_digest="$3"
+    local new_size="$4"
+    local new_arch="$5"
+    local new_os="${{6:-linux}}"
+
+    # Normalize architecture for OCI
+    case "$new_arch" in
+        aarch64) new_arch="arm64" ;;
+        x86_64)  new_arch="amd64" ;;
+    esac
+
+    local manifests=""
+
+    # Check for existing manifest list or single manifest
+    if is_manifest_list "$image" "$tag"; then
+        # Get existing manifest list and extract manifests (excluding our arch)
+        local existing=$(get_manifest_list "$image" "$tag")
+        manifests=$(echo "$existing" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for m in data.get('manifests', []):
+        p = m.get('platform', {{}})
+        if p.get('architecture') != '$new_arch':
+            print(json.dumps(m))
+except: pass
+" 2>/dev/null)
+    else
+        # Check if there's a single manifest at this tag
+        local existing_info=$(get_manifest_info "$image" "$tag")
+        if [ -n "$existing_info" ]; then
+            # Get architecture of existing single manifest
+            local existing_digest=$(echo "$existing_info" | cut -d: -f1-2)
+            local existing_size=$(echo "$existing_info" | cut -d: -f3)
+
+            # Inspect to get architecture
+            local existing_arch=$("$SKOPEO_BIN" inspect --tls-verify=false \\
+                "docker://$REGISTRY_URL/$image:$tag" 2>/dev/null | \\
+                python3 -c "import sys,json; print(json.load(sys.stdin).get('Architecture',''))" 2>/dev/null)
+
+            if [ -n "$existing_arch" ] && [ "$existing_arch" != "$new_arch" ]; then
+                # Different arch - include it in manifest list
+                manifests=$(cat <<MANIFEST
+{{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "$existing_digest", "size": $existing_size, "platform": {{"architecture": "$existing_arch", "os": "linux"}}}}
+MANIFEST
+)
+            fi
+        fi
+    fi
+
+    # Add our new manifest
+    local new_manifest='{{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "'$new_digest'", "size": '$new_size', "platform": {{"architecture": "'$new_arch'", "os": "'$new_os'"}}}}'
+
+    if [ -n "$manifests" ]; then
+        manifests="$manifests
+$new_manifest"
+    else
+        manifests="$new_manifest"
+    fi
+
+    # Create manifest list JSON
+    local manifest_list=$(python3 -c "
+import sys, json
+manifests = []
+for line in sys.stdin:
+    line = line.strip()
+    if line:
+        manifests.append(json.loads(line))
+result = {{
+    'schemaVersion': 2,
+    'mediaType': 'application/vnd.oci.image.index.v1+json',
+    'manifests': manifests
+}}
+print(json.dumps(result, indent=2))
+" <<< "$manifests")
+
+    # Push manifest list
+    local status=$(curl -s -o /dev/null -w "%{{http_code}}" -X PUT \\
+        -H "Content-Type: application/vnd.oci.image.index.v1+json" \\
+        -d "$manifest_list" \\
+        "http://$REGISTRY_URL/v2/$image/manifests/$tag")
+
+    [ "$status" = "201" ] || [ "$status" = "200" ]
+}}
+
 cmd_push() {{
     shift  # Remove 'push' from args
 
@@ -367,59 +557,146 @@ cmd_push() {{
         tags=$(generate_tags "$strategy")
     fi
 
-    if [ -n "$image_filter" ]; then
-        echo "Pushing image: $image_filter"
-    else
-        echo "Pushing all OCI images from $DEPLOY_DIR_IMAGE"
+    # Check if argument is a path to an OCI directory (contains / or ends with -oci)
+    if [ -n "$image_filter" ] && [ -d "$image_filter" ] && [ -f "$image_filter/index.json" ]; then
+        # Direct path mode: push single OCI directory
+        local oci_dir="$image_filter"
+        local name=$(basename "$oci_dir" | sed 's/-latest-oci$//' | sed 's/-oci$//')
+        name=$(echo "$name" | sed 's/-qemux86-64//' | sed 's/-qemuarm64//')
+        name=$(echo "$name" | sed 's/\\.rootfs-[0-9]*//')
+
+        local arch=$(get_oci_arch "$oci_dir")
+        [ -z "$arch" ] && arch="unknown"
+
+        echo "Pushing OCI directory: $oci_dir"
+        echo "  Image name: $name ($arch)"
+        echo "  To registry: $REGISTRY_URL/$REGISTRY_NAMESPACE/"
+        echo "  Tags: $tags"
+        echo ""
+
+        echo "  Uploading image blobs..."
+        local digest_info=$(push_by_digest "$oci_dir" "$name")
+        local digest=$(echo "$digest_info" | cut -d: -f1-2)
+        local size=$(echo "$digest_info" | cut -d: -f3)
+
+        if [ -z "$digest" ]; then
+            echo "  ERROR: Failed to push image"
+            return 1
+        fi
+
+        echo "  Image digest: $digest"
+
+        for tag in $tags; do
+            echo "  Creating/updating manifest list: $tag"
+            if update_manifest_list "$REGISTRY_NAMESPACE/$name" "$tag" "$digest" "$size" "$arch"; then
+                echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag (manifest list)"
+            else
+                echo "  WARNING: Failed to update manifest list, falling back to direct push"
+                "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+                    "oci:$oci_dir" \\
+                    "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
+            fi
+        done
+
+        echo ""
+        echo "Done."
+        return 0
     fi
+
+    # Name filter mode or push all: scan machine directories
+    if [ -n "$image_filter" ]; then
+        echo "Pushing image: $image_filter (all architectures)"
+    else
+        echo "Pushing all OCI images"
+    fi
+    echo "Scanning: $DEPLOY_DIR_IMAGES/*/"
     echo "To registry: $REGISTRY_URL/$REGISTRY_NAMESPACE/"
     echo "Tags: $tags"
+    echo "(Multi-arch manifest lists enabled)"
     echo ""
 
     local found=0
-    for oci_dir in "$DEPLOY_DIR_IMAGE"/*-oci; do
-        [ -d "$oci_dir" ] || continue
-        [ -f "$oci_dir/index.json" ] || continue
 
-        name=$(basename "$oci_dir" | sed 's/-latest-oci$//' | sed 's/-oci$//')
-        # Remove machine suffix
-        name=$(echo "$name" | sed 's/-qemux86-64//' | sed 's/-qemuarm64//')
-        # Remove rootfs timestamp
-        name=$(echo "$name" | sed 's/\\.rootfs-[0-9]*//')
+    # Iterate over all machine directories (e.g., qemuarm64, qemux86-64)
+    for machine_dir in "$DEPLOY_DIR_IMAGES"/*/; do
+        [ -d "$machine_dir" ] || continue
 
-        # Filter by image name if specified
-        if [ -n "$image_filter" ]; then
-            # Match exact name or name.rootfs variant
-            case "$name" in
-                "$image_filter"|"$image_filter.rootfs")
-                    : # match
-                    ;;
-                *)
-                    continue
-                    ;;
-            esac
-        fi
+        local machine_name=$(basename "$machine_dir")
 
-        found=1
-        echo "Pushing: $name"
-        for tag in $tags; do
-            echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
-            "$SKOPEO_BIN" copy --dest-tls-verify=false \\
-                "oci:$oci_dir" \\
-                "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
+        # Find OCI directories in this machine's deploy dir
+        for oci_dir in "$machine_dir"*-oci; do
+            [ -d "$oci_dir" ] || continue
+            [ -f "$oci_dir/index.json" ] || continue
+
+            name=$(basename "$oci_dir" | sed 's/-latest-oci$//' | sed 's/-oci$//')
+            # Remove machine suffix
+            name=$(echo "$name" | sed 's/-qemux86-64//' | sed 's/-qemuarm64//')
+            # Remove rootfs timestamp
+            name=$(echo "$name" | sed 's/\\.rootfs-[0-9]*//')
+
+            # Filter by image name if specified
+            if [ -n "$image_filter" ]; then
+                # Match exact name or name.rootfs variant
+                case "$name" in
+                    "$image_filter"|"$image_filter.rootfs")
+                        : # match
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+            fi
+
+            found=1
+
+            # Get architecture from OCI image
+            local arch=$(get_oci_arch "$oci_dir")
+            [ -z "$arch" ] && arch="unknown"
+            echo "Pushing: $name ($arch) [from $machine_name]"
+
+            # Push image by digest first
+            echo "  Uploading image blobs..."
+            local digest_info=$(push_by_digest "$oci_dir" "$name")
+            local digest=$(echo "$digest_info" | cut -d: -f1-2)
+            local size=$(echo "$digest_info" | cut -d: -f3)
+
+            if [ -z "$digest" ]; then
+                echo "  ERROR: Failed to push image"
+                continue
+            fi
+
+            echo "  Image digest: $digest"
+
+            # Update manifest list for each tag
+            for tag in $tags; do
+                echo "  Creating/updating manifest list: $tag"
+                if update_manifest_list "$REGISTRY_NAMESPACE/$name" "$tag" "$digest" "$size" "$arch"; then
+                    echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag (manifest list)"
+                else
+                    echo "  WARNING: Failed to update manifest list, falling back to direct push"
+                    "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+                        "oci:$oci_dir" \\
+                        "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
+                fi
+            done
+            echo ""
         done
     done
 
     if [ -n "$image_filter" ] && [ "$found" = "0" ]; then
-        echo "Error: Image '$image_filter' not found in $DEPLOY_DIR_IMAGE"
+        echo "Error: Image '$image_filter' not found in $DEPLOY_DIR_IMAGES"
         echo ""
         echo "Available images:"
-        for oci_dir in "$DEPLOY_DIR_IMAGE"/*-oci; do
-            [ -d "$oci_dir" ] || continue
-            [ -f "$oci_dir/index.json" ] || continue
-            n=$(basename "$oci_dir" | sed 's/-latest-oci$//' | sed 's/-oci$//' | sed 's/-qemux86-64//' | sed 's/-qemuarm64//' | sed 's/\\.rootfs-[0-9]*//')
-            echo "  $n"
-        done
+        for machine_dir in "$DEPLOY_DIR_IMAGES"/*/; do
+            [ -d "$machine_dir" ] || continue
+            for oci_dir in "$machine_dir"*-oci; do
+                [ -d "$oci_dir" ] || continue
+                [ -f "$oci_dir/index.json" ] || continue
+                local arch=$(get_oci_arch "$oci_dir")
+                n=$(basename "$oci_dir" | sed 's/-latest-oci$//' | sed 's/-oci$//' | sed 's/-qemux86-64//' | sed 's/-qemuarm64//' | sed 's/\\.rootfs-[0-9]*//')
+                echo "  $n ($arch)"
+            done
+        done | sort -u
         return 1
     fi
 
@@ -697,11 +974,23 @@ cmd_help() {{
     echo "  latest                 The 'latest' tag"
     echo "  arch                   Append architecture suffix to other tags"
     echo ""
+    echo "Multi-architecture support:"
+    echo "  Push scans all machine directories under DEPLOY_DIR_IMAGES and creates"
+    echo "  manifest lists containing all architectures found for each container."
+    echo ""
+    echo "  Workflow:"
+    echo "    MACHINE=qemuarm64 bitbake myapp"
+    echo "    MACHINE=qemux86-64 bitbake myapp"
+    echo "    $0 push                   # Scans all machines, creates manifest lists"
+    echo ""
+    echo "  Result: myapp:latest is a manifest list with both arm64 and amd64"
+    echo ""
     echo "Examples:"
     echo "  $0 start"
-    echo "  $0 push                                    # Push all, default strategy"
-    echo "  $0 push container-base                     # Push one, default strategy"
-    echo "  $0 push container-base --tag v1.0.0        # Explicit tag (one image)"
+    echo "  $0 push                                    # Push all from all machines"
+    echo "  $0 push container-base                     # Push by name (all archs found)"
+    echo "  $0 push /path/to/container-base-latest-oci # Push by path (single OCI dir)"
+    echo "  $0 push container-base --tag v1.0.0        # Explicit tag"
     echo "  $0 push container-base -t latest -t v1.0.0 # Multiple explicit tags"
     echo "  $0 push --strategy 'sha branch latest'     # All images, strategy"
     echo "  $0 push --strategy semver --version 1.2.3  # All images, SemVer"
@@ -712,6 +1001,8 @@ cmd_help() {{
     echo "  $0 tags container-base"
     echo ""
     echo "Environment variables:"
+    echo "  DEPLOY_DIR_IMAGES                 Override parent of deploy dirs (scans */)"
+    echo "  DEPLOY_DIR_IMAGE                  Override single machine deploy dir"
     echo "  CONTAINER_REGISTRY_TAG_STRATEGY   Override default tag strategy"
     echo "  IMAGE_VERSION                     Version for semver/version strategies"
     echo "  TARGET_ARCH                       Architecture for arch strategy"
@@ -722,7 +1013,7 @@ cmd_help() {{
     echo "  Tag strategy:   $DEFAULT_TAG_STRATEGY"
     echo "  Target arch:    $DEFAULT_TARGET_ARCH"
     echo "  Storage:        $REGISTRY_STORAGE"
-    echo "  Deploy images:  $DEPLOY_DIR_IMAGE"
+    echo "  Deploy dirs:    $DEPLOY_DIR_IMAGES/*/"
 }}
 
 case "${{1:-help}}" in

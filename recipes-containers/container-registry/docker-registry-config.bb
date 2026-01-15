@@ -46,22 +46,38 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 # Space-separated list of insecure registries
 # Example: "10.0.2.2:5000 myregistry.local:5000"
+# Can also use runtime-agnostic CONTAINER_REGISTRY_URL + CONTAINER_REGISTRY_INSECURE
 DOCKER_REGISTRY_INSECURE ?= ""
+CONTAINER_REGISTRY_URL ?= ""
+CONTAINER_REGISTRY_INSECURE ?= ""
+
+def get_insecure_registries(d):
+    """Get insecure registries from either Docker-specific or generic config"""
+    # Prefer explicit DOCKER_REGISTRY_INSECURE if set
+    docker_insecure = d.getVar('DOCKER_REGISTRY_INSECURE') or ""
+    if docker_insecure.strip():
+        return docker_insecure.strip()
+    # Fall back to CONTAINER_REGISTRY_URL if marked insecure
+    registry_url = d.getVar('CONTAINER_REGISTRY_URL') or ""
+    is_insecure = d.getVar('CONTAINER_REGISTRY_INSECURE') or ""
+    if registry_url.strip() and is_insecure in ['1', 'true', 'yes']:
+        return registry_url.strip()
+    return ""
 
 inherit allarch
 
 # Skip recipe entirely if not configured
 python() {
-    registries = d.getVar('DOCKER_REGISTRY_INSECURE')
-    if not registries or not registries.strip():
-        raise bb.parse.SkipRecipe("DOCKER_REGISTRY_INSECURE not set - recipe is opt-in only")
+    registries = get_insecure_registries(d)
+    if not registries:
+        raise bb.parse.SkipRecipe("No insecure registry configured - recipe is opt-in only")
 }
 
 python do_install() {
     import os
     import json
 
-    registries = d.getVar('DOCKER_REGISTRY_INSECURE').split()
+    registries = get_insecure_registries(d).split()
 
     dest = d.getVar('D')
     confdir = os.path.join(dest, d.getVar('sysconfdir').lstrip('/'), 'docker')
