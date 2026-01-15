@@ -296,6 +296,196 @@ check_oci_arch() {
     return 0
 }
 
+# ============================================================================
+# Multi-Architecture OCI Support
+# ============================================================================
+# OCI Image Index (manifest list) format allows multiple platform-specific
+# images under a single tag. These functions detect and handle multi-arch OCI.
+# ============================================================================
+
+# Normalize architecture name to OCI convention
+# Usage: normalize_arch_to_oci <arch>
+# Returns: OCI-format architecture (arm64, amd64, etc.)
+normalize_arch_to_oci() {
+    local arch="$1"
+    case "$arch" in
+        aarch64) echo "arm64" ;;
+        x86_64)  echo "amd64" ;;
+        *)       echo "$arch" ;;
+    esac
+}
+
+# Normalize OCI architecture to Yocto/Linux convention
+# Usage: normalize_arch_from_oci <arch>
+# Returns: Linux-format architecture (aarch64, x86_64, etc.)
+normalize_arch_from_oci() {
+    local arch="$1"
+    case "$arch" in
+        arm64) echo "aarch64" ;;
+        amd64) echo "x86_64" ;;
+        *)     echo "$arch" ;;
+    esac
+}
+
+# Check if OCI directory contains a multi-architecture Image Index
+# Usage: is_oci_image_index <oci_dir>
+# Returns: 0 if multi-arch, 1 if single-arch or not OCI
+is_oci_image_index() {
+    local oci_dir="$1"
+
+    [ -f "$oci_dir/index.json" ] || return 1
+
+    # Check if index.json has manifests with platform info
+    # Multi-arch images have "platform" object in manifest entries
+    if grep -q '"platform"' "$oci_dir/index.json" 2>/dev/null; then
+        # Also verify there are multiple manifests
+        local manifest_count=$(grep -c '"digest"' "$oci_dir/index.json" 2>/dev/null || echo "0")
+        [ "$manifest_count" -gt 1 ] && return 0
+
+        # Single manifest with platform info is also a valid Image Index
+        # (could be a multi-arch image built with only one arch so far)
+        return 0
+    fi
+
+    return 1
+}
+
+# Get list of available platforms in a multi-arch OCI Image Index
+# Usage: get_oci_platforms <oci_dir>
+# Returns: Space-separated list of architectures (e.g., "arm64 amd64")
+get_oci_platforms() {
+    local oci_dir="$1"
+
+    [ -f "$oci_dir/index.json" ] || return 1
+
+    # Extract architecture values from platform objects
+    # Format: "platform": { "architecture": "arm64", "os": "linux" }
+    grep -o '"architecture"[[:space:]]*:[[:space:]]*"[^"]*"' "$oci_dir/index.json" 2>/dev/null | \
+        sed 's/.*"\([^"]*\)"$/\1/' | \
+        tr '\n' ' ' | sed 's/ $//'
+}
+
+# Select manifest digest for a specific platform from OCI Image Index
+# Usage: select_platform_manifest <oci_dir> <target_arch>
+# Returns: sha256 digest of the matching manifest (without "sha256:" prefix)
+# Sets OCI_SELECTED_PLATFORM to the matched platform for informational purposes
+select_platform_manifest() {
+    local oci_dir="$1"
+    local target_arch="$2"
+
+    [ -f "$oci_dir/index.json" ] || return 1
+
+    # Normalize target arch to OCI convention
+    local oci_arch=$(normalize_arch_to_oci "$target_arch")
+
+    # Parse index.json to find manifest with matching platform
+    # This is done without jq using grep/sed for portability
+    local in_manifest=0
+    local current_digest=""
+    local current_arch=""
+    local matched_digest=""
+
+    # Read index.json line by line
+    while IFS= read -r line; do
+        # Track when we're inside a manifest entry
+        if echo "$line" | grep -q '"manifests"'; then
+            in_manifest=1
+            continue
+        fi
+
+        if [ "$in_manifest" = "1" ]; then
+            # Extract digest
+            if echo "$line" | grep -q '"digest"'; then
+                current_digest=$(echo "$line" | sed 's/.*"sha256:\([a-f0-9]*\)".*/\1/')
+            fi
+
+            # Extract architecture from platform
+            # Handle both formats: "architecture": "arm64" or {"architecture": "arm64", ...}
+            if echo "$line" | grep -q '"architecture"'; then
+                current_arch=$(echo "$line" | sed 's/.*"architecture"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+                # Check if this matches our target
+                if [ "$current_arch" = "$oci_arch" ]; then
+                    matched_digest="$current_digest"
+                    OCI_SELECTED_PLATFORM="$current_arch"
+                    break
+                fi
+            fi
+
+            # Reset on closing brace (end of manifest entry)
+            if echo "$line" | grep -q '^[[:space:]]*}'; then
+                current_digest=""
+                current_arch=""
+            fi
+        fi
+    done < "$oci_dir/index.json"
+
+    if [ -n "$matched_digest" ]; then
+        echo "$matched_digest"
+        return 0
+    fi
+
+    return 1
+}
+
+# Extract a single platform from multi-arch OCI to a new OCI directory
+# Usage: extract_platform_oci <src_oci_dir> <dest_oci_dir> <manifest_digest>
+# This creates a single-arch OCI directory that skopeo can import
+extract_platform_oci() {
+    local src_dir="$1"
+    local dest_dir="$2"
+    local manifest_digest="$3"
+
+    mkdir -p "$dest_dir/blobs/sha256"
+
+    # Copy the manifest blob
+    cp "$src_dir/blobs/sha256/$manifest_digest" "$dest_dir/blobs/sha256/"
+
+    # Read the manifest to get config and layer digests
+    local manifest_file="$src_dir/blobs/sha256/$manifest_digest"
+
+    # Extract and copy config blob
+    local config_digest=$(grep -o '"config"[[:space:]]*:[[:space:]]*{[^}]*"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' "$manifest_file" | \
+        sed 's/.*sha256:\([a-f0-9]*\)".*/\1/')
+    if [ -n "$config_digest" ] && [ -f "$src_dir/blobs/sha256/$config_digest" ]; then
+        cp "$src_dir/blobs/sha256/$config_digest" "$dest_dir/blobs/sha256/"
+    fi
+
+    # Extract and copy layer blobs
+    grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' "$manifest_file" | \
+        sed 's/.*sha256:\([a-f0-9]*\)".*/\1/' | while read -r layer_digest; do
+        if [ -f "$src_dir/blobs/sha256/$layer_digest" ]; then
+            cp "$src_dir/blobs/sha256/$layer_digest" "$dest_dir/blobs/sha256/"
+        fi
+    done
+
+    # Get manifest size
+    local manifest_size=$(stat -c%s "$manifest_file" 2>/dev/null || stat -f%z "$manifest_file" 2>/dev/null)
+
+    # Create new index.json pointing to just this manifest
+    cat > "$dest_dir/index.json" << EOF
+{
+  "schemaVersion": 2,
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:$manifest_digest",
+      "size": $manifest_size
+    }
+  ]
+}
+EOF
+
+    # Copy oci-layout
+    if [ -f "$src_dir/oci-layout" ]; then
+        cp "$src_dir/oci-layout" "$dest_dir/"
+    else
+        echo '{"imageLayoutVersion": "1.0.0"}' > "$dest_dir/oci-layout"
+    fi
+
+    return 0
+}
+
 show_usage() {
     local PROG_NAME=$(basename "$0")
     local RUNTIME_UPPER=$(echo "$VCONTAINER_RUNTIME_CMD" | sed 's/./\U&/')
@@ -348,6 +538,7 @@ ${BOLD}${RUNTIME_UPPER}-COMPATIBLE COMMANDS:${NC}
 
 ${BOLD}EXTENDED COMMANDS (${VCONTAINER_RUNTIME_NAME}-specific):${NC}
     ${CYAN}vimport${NC} <path> [name:tag]    Import from OCI dir, tarball, or directory (auto-detect)
+                                 Multi-arch OCI Image Index supported (auto-selects platform)
     ${CYAN}vrun${NC} [opts] <image> [cmd]    Run command, clearing entrypoint (see RUN vs VRUN below)
     ${CYAN}vstorage${NC}                     List all storage directories (alias: vstorage list)
     ${CYAN}vstorage list${NC}                List all storage directories with details
@@ -425,6 +616,7 @@ ${BOLD}GLOBAL OPTIONS:${NC}
     --no-kvm              Disable KVM acceleration (use TCG emulation)
     --no-daemon           Run in ephemeral mode (don't auto-start/use daemon)
     --registry <url>      Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
+    --no-registry         Disable baked-in default registry (use images as-is)
     --insecure-registry <host:port>  Mark registry as insecure (HTTP). Can repeat.
     --verbose, -v         Enable verbose output
     --help, -h            Show this help
@@ -634,6 +826,11 @@ while [ $# -gt 0 ]; do
         --registry)
             REGISTRY="$2"
             shift 2
+            ;;
+        --no-registry)
+            # Explicitly disable baked-in registry (passes docker_registry=none to init)
+            REGISTRY="none"
+            shift
             ;;
         --insecure-registry)
             INSECURE_REGISTRIES+=("$2")
@@ -1322,15 +1519,53 @@ case "$COMMAND" in
         if [ -d "$INPUT_PATH" ]; then
             if [ -f "$INPUT_PATH/index.json" ] || [ -f "$INPUT_PATH/oci-layout" ]; then
                 INPUT_TYPE="oci"
+                ACTUAL_OCI_PATH="$INPUT_PATH"
 
-                # Check architecture before importing
-                if ! check_oci_arch "$INPUT_PATH" "$TARGET_ARCH"; then
-                    exit 1
+                # Check for multi-architecture OCI Image Index
+                if is_oci_image_index "$INPUT_PATH"; then
+                    local available_platforms=$(get_oci_platforms "$INPUT_PATH")
+                    [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Multi-arch OCI detected. Available: $available_platforms" >&2
+
+                    # Select manifest for target architecture
+                    local manifest_digest=$(select_platform_manifest "$INPUT_PATH" "$TARGET_ARCH")
+                    if [ -z "$manifest_digest" ]; then
+                        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Architecture $TARGET_ARCH not found in multi-arch image" >&2
+                        echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} Available platforms: $available_platforms" >&2
+                        echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} Use --arch <arch> to select a different platform" >&2
+                        exit 1
+                    fi
+
+                    echo -e "${GREEN}[$VCONTAINER_RUNTIME_NAME]${NC} Selected platform: $OCI_SELECTED_PLATFORM (from multi-arch image)" >&2
+
+                    # Extract single-platform OCI to temp directory
+                    TEMP_OCI_DIR=$(mktemp -d)
+                    trap "rm -rf '$TEMP_OCI_DIR'" EXIT
+
+                    if ! extract_platform_oci "$INPUT_PATH" "$TEMP_OCI_DIR" "$manifest_digest"; then
+                        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to extract platform from multi-arch image" >&2
+                        exit 1
+                    fi
+
+                    ACTUAL_OCI_PATH="$TEMP_OCI_DIR"
+                    [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Extracted to: $TEMP_OCI_DIR" >&2
+                else
+                    # Single-arch OCI - check architecture before importing
+                    if ! check_oci_arch "$INPUT_PATH" "$TARGET_ARCH"; then
+                        exit 1
+                    fi
                 fi
 
                 # Use skopeo to properly import OCI image with full metadata (entrypoint, cmd, etc.)
                 # This preserves the container config unlike raw import
-                RUNTIME_CMD="skopeo copy oci:{INPUT} ${VCONTAINER_IMPORT_TARGET}$IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
+                # For multi-arch, we import from the extracted temp directory
+                if [ "$ACTUAL_OCI_PATH" = "$INPUT_PATH" ]; then
+                    RUNTIME_CMD="skopeo copy oci:{INPUT} ${VCONTAINER_IMPORT_TARGET}$IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
+                else
+                    # Multi-arch: copy extracted OCI to share dir for import
+                    # We need to handle this specially since INPUT_PATH differs from actual OCI
+                    INPUT_PATH="$ACTUAL_OCI_PATH"
+                    RUNTIME_CMD="skopeo copy oci:{INPUT} ${VCONTAINER_IMPORT_TARGET}$IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
+                fi
             else
                 # Directory but not OCI - check if it looks like a deploy/images dir
                 # and provide a helpful hint
