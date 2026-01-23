@@ -830,7 +830,8 @@ Or remove it from BUNDLED_CONTAINERS if not needed.
         VRUNNER_CMD="${VRUNNER_CMD} -- ${DOCKER_CONTAINERS}"
 
         bbnote "Running batch import for Docker containers..."
-        TMPDIR="${WORKDIR}" eval ${VRUNNER_CMD}
+        # Prepend native sysroot to PATH so vrunner finds the correct QEMU (with virtfs support)
+        PATH="${STAGING_BINDIR_NATIVE}:${PATH}" TMPDIR="${WORKDIR}" eval ${VRUNNER_CMD}
 
         if [ $? -ne 0 ]; then
             bbfatal "Docker batch import failed"
@@ -894,7 +895,8 @@ Or remove it from BUNDLED_CONTAINERS if not needed.
         VRUNNER_CMD="${VRUNNER_CMD} -- ${PODMAN_CONTAINERS}"
 
         bbnote "Running batch import for Podman containers..."
-        TMPDIR="${WORKDIR}" eval ${VRUNNER_CMD}
+        # Prepend native sysroot to PATH so vrunner finds the correct QEMU (with virtfs support)
+        PATH="${STAGING_BINDIR_NATIVE}:${PATH}" TMPDIR="${WORKDIR}" eval ${VRUNNER_CMD}
 
         if [ $? -ne 0 ]; then
             bbfatal "Podman batch import failed"
