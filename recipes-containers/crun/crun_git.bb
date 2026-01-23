@@ -56,3 +56,10 @@ do_install() {
         ln -sr "${D}/${bindir}/crun" "${D}${bindir}/runc"
     fi
 }
+
+# When crun provides /usr/bin/runc symlink, it conflicts with the runc package
+RCONFLICTS:${PN} = "${@'runc' if d.getVar('CRUN_AS_RUNC') else ''}"
+
+REQUIRED_DISTRO_FEATURES:class-native ?= ""
+DEPENDS:class-native += "yajl libcap go-md2man m4 libseccomp"
+BBCLASSEXTEND = "native"
