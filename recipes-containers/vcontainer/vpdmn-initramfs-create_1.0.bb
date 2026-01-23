@@ -32,7 +32,7 @@
 # Blobs are deployed to: tmp-vruntime-*/deploy/images/${MACHINE}/vpdmn/
 #
 # To build the complete standalone tarball (recommended):
-#   MACHINE=qemux86-64 bitbake vcontainer-native -c create_tarball
+#   bitbake vcontainer-tarball
 #
 # ===========================================================================
 
