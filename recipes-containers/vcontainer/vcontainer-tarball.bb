@@ -43,6 +43,7 @@ TOOLCHAIN_HOST_TASK = "\
     nativesdk-sdk-provides-dummy \
     nativesdk-qemu-vcontainer \
     nativesdk-socat \
+    nativesdk-expect \
     "
 
 # SDK naming and metadata
