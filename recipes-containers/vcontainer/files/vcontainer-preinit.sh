@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# vdkr-preinit.sh
+# vcontainer-preinit.sh
 # Minimal init for initramfs - mounts rootfs and does switch_root
 #
 # This script runs from the initramfs and:
@@ -12,7 +12,7 @@
 # 3. Creates overlayfs with tmpfs for writes
 # 4. Executes switch_root to the overlay root filesystem
 #
-# The real init (/init or /sbin/init on rootfs) then runs vdkr-init.sh logic
+# The real init (/init or /sbin/init on rootfs) then continues boot
 
 # Mount essential filesystems first (needed to check cmdline)
 mount -t proc proc /proc
@@ -31,7 +31,7 @@ log() {
     [ "$QUIET" = "0" ] && echo "$@"
 }
 
-log "=== vdkr preinit (squashfs) ==="
+log "=== vcontainer preinit (squashfs) ==="
 
 # Wait for block devices to appear
 log "Waiting for block devices..."
