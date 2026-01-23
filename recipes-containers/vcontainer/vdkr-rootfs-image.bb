@@ -38,6 +38,8 @@ do_rootfs[nostamp] = "1"
 inherit core-image
 
 # We need Docker and container tools
+# Note: runc is explicitly listed because vruntime distro sets
+# VIRTUAL-RUNTIME_container_runtime="" to avoid runc/crun conflicts.
 IMAGE_INSTALL = " \
     packagegroup-core-boot \
     docker-moby \
@@ -48,6 +50,7 @@ IMAGE_INSTALL = " \
     iproute2 \
     iptables \
     util-linux \
+    kernel-modules \
 "
 
 # No extra features needed

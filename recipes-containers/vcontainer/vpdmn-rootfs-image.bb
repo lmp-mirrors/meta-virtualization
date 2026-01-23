@@ -31,21 +31,14 @@ do_rootfs[nostamp] = "1"
 # Inherit from core-image-minimal for a minimal base
 inherit core-image
 
-# Use crun as the OCI runtime (not runc) - this prevents the conflict where
-# both crun (which creates /usr/bin/runc symlink) and runc package are installed
-VIRTUAL-RUNTIME_container_runtime = "crun"
-
-# Use netavark for container networking (pulled in via podman's RDEPENDS)
-VIRTUAL-RUNTIME_container_networking = "netavark"
-
-# Use aardvark-dns for container DNS
-VIRTUAL-RUNTIME_container_dns = "aardvark-dns"
-
 # We need Podman and container tools
 # Podman is daemonless - no containerd required!
+# Note: crun is explicitly listed because vruntime distro sets
+# VIRTUAL-RUNTIME_container_runtime="" to avoid runc/crun conflicts.
 IMAGE_INSTALL = " \
     packagegroup-core-boot \
     podman \
+    crun \
     skopeo \
     conmon \
     netavark \
