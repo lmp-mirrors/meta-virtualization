@@ -171,7 +171,7 @@ start_dockerd() {
         DOCKER_OPTS="$DOCKER_OPTS --containerd=/run/containerd/containerd.sock"
     fi
 
-    /usr/bin/dockerd $DOCKER_OPTS >/dev/null 2>&1 &
+    /usr/bin/dockerd $DOCKER_OPTS >/var/log/docker.log 2>&1 &
     DOCKER_PID=$!
     log "Docker daemon started (PID: $DOCKER_PID)"
 
@@ -185,26 +185,38 @@ start_dockerd() {
         if ! kill -0 $DOCKER_PID 2>/dev/null; then
             echo "===ERROR==="
             echo "Docker daemon died after $i iterations"
+            echo "Docker log:"
             cat /var/log/docker.log 2>/dev/null || true
             dmesg | tail -20 2>/dev/null || true
             sleep 2
             reboot -f
         fi
 
-        if /usr/bin/docker info >/dev/null 2>&1; then
+        # Try docker info and capture any error
+        DOCKER_INFO_OUT=$(/usr/bin/docker info 2>&1)
+        DOCKER_INFO_RC=$?
+        if [ $DOCKER_INFO_RC -eq 0 ]; then
             log "Docker daemon is ready!"
             DOCKER_READY=true
             break
         fi
 
-        log "Waiting... ($i/60)"
+        log "Waiting... ($i/60) - docker info rc=$DOCKER_INFO_RC"
+        # Show first line of error on every 10th iteration
+        if [ $((i % 10)) -eq 0 ]; then
+            echo "docker info error: $(echo "$DOCKER_INFO_OUT" | head -1)"
+        fi
         sleep 2
     done
 
     if [ "$DOCKER_READY" != "true" ]; then
         echo "===ERROR==="
-        echo "Docker failed to start"
-        sleep 2
+        echo "Docker failed to start after 60 attempts"
+        echo "Last docker info output:"
+        echo "$DOCKER_INFO_OUT" | head -5
+        echo "Docker log tail:"
+        tail -20 /var/log/docker.log 2>/dev/null || true
+        sleep 5
         reboot -f
     fi
 }
