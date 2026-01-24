@@ -546,6 +546,9 @@ daemon_send() {
         exit 1
     fi
 
+    # Update activity timestamp for idle timeout tracking
+    touch "$DAEMON_SOCKET_DIR/activity" 2>/dev/null || true
+
     # Encode command in base64 and send
     local cmd_b64=$(echo -n "$cmd" | base64 -w0)
 
@@ -602,6 +605,9 @@ daemon_send_with_input() {
         log "ERROR" "Daemon is not running. Start it with --daemon-start"
         exit 1
     fi
+
+    # Update activity timestamp for idle timeout tracking
+    touch "$DAEMON_SOCKET_DIR/activity" 2>/dev/null || true
 
     # Shared directory for virtio-9p
     local share_dir="$DAEMON_SOCKET_DIR/share"
@@ -1159,7 +1165,7 @@ fi
 #   /dev/vdc = state disk (if any)
 # The preinit script in initramfs mounts /dev/vda and does switch_root
 # Build QEMU options
-QEMU_OPTS="$QEMU_MACHINE -nographic -smp 2 -m 2048"
+QEMU_OPTS="$QEMU_MACHINE -nographic -smp 2 -m 2048 -no-reboot"
 if [ "$USE_KVM" = "true" ]; then
     QEMU_OPTS="$QEMU_OPTS -enable-kvm"
 fi
@@ -1336,6 +1342,58 @@ if [ "$DAEMON_MODE" = "start" ]; then
 
     if [ "$READY" = "true" ]; then
         log "INFO" "Daemon is ready!"
+
+        # Start host-side idle watchdog if timeout is set
+        if [ "$IDLE_TIMEOUT" -gt 0 ] 2>/dev/null; then
+            ACTIVITY_FILE="$DAEMON_SOCKET_DIR/activity"
+            touch "$ACTIVITY_FILE"
+
+            # Spawn background watchdog
+            (
+                # Container status file - guest writes this via virtio-9p share
+                # This avoids sending commands through daemon socket which corrupts output
+                CONTAINER_STATUS_FILE="$DAEMON_SHARE_DIR/.containers_running"
+
+                # Scale check interval to idle timeout (check ~5 times before timeout)
+                CHECK_INTERVAL=$((IDLE_TIMEOUT / 5))
+                [ "$CHECK_INTERVAL" -lt 10 ] && CHECK_INTERVAL=10
+                [ "$CHECK_INTERVAL" -gt 60 ] && CHECK_INTERVAL=60
+
+                while true; do
+                    sleep "$CHECK_INTERVAL"
+                    [ -f "$ACTIVITY_FILE" ] || exit 0  # Clean exit if file removed
+                    [ -f "$DAEMON_PID_FILE" ] || exit 0  # PID file gone
+
+                    # Check if QEMU process is still running
+                    QEMU_PID=$(cat "$DAEMON_PID_FILE" 2>/dev/null)
+                    [ -n "$QEMU_PID" ] && kill -0 "$QEMU_PID" 2>/dev/null || exit 0
+
+                    LAST_ACTIVITY=$(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || echo 0)
+                    NOW=$(date +%s)
+                    IDLE_SECONDS=$((NOW - LAST_ACTIVITY))
+
+                    if [ "$IDLE_SECONDS" -ge "$IDLE_TIMEOUT" ]; then
+                        # Check if any containers are running via shared file
+                        # Guest-side watchdog writes container IDs to this file
+                        if [ -f "$CONTAINER_STATUS_FILE" ] && [ -s "$CONTAINER_STATUS_FILE" ]; then
+                            # Containers are running - reset activity and skip shutdown
+                            touch "$ACTIVITY_FILE"
+                            continue
+                        fi
+
+                        # No containers running - send QMP quit to gracefully stop QEMU
+                        if [ -S "$QMP_SOCKET" ]; then
+                            echo '{"execute":"qmp_capabilities"}{"execute":"quit"}' | \
+                                socat - "UNIX-CONNECT:$QMP_SOCKET" >/dev/null 2>&1 || true
+                        fi
+                        rm -f "$ACTIVITY_FILE"
+                        exit 0
+                    fi
+                done
+            ) &
+            log "DEBUG" "Started host-side idle watchdog (timeout: ${IDLE_TIMEOUT}s)"
+        fi
+
         echo "Daemon running (PID: $QEMU_PID)"
         echo "Socket: $DAEMON_SOCKET"
         exit 0

@@ -737,6 +737,10 @@ build_runner_args() {
     [ -n "$INPUT_STORAGE" ] && args+=("--input-storage" "$INPUT_STORAGE")
     [ "$DISABLE_KVM" = "true" ] && args+=("--no-kvm")
 
+    # Add idle timeout from config
+    local idle_timeout=$(config_get "idle-timeout" "1800")
+    args+=("--idle-timeout" "$idle_timeout")
+
     # Add port forwards (each -p adds a --port-forward)
     for pf in "${PORT_FORWARDS[@]}"; do
         args+=("--port-forward" "$pf")
@@ -1088,10 +1092,9 @@ run_runtime_command() {
         # Check if auto-daemon is enabled
         local auto_daemon=$(config_get "auto-daemon" "true")
         if [ "$auto_daemon" = "true" ]; then
-            # Auto-start daemon
+            # Auto-start daemon (idle-timeout is included in runner_args)
             echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Starting daemon..." >&2
-            local idle_timeout=$(config_get "idle-timeout" "1800")
-            "$RUNNER" $runner_args --idle-timeout "$idle_timeout" --daemon-start
+            "$RUNNER" $runner_args --daemon-start
 
             if daemon_is_running; then
                 # Fresh daemon has no port forwards - clear stale registry
@@ -1136,10 +1139,9 @@ run_runtime_command_with_input() {
         # Check if auto-daemon is enabled
         local auto_daemon=$(config_get "auto-daemon" "true")
         if [ "$auto_daemon" = "true" ]; then
-            # Auto-start daemon
+            # Auto-start daemon (idle-timeout is included in runner_args)
             echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Starting daemon..." >&2
-            local idle_timeout=$(config_get "idle-timeout" "1800")
-            "$RUNNER" $runner_args --idle-timeout "$idle_timeout" --daemon-start
+            "$RUNNER" $runner_args --daemon-start
 
             if daemon_is_running; then
                 # Fresh daemon has no port forwards - clear stale registry

@@ -53,6 +53,15 @@ mount_tmpfs_dirs() {
     mount -t tmpfs tmpfs /tmp
     mount -t tmpfs tmpfs /run
     mount -t tmpfs tmpfs /mnt
+
+    # Handle Yocto read-only-rootfs volatile directories
+    # /var/log and /var/tmp are symlinks to volatile/log and volatile/tmp
+    if [ -d /var/volatile ]; then
+        mount -t tmpfs tmpfs /var/volatile
+        mkdir -p /var/volatile/log /var/volatile/tmp
+    fi
+
+    # Fallback for non-volatile layouts
     mount -t tmpfs tmpfs /var/run 2>/dev/null || true
     mount -t tmpfs tmpfs /var/tmp 2>/dev/null || true
 
@@ -330,13 +339,81 @@ run_daemon_mode() {
 
     log "Daemon ready, waiting for commands..."
 
-    # Command loop with idle timeout
+    # Start idle timeout watchdog
+    # Note: 'read -t' doesn't work reliably on non-terminal fds (like virtio-serial),
+    # so we use a background watchdog that tracks activity via a timestamp file.
+    ACTIVITY_FILE="/tmp/.daemon_activity"
+    touch "$ACTIVITY_FILE"
+    DAEMON_PID=$$
+
+    # Watchdog process - writes container status to shared directory for host-side
+    # Host-side handles shutdown via QMP; guest-side shutdown is disabled but preserved
+    CONTAINER_STATUS_FILE="/mnt/share/.containers_running"
+
+    # Scale check interval to idle timeout (check ~5 times before timeout)
+    CHECK_INTERVAL=$((RUNTIME_IDLE_TIMEOUT / 5))
+    [ "$CHECK_INTERVAL" -lt 10 ] && CHECK_INTERVAL=10
+    [ "$CHECK_INTERVAL" -gt 60 ] && CHECK_INTERVAL=60
+
+    (
+        # Close inherited virtio-serial fd to prevent output leaking to host
+        exec 3>&-
+
+        while true; do
+            sleep "$CHECK_INTERVAL"
+            if [ ! -f "$ACTIVITY_FILE" ]; then
+                # Activity file removed = clean shutdown in progress
+                rm -f "$CONTAINER_STATUS_FILE" 2>/dev/null
+                exit 0
+            fi
+
+            # Check for running containers and write status to shared file
+            # Host-side reads this file instead of sending socket commands
+            RUNNING=$("$VCONTAINER_RUNTIME_CMD" ps -q 2>/dev/null)
+            if [ -n "$RUNNING" ]; then
+                echo "$RUNNING" > "$CONTAINER_STATUS_FILE" 2>/dev/null || true
+            else
+                rm -f "$CONTAINER_STATUS_FILE" 2>/dev/null || true
+            fi
+
+            # Guest-side shutdown logic - DISABLED, host-side QMP is more reliable
+            # Kept for potential future use if host-side becomes unavailable
+            : << 'DISABLED_GUEST_SHUTDOWN'
+            LAST_ACTIVITY=$(stat -c %Y "$ACTIVITY_FILE" 2>/dev/null || echo 0)
+            NOW=$(date +%s)
+            IDLE_SECONDS=$((NOW - LAST_ACTIVITY))
+            if [ "$IDLE_SECONDS" -ge "$RUNTIME_IDLE_TIMEOUT" ]; then
+                if [ -n "$RUNNING" ]; then
+                    # Containers are running - reset activity and skip shutdown
+                    echo "[watchdog] Containers still running, resetting idle timer" >> /dev/kmsg 2>/dev/null || true
+                    touch "$ACTIVITY_FILE"
+                    continue
+                fi
+                echo "[watchdog] Idle timeout (${IDLE_SECONDS}s >= ${RUNTIME_IDLE_TIMEOUT}s), no containers running, shutting down..." >> /dev/kmsg 2>/dev/null || true
+                rm -f "$CONTAINER_STATUS_FILE" 2>/dev/null
+                kill -TERM "$DAEMON_PID" 2>/dev/null
+                exit 0
+            fi
+DISABLED_GUEST_SHUTDOWN
+        done
+    ) &
+    WATCHDOG_PID=$!
+    log "Started idle watchdog (PID: $WATCHDOG_PID, timeout: ${RUNTIME_IDLE_TIMEOUT}s)"
+
+    # Trap to clean up watchdog on exit and power off VM
+    # Use reboot -f which works with QEMU's -no-reboot flag to exit cleanly
+    trap 'log "Idle timeout triggered by watchdog"; log "Calling reboot -f"; sync; /usr/sbin/reboot -f' TERM
+    trap 'rm -f "$ACTIVITY_FILE"; kill $WATCHDOG_PID 2>/dev/null; exit' INT
+
+    # Command loop
     while true; do
         CMD_B64=""
-        read -t "$RUNTIME_IDLE_TIMEOUT" -r CMD_B64 <&3
+        read -r CMD_B64 <&3
         READ_EXIT=$?
 
-        if [ $READ_EXIT -eq 0 ]; then
+        if [ $READ_EXIT -eq 0 ] && [ -n "$CMD_B64" ]; then
+            # Update activity timestamp
+            touch "$ACTIVITY_FILE"
             log "Received: '$CMD_B64'"
             # Handle special commands
             case "$CMD_B64" in
@@ -450,19 +527,15 @@ run_daemon_mode() {
 
             log "Command completed (exit code: $EXEC_EXIT_CODE)"
         else
-            # Read returned non-zero: either timeout or EOF
-            # Timeout returns >128 (typically 142), EOF returns 1
-            if [ $READ_EXIT -gt 128 ]; then
-                # Actual timeout - shut down
-                log "Idle timeout (${RUNTIME_IDLE_TIMEOUT}s), shutting down..."
-                echo "===IDLE_SHUTDOWN===" | cat >&3
-                break
-            fi
-            # EOF or empty line - host closed connection, wait for reconnect
+            # Read returned non-zero or empty - host closed connection or EOF
+            # Idle timeout is handled by the watchdog process
             sleep 0.1
         fi
     done
 
+    # Clean shutdown
+    rm -f "$ACTIVITY_FILE"
+    kill $WATCHDOG_PID 2>/dev/null
     exec 3>&-
     log "Daemon shutting down..."
 }
@@ -578,5 +651,6 @@ graceful_shutdown() {
     sleep 2
 
     log "=== ${VCONTAINER_RUNTIME_NAME} Complete ==="
-    poweroff -f
+    # Use reboot -f which works with QEMU's -no-reboot flag to exit cleanly
+    reboot -f
 }
