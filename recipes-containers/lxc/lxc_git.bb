@@ -63,6 +63,9 @@ EXTRA_OEMESON += "${PTEST_CONF} -Ddistrosysconfdir=${sysconfdir}/default"
 # No meson equivalent for these yet
 # EXTRA_OECONF += "--enable-log-src-basename --disable-werror"
 
+# LTO is enabled by default, expose prefix-map options to the linker for reproducibility
+TARGET_LDFLAGS:append = " ${DEBUG_PREFIX_MAP}"
+
 PACKAGECONFIG ??= "templates \
     ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'systemd', '', d)} \
     ${@bb.utils.contains('DISTRO_FEATURES', 'selinux', 'selinux', '', d)} \
