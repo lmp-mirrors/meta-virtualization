@@ -78,7 +78,7 @@ do_compile() {
         export CGO_LDFLAGS="${LDFLAGS} --sysroot=${STAGING_DIR_TARGET}"
 
         # -trimpath removes build paths from the binary (required for reproducible builds)
-        oe_runmake GO=${GO} BUILDTAGS="${BUILDTAGS}" GO_BUILD_FLAGS="-trimpath" binaries
+        oe_runmake GO=${GO} BUILDTAGS="${BUILDTAGS}" GO_BUILD_FLAGS="-trimpath -buildmode=pie" binaries
 }
 
 do_install() {
