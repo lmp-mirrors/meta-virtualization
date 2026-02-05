@@ -33,10 +33,17 @@ EXCLUDE_FROM_WORLD = "1"
 # No extraction tools needed - we use pre-built images
 DEPENDS = ""
 
-# Always rebuild - no sstate caching for this recipe
-SSTATE_SKIP_CREATION = "1"
-do_compile[nostamp] = "1"
-do_deploy[nostamp] = "1"
+# Force rebuild control:
+# Set VCONTAINER_FORCE_BUILD = "1" in local.conf to disable stamp caching
+# and force compile/deploy to always run. Useful when debugging dependency issues.
+# Default: use normal stamp caching for faster incremental builds
+VCONTAINER_FORCE_BUILD ?= ""
+python () {
+    if d.getVar('VCONTAINER_FORCE_BUILD') == '1':
+        d.setVar('SSTATE_SKIP_CREATION', '1')
+        d.setVarFlag('do_compile', 'nostamp', '1')
+        d.setVarFlag('do_deploy', 'nostamp', '1')
+}
 
 # Only populate native sysroot, skip target sysroot to avoid libgcc conflicts
 INHIBIT_DEFAULT_DEPS = "1"
