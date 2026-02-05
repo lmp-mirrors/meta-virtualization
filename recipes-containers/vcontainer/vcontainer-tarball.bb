@@ -144,6 +144,15 @@ python () {
         bb.plain("  To build only one architecture, set in local.conf:")
         bb.plain("    VCONTAINER_ARCHITECTURES = \"x86_64\"")
         bb.plain("    VCONTAINER_ARCHITECTURES = \"aarch64\"")
+        bb.plain("")
+        force = d.getVar('VCONTAINER_FORCE_BUILD') or ''
+        if force == '1':
+            bb.plain("  VCONTAINER_FORCE_BUILD = \"1\" (enabled)")
+            bb.plain("    All vcontainer tasks will rebuild unconditionally.")
+        else:
+            bb.plain("  Incremental builds enabled (default).")
+            bb.plain("    To force full rebuild, set in local.conf:")
+            bb.plain("      VCONTAINER_FORCE_BUILD = \"1\"")
         bb.plain("=" * 70)
         bb.plain("")
 }

@@ -24,9 +24,15 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 do_rootfs[file-checksums] += "${THISDIR}/files/vpdmn-init.sh:True"
 do_rootfs[file-checksums] += "${THISDIR}/files/vcontainer-init-common.sh:True"
 
-# Force do_rootfs to always run (no stamp caching)
-# Combined with file-checksums, this ensures init script changes are picked up
-do_rootfs[nostamp] = "1"
+# Force rebuild control:
+# Set VCONTAINER_FORCE_BUILD = "1" in local.conf to disable stamp caching
+# and force rootfs to always rebuild. Useful when debugging dependency issues.
+# Default: use normal stamp caching (file-checksums handles init script changes)
+VCONTAINER_FORCE_BUILD ?= ""
+python () {
+    if d.getVar('VCONTAINER_FORCE_BUILD') == '1':
+        d.setVarFlag('do_rootfs', 'nostamp', '1')
+}
 
 # Inherit from core-image-minimal for a minimal base
 inherit core-image
