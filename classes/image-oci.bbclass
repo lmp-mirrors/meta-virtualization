@@ -167,9 +167,10 @@ OCI_LAYER_MODE ?= "single"
 # Each layer is defined as: "name:type:content"
 #
 # Layer Types:
-#   packages    - Copy files installed by specified packages
-#   directories - Copy specific directories from IMAGE_ROOTFS
-#   files       - Copy specific files from IMAGE_ROOTFS
+#   packages    - Install packages using Yocto's package manager
+#   directories - Copy specific directories from IMAGE_ROOTFS (delta-only)
+#   files       - Copy specific files from IMAGE_ROOTFS (delta-only)
+#   host        - Copy files from build machine filesystem (outside Yocto)
 #
 # Format: Space-separated list of layer definitions
 #   OCI_LAYERS = "layer1:type:content layer2:type:content ..."
@@ -181,6 +182,18 @@ OCI_LAYER_MODE ?= "single"
 #   "app:directories:/opt/myapp+/etc/myapp"
 #   "config:files:/etc/myapp.conf+/etc/default/myapp"
 #
+#   NOTE: directories/files only copy content NOT already present in
+#   earlier layers (delta-only), avoiding duplication with packages layers.
+#
+# For host type, content is source:dest pairs (use + as delimiter):
+#   "certs:host:/etc/ssl/certs/my-ca.crt:/etc/ssl/certs/my-ca.crt"
+#   "config:host:/home/builder/config:/etc/myapp/config+/home/builder/keys:/etc/myapp/keys"
+#
+#   WARNING: host layers copy content from the build machine that is NOT
+#   part of the Yocto build. This affects reproducibility - the build output
+#   depends on the state of the build machine. Use sparingly for deployment-
+#   specific config, keys, or certificates that cannot be packaged.
+#
 # Note: Use + as delimiter because ; is interpreted as shell command separator
 #
 # Example:
@@ -189,9 +202,10 @@ OCI_LAYER_MODE ?= "single"
 #       base:packages:base-files+base-passwd+netbase+busybox \
 #       python:packages:python3+python3-pip \
 #       app:directories:/opt/myapp \
+#       certs:host:/etc/ssl/certs/my-ca.crt:/etc/ssl/certs/ \
 #   "
 #
-# Result: 3 layers (base, python, app) plus any base image layers
+# Result: 4 layers (base, python, app, certs) plus any base image layers
 #
 OCI_LAYERS ?= ""
 
@@ -288,6 +302,7 @@ python __anonymous() {
             bb.fatal("OCI_LAYER_MODE = 'multi' requires OCI_LAYERS to be defined")
 
         has_packages_layer = False
+        host_layer_warnings = []
 
         # Parse and validate layer definitions
         for layer_def in oci_layers.split():
@@ -296,11 +311,27 @@ python __anonymous() {
                 bb.fatal(f"Invalid OCI_LAYERS entry '{layer_def}': "
                          "format is 'name:type:content'")
             layer_name, layer_type, layer_content = parts[0], parts[1], ':'.join(parts[2:])
-            if layer_type not in ('packages', 'directories', 'files'):
+            if layer_type not in ('packages', 'directories', 'files', 'host'):
                 bb.fatal(f"Invalid layer type '{layer_type}' in '{layer_def}': "
-                         "must be 'packages', 'directories', or 'files'")
+                         "must be 'packages', 'directories', 'files', or 'host'")
             if layer_type == 'packages':
                 has_packages_layer = True
+            elif layer_type == 'host':
+                # Validate host layer format and collect warnings
+                # Format: source:dest pairs separated by +
+                for pair in layer_content.replace('+', ' ').split():
+                    if ':' not in pair:
+                        bb.fatal(f"Invalid host layer content '{pair}' in '{layer_def}': "
+                                 "format is 'source_path:dest_path'")
+                    src_path = pair.rsplit(':', 1)[0]
+                    host_layer_warnings.append(f"  Layer '{layer_name}': {src_path}")
+
+        # Emit warning for host layers (content from build machine, not Yocto)
+        if host_layer_warnings:
+            bb.warn("OCI image includes content from build machine filesystem (host layers).\n"
+                    "This content is NOT part of the Yocto build and affects reproducibility.\n"
+                    "The build output will depend on the state of the build machine.\n"
+                    "Host paths used:\n" + "\n".join(host_layer_warnings))
 
         # Add package manager native dependency if using 'packages' layer type
         if has_packages_layer:

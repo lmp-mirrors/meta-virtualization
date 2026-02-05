@@ -589,22 +589,67 @@ IMAGE_CMD:oci() {
                 fi
 
             elif [ "$oci_layer_type" = "directories" ]; then
-                # Copy directories from IMAGE_ROOTFS
+                # Copy directories from IMAGE_ROOTFS (delta-only: skip files already in bundle)
                 for oci_dir in $oci_layer_content; do
                     if [ -d "${IMAGE_ROOTFS}$oci_dir" ]; then
-                        mkdir -p "$image_bundle_name/rootfs$(dirname $oci_dir)"
-                        cp -a "${IMAGE_ROOTFS}$oci_dir" "$image_bundle_name/rootfs$oci_dir"
-                        bbnote "OCI: Added directory $oci_dir"
+                        oci_delta_copied=0
+                        oci_delta_skipped=0
+                        # Walk the directory and copy only files not in bundle
+                        while IFS= read -r oci_src_file; do
+                            oci_rel_path="${oci_src_file#${IMAGE_ROOTFS}}"
+                            oci_dst_file="$image_bundle_name/rootfs$oci_rel_path"
+                            if [ ! -e "$oci_dst_file" ]; then
+                                mkdir -p "$(dirname "$oci_dst_file")"
+                                cp -a "$oci_src_file" "$oci_dst_file"
+                                oci_delta_copied=$((oci_delta_copied + 1))
+                            else
+                                oci_delta_skipped=$((oci_delta_skipped + 1))
+                            fi
+                        done < <(find "${IMAGE_ROOTFS}$oci_dir" -type f -o -type l)
+                        # Also copy empty directories
+                        while IFS= read -r oci_src_dir; do
+                            oci_rel_path="${oci_src_dir#${IMAGE_ROOTFS}}"
+                            oci_dst_dir="$image_bundle_name/rootfs$oci_rel_path"
+                            if [ ! -e "$oci_dst_dir" ]; then
+                                mkdir -p "$oci_dst_dir"
+                            fi
+                        done < <(find "${IMAGE_ROOTFS}$oci_dir" -type d)
+                        bbnote "OCI: Added directory $oci_dir (delta: $oci_delta_copied copied, $oci_delta_skipped skipped)"
+                    else
+                        bbwarn "OCI: Directory not found in IMAGE_ROOTFS: $oci_dir"
                     fi
                 done
 
             elif [ "$oci_layer_type" = "files" ]; then
-                # Copy specific files from IMAGE_ROOTFS
+                # Copy specific files from IMAGE_ROOTFS (delta-only: skip files already in bundle)
                 for oci_file in $oci_layer_content; do
                     if [ -e "${IMAGE_ROOTFS}$oci_file" ]; then
-                        mkdir -p "$image_bundle_name/rootfs$(dirname $oci_file)"
-                        cp -a "${IMAGE_ROOTFS}$oci_file" "$image_bundle_name/rootfs$oci_file"
-                        bbnote "OCI: Added file $oci_file"
+                        oci_dst_file="$image_bundle_name/rootfs$oci_file"
+                        if [ ! -e "$oci_dst_file" ]; then
+                            mkdir -p "$(dirname "$oci_dst_file")"
+                            cp -a "${IMAGE_ROOTFS}$oci_file" "$oci_dst_file"
+                            bbnote "OCI: Added file $oci_file"
+                        else
+                            bbnote "OCI: Skipped file $oci_file (already in bundle)"
+                        fi
+                    else
+                        bbwarn "OCI: File not found in IMAGE_ROOTFS: $oci_file"
+                    fi
+                done
+
+            elif [ "$oci_layer_type" = "host" ]; then
+                # Copy files from build machine filesystem (outside Yocto)
+                # Format: source_path:dest_path pairs separated by + (already converted to space)
+                for oci_host_pair in $oci_layer_content; do
+                    # Split on last : to handle paths that might contain :
+                    oci_host_src="${oci_host_pair%:*}"
+                    oci_host_dst="${oci_host_pair##*:}"
+                    if [ -e "$oci_host_src" ]; then
+                        mkdir -p "$image_bundle_name/rootfs$(dirname $oci_host_dst)"
+                        cp -a "$oci_host_src" "$image_bundle_name/rootfs$oci_host_dst"
+                        bbnote "OCI: Added from host: $oci_host_src -> $oci_host_dst"
+                    else
+                        bbfatal "OCI: Host path not found: $oci_host_src"
                     fi
                 done
             fi
