@@ -86,11 +86,12 @@ VCONTAINER_MC = "${@'vruntime-aarch64' if d.getVar('MACHINE') == 'qemuarm64' els
 # ===========================================================================
 # Multiconfig dependencies for blobs
 # ===========================================================================
-# Auto-detect which architectures have blobs available.
-# To limit to specific architectures, set in local.conf:
+# By default, builds BOTH x86_64 and aarch64 via mcdepends.
+# To limit to a single architecture, set in local.conf:
 #   VCONTAINER_ARCHITECTURES = "x86_64"           # x86_64 only
 #   VCONTAINER_ARCHITECTURES = "aarch64"          # aarch64 only
-#   VCONTAINER_ARCHITECTURES = "x86_64 aarch64"   # both (default if both built)
+#
+# Helper function (optional - for auto-detection if needed)
 def get_available_architectures(d):
     import os
     topdir = d.getVar('TOPDIR')
@@ -108,11 +109,44 @@ def get_available_architectures(d):
         available.append(d.getVar('VCONTAINER_TARGET_ARCH'))
     return " ".join(sorted(available))
 
-VCONTAINER_ARCHITECTURES ?= "${@get_available_architectures(d)}"
+# Default to both architectures. Override in local.conf if you only want one:
+#   VCONTAINER_ARCHITECTURES = "x86_64"
+#   VCONTAINER_ARCHITECTURES = "aarch64"
+VCONTAINER_ARCHITECTURES ?= "x86_64 aarch64"
 
 # Trigger multiconfig blob builds automatically via mcdepends
-# VCONTAINER_MC is set based on MACHINE (qemuarm64 -> vruntime-aarch64, qemux86-64 -> vruntime-x86-64)
-do_populate_sdk[mcdepends] = "mc::${VCONTAINER_MC}:vdkr-initramfs-create:do_deploy mc::${VCONTAINER_MC}:vpdmn-initramfs-create:do_deploy"
+# Build BOTH architectures so a single bitbake command produces a complete SDK
+do_populate_sdk[mcdepends] = "\
+    mc::vruntime-x86-64:vdkr-initramfs-create:do_deploy \
+    mc::vruntime-x86-64:vpdmn-initramfs-create:do_deploy \
+    mc::vruntime-aarch64:vdkr-initramfs-create:do_deploy \
+    mc::vruntime-aarch64:vpdmn-initramfs-create:do_deploy \
+    "
+
+# Print banner at parse time (before builds start)
+python () {
+    # Only print for main multiconfig (not vruntime-* multiconfigs)
+    mc = d.getVar('BB_CURRENT_MC') or ''
+    if mc == '' and d.getVar('BB_WORKERCONTEXT') != '1':
+        archs = d.getVar('VCONTAINER_ARCHITECTURES')
+        bb.plain("")
+        bb.plain("=" * 70)
+        bb.plain("vcontainer-tarball: Building SDK with multiconfig dependencies")
+        bb.plain("")
+        bb.plain("  Architectures: %s" % archs)
+        bb.plain("")
+        bb.plain("  This will automatically build:")
+        for arch in archs.split():
+            mc_name = "vruntime-aarch64" if arch == "aarch64" else "vruntime-x86-64"
+            bb.plain("    - mc:%s:vdkr-initramfs-create" % mc_name)
+            bb.plain("    - mc:%s:vpdmn-initramfs-create" % mc_name)
+        bb.plain("")
+        bb.plain("  To build only one architecture, set in local.conf:")
+        bb.plain("    VCONTAINER_ARCHITECTURES = \"x86_64\"")
+        bb.plain("    VCONTAINER_ARCHITECTURES = \"aarch64\"")
+        bb.plain("=" * 70)
+        bb.plain("")
+}
 
 # ===========================================================================
 # Custom SDK files - environment script AND blobs/scripts

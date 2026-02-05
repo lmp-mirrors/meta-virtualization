@@ -13,6 +13,11 @@ virtualization support.")
 addhandler vcontainer_sanity_check
 vcontainer_sanity_check[eventmask] = "bb.event.SanityCheck"
 python vcontainer_sanity_check() {
+    # Only run for main multiconfig (avoid duplicate messages)
+    mc = e.data.getVar('BB_CURRENT_MC') or ''
+    if mc != '':
+        return
+
     skip_check = e.data.getVar('SKIP_META_VIRT_SANITY_CHECK') == "1"
     if skip_check:
         return
