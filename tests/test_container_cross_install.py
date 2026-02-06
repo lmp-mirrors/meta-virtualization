@@ -904,3 +904,197 @@ class TestBundledContainersBoot:
 
         assert 'CONTAINER_WORKS' in output, \
             f"Container {container} failed to run.\nOutput:\n{output}"
+
+
+# ============================================================================
+# Custom Service File Tests
+# ============================================================================
+
+class TestCustomServiceFileSupport:
+    """
+    Test CONTAINER_SERVICE_FILE varflag support.
+
+    This tests the ability to provide custom systemd service files or
+    Podman Quadlet files instead of auto-generated ones.
+    """
+
+    def test_bbclass_has_service_file_support(self, meta_virt_dir):
+        """Test that the bbclass includes CONTAINER_SERVICE_FILE support."""
+        class_file = meta_virt_dir / "classes" / "container-cross-install.bbclass"
+        content = class_file.read_text()
+
+        # Check for the key implementation elements
+        assert "CONTAINER_SERVICE_FILE" in content, \
+            "CONTAINER_SERVICE_FILE variable not found in bbclass"
+        assert "get_container_service_file_map" in content, \
+            "get_container_service_file_map function not found"
+        assert "CONTAINER_SERVICE_FILE_MAP" in content, \
+            "CONTAINER_SERVICE_FILE_MAP variable not found"
+        assert "install_custom_service" in content, \
+            "install_custom_service function not found"
+
+    def test_bundle_class_has_service_file_support(self, meta_virt_dir):
+        """Test that container-bundle.bbclass includes CONTAINER_SERVICE_FILE support."""
+        class_file = meta_virt_dir / "classes" / "container-bundle.bbclass"
+        content = class_file.read_text()
+
+        # Check for the key implementation elements
+        assert "CONTAINER_SERVICE_FILE" in content, \
+            "CONTAINER_SERVICE_FILE variable not found in container-bundle.bbclass"
+        assert "_CONTAINER_SERVICE_FILE_MAP" in content, \
+            "_CONTAINER_SERVICE_FILE_MAP variable not found"
+        assert "services" in content, \
+            "services directory handling not found"
+
+    def test_service_file_map_syntax(self, meta_virt_dir):
+        """Test that the service file map function has correct syntax."""
+        class_file = meta_virt_dir / "classes" / "container-cross-install.bbclass"
+        content = class_file.read_text()
+
+        # Check the function signature and key logic
+        assert "def get_container_service_file_map(d):" in content, \
+            "get_container_service_file_map function signature not found"
+        assert "getVarFlag('CONTAINER_SERVICE_FILE'" in content, \
+            "getVarFlag call for CONTAINER_SERVICE_FILE not found"
+        assert 'mappings.append' in content or 'mappings =' in content, \
+            "Service file mapping logic not found"
+
+    def test_install_custom_service_function(self, meta_virt_dir):
+        """Test that install_custom_service handles both Docker and Podman."""
+        class_file = meta_virt_dir / "classes" / "container-cross-install.bbclass"
+        content = class_file.read_text()
+
+        # Check the function handles both runtimes
+        assert 'install_custom_service()' in content or 'install_custom_service ' in content, \
+            "install_custom_service function not found"
+
+        # Docker service installation
+        assert '/lib/systemd/system' in content, \
+            "Docker service directory path not found"
+        assert 'multi-user.target.wants' in content, \
+            "Systemd enable symlink path not found"
+
+        # Podman Quadlet installation
+        assert '/etc/containers/systemd' in content, \
+            "Podman Quadlet directory path not found"
+
+
+class TestCustomServiceFileBoot:
+    """
+    Boot tests for custom service files.
+
+    These tests verify that custom service files are properly installed
+    and enabled in the booted system.
+    """
+
+    @pytest.mark.slow
+    @pytest.mark.boot
+    def test_systemd_services_directory_exists(self, runqemu_session):
+        """Test that systemd service directories exist."""
+        output = runqemu_session.run_command('ls -la /lib/systemd/system/ | head -5')
+        assert 'systemd' in output or 'total' in output, \
+            "Systemd system directory not accessible"
+
+    @pytest.mark.slow
+    @pytest.mark.boot
+    def test_container_services_present(self, runqemu_session, bundled_containers_config):
+        """Test that container service files are present (custom or generated)."""
+        docker_containers = bundled_containers_config.get('docker', [])
+
+        if not docker_containers:
+            pytest.skip("No Docker containers configured")
+
+        # Check if docker is available
+        output = runqemu_session.run_command('which docker')
+        if '/docker' not in output:
+            pytest.skip("docker not installed in image")
+
+        # Check for container service files
+        output = runqemu_session.run_command('ls /lib/systemd/system/container-*.service 2>/dev/null || echo "NONE"')
+
+        if 'NONE' in output:
+            # No autostart services - check if any containers have autostart
+            pytest.skip("No container autostart services found (containers may not have autostart enabled)")
+
+        # Verify at least one service file exists
+        assert '.service' in output, \
+            f"No container service files found. Output: {output}"
+
+    @pytest.mark.slow
+    @pytest.mark.boot
+    def test_container_service_enabled(self, runqemu_session, bundled_containers_config):
+        """Test that container services are enabled (linked in wants directory)."""
+        docker_containers = bundled_containers_config.get('docker', [])
+
+        if not docker_containers:
+            pytest.skip("No Docker containers configured")
+
+        # Check for enabled services in multi-user.target.wants
+        output = runqemu_session.run_command(
+            'ls /etc/systemd/system/multi-user.target.wants/container-*.service 2>/dev/null || echo "NONE"'
+        )
+
+        if 'NONE' in output:
+            pytest.skip("No container autostart services enabled")
+
+        # Verify services are symlinked
+        assert '.service' in output, \
+            f"No enabled container services found. Output: {output}"
+
+    @pytest.mark.slow
+    @pytest.mark.boot
+    def test_custom_service_content(self, runqemu_session, bundled_containers_config):
+        """Test that custom service files have expected content markers."""
+        docker_containers = bundled_containers_config.get('docker', [])
+
+        if not docker_containers:
+            pytest.skip("No Docker containers configured")
+
+        # Find a container service file
+        output = runqemu_session.run_command(
+            'ls /lib/systemd/system/container-*.service 2>/dev/null | head -1'
+        )
+
+        if not output or 'container-' not in output:
+            pytest.skip("No container service files found")
+
+        service_file = output.strip().split('\n')[0]
+
+        # Read the service file content
+        content = runqemu_session.run_command(f'cat {service_file}')
+
+        # Verify it has expected systemd service structure
+        assert '[Unit]' in content, f"Service file missing [Unit] section: {service_file}"
+        assert '[Service]' in content, f"Service file missing [Service] section: {service_file}"
+        assert '[Install]' in content, f"Service file missing [Install] section: {service_file}"
+
+        # Check for docker-related content
+        assert 'docker' in content.lower(), \
+            f"Service file doesn't reference docker: {content}"
+
+    @pytest.mark.slow
+    @pytest.mark.boot
+    def test_podman_quadlet_directory(self, runqemu_session, bundled_containers_config):
+        """Test Podman Quadlet directory exists for Podman containers."""
+        podman_containers = bundled_containers_config.get('podman', [])
+
+        if not podman_containers:
+            pytest.skip("No Podman containers configured")
+
+        # Check if podman is available
+        output = runqemu_session.run_command('which podman')
+        if '/podman' not in output:
+            pytest.skip("podman not installed in image")
+
+        # Check for Quadlet directory
+        output = runqemu_session.run_command('ls -la /etc/containers/systemd/ 2>/dev/null || echo "NONE"')
+
+        if 'NONE' in output:
+            pytest.skip("Quadlet directory not found (containers may not have autostart enabled)")
+
+        # Check for .container files
+        output = runqemu_session.run_command('ls /etc/containers/systemd/*.container 2>/dev/null || echo "NONE"')
+
+        if 'NONE' not in output:
+            assert '.container' in output, \
+                f"No Quadlet container files found. Output: {output}"

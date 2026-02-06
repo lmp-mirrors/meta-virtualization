@@ -360,6 +360,101 @@ Containers can be configured to start automatically on boot:
 - Podman: `/etc/containers/systemd/<name>.container` (Quadlet format)
 
 
+Custom Service Files
+--------------------
+
+For containers that require specific startup configuration (ports, volumes,
+capabilities, dependencies), you can provide custom service files instead of
+using the auto-generated ones.
+
+### Variable Format
+
+Use the `CONTAINER_SERVICE_FILE` varflag to specify custom service files:
+
+    CONTAINER_SERVICE_FILE[container-name] = "${UNPACKDIR}/myservice.service"
+    CONTAINER_SERVICE_FILE[other-container] = "${UNPACKDIR}/other.container"
+
+### For BUNDLED_CONTAINERS (in image recipe)
+
+    # host-image.bb or local.conf
+    inherit container-cross-install
+
+    SRC_URI += "\
+        file://myapp.service \
+        file://mydb.container \
+    "
+
+    BUNDLED_CONTAINERS = "\
+        myapp-container:docker:autostart \
+        mydb-container:podman:autostart \
+    "
+
+    # Map containers to custom service files
+    CONTAINER_SERVICE_FILE[myapp-container] = "${UNPACKDIR}/myapp.service"
+    CONTAINER_SERVICE_FILE[mydb-container] = "${UNPACKDIR}/mydb.container"
+
+### For container-bundle Packages
+
+    # my-bundle_1.0.bb
+    inherit container-bundle
+
+    SRC_URI = "\
+        file://myapp.service \
+        file://mydb.container \
+    "
+
+    CONTAINER_BUNDLES = "\
+        myapp-container:autostart \
+        mydb-container:autostart \
+    "
+
+    CONTAINER_SERVICE_FILE[myapp-container] = "${UNPACKDIR}/myapp.service"
+    CONTAINER_SERVICE_FILE[mydb-container] = "${UNPACKDIR}/mydb.container"
+
+### Docker .service Example
+
+    # myapp.service
+    [Unit]
+    Description=MyApp Container
+    After=docker.service
+    Requires=docker.service
+
+    [Service]
+    Type=simple
+    Restart=unless-stopped
+    RestartSec=5s
+    ExecStartPre=-/usr/bin/docker rm -f myapp
+    ExecStart=/usr/bin/docker run --rm --name myapp \
+        -p 8080:80 \
+        -v /data/myapp:/var/lib/myapp:rw \
+        --cap-add NET_ADMIN \
+        myapp:latest
+    ExecStop=/usr/bin/docker stop myapp
+
+    [Install]
+    WantedBy=multi-user.target
+
+### Podman .container (Quadlet) Example
+
+    # mydb.container
+    [Unit]
+    Description=MyDB Container
+
+    [Container]
+    Image=mydb:latest
+    ContainerName=mydb
+    PublishPort=5432:5432
+    Volume=/data/db:/var/lib/postgresql/data:Z
+    Environment=POSTGRES_PASSWORD=secret
+
+    [Service]
+    Restart=unless-stopped
+    RestartSec=5s
+
+    [Install]
+    WantedBy=multi-user.target
+
+
 vdkr and vpdmn - Virtual Container Runtimes
 ===========================================
 
