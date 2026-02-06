@@ -141,6 +141,30 @@
 # The runtime subdirectory (docker/ vs podman/) tells container-cross-install
 # which vrunner runtime to use for import.
 #
+# ===========================================================================
+# Custom Service Files (CONTAINER_SERVICE_FILE)
+# ===========================================================================
+#
+# For containers requiring specific startup configuration, provide custom
+# service files instead of auto-generated ones:
+#
+#   SRC_URI = "file://myapp.service file://mydb.container"
+#
+#   CONTAINER_BUNDLES = "\
+#       myapp-container:autostart \
+#       mydb-container:autostart \
+#   "
+#
+#   CONTAINER_SERVICE_FILE[myapp-container] = "${UNPACKDIR}/myapp.service"
+#   CONTAINER_SERVICE_FILE[mydb-container] = "${UNPACKDIR}/mydb.container"
+#
+# Custom files are installed to ${datadir}/container-bundles/${RUNTIME}/services/
+# and used by container-cross-install instead of generating default services.
+#
+# For Docker, provide a .service file; for Podman, provide a .container Quadlet.
+#
+# See docs/container-bundling.md for detailed examples.
+#
 # See also: container-cross-install.bbclass
 
 CONTAINER_BUNDLES ?= ""
@@ -247,6 +271,29 @@ python __anonymous() {
     d.setVar('_REMOTE_CONTAINERS', ' '.join(remote_urls))
     d.setVar('_PROCESSED_BUNDLES', ' '.join(processed_bundles))
     d.setVar('_BUNDLE_RUNTIME', runtime)
+
+    # Build service file map for custom service files
+    # Format: container1=/path/to/file1;container2=/path/to/file2
+    service_mappings = []
+    for bundle in bundles:
+        # Extract container name (handle both local and remote formats)
+        if is_remote_container(bundle):
+            if bundle.endswith(':autostart') or bundle.endswith(':always') or \
+               bundle.endswith(':unless-stopped') or bundle.endswith(':on-failure') or \
+               bundle.endswith(':no'):
+                last_colon = bundle.rfind(':')
+                source = bundle[:last_colon]
+            else:
+                source = bundle
+        else:
+            parts = bundle.split(':')
+            source = parts[0]
+
+        custom_file = d.getVarFlag('CONTAINER_SERVICE_FILE', source)
+        if custom_file:
+            service_mappings.append(f"{source}={custom_file}")
+
+    d.setVar('_CONTAINER_SERVICE_FILE_MAP', ';'.join(service_mappings))
 }
 
 # S must be a real directory
@@ -401,6 +448,39 @@ do_install() {
         install -d ${D}${datadir}/container-bundles
         install -m 0644 ${B}/bundle-metadata.txt \
             ${D}${datadir}/container-bundles/${PN}.meta
+    fi
+
+    # Install custom service files from CONTAINER_SERVICE_FILE varflags
+    # Format: container1=/path/to/file1;container2=/path/to/file2
+    if [ -n "${_CONTAINER_SERVICE_FILE_MAP}" ]; then
+        install -d ${D}${datadir}/container-bundles/${RUNTIME}/services
+        echo "${_CONTAINER_SERVICE_FILE_MAP}" | tr ';' '\n' | while IFS='=' read -r container_name service_file; do
+            [ -z "$container_name" ] && continue
+            [ -z "$service_file" ] && continue
+
+            if [ ! -f "$service_file" ]; then
+                bbwarn "Custom service file not found: $service_file (for container $container_name)"
+                continue
+            fi
+
+            # Sanitize container name for filename (replace / and : with _)
+            local sanitized_name=$(echo "$container_name" | sed 's|[/:]|_|g')
+
+            # Determine file extension based on runtime and source file
+            local dest_file
+            if [ "${RUNTIME}" = "docker" ]; then
+                dest_file="${sanitized_name}.service"
+            elif [ "${RUNTIME}" = "podman" ]; then
+                dest_file="${sanitized_name}.container"
+            else
+                # Keep original extension
+                dest_file="${sanitized_name}.$(echo "$service_file" | sed 's/.*\.//')"
+            fi
+
+            bbnote "Installing custom service file: $service_file -> services/${dest_file}"
+            install -m 0644 "$service_file" \
+                ${D}${datadir}/container-bundles/${RUNTIME}/services/${dest_file}
+        done
     fi
 }
 

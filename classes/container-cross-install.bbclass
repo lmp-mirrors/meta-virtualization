@@ -98,6 +98,27 @@
 # The runtime is determined by the subdirectory (docker/ vs podman/),
 # which is set by container-bundle.bbclass based on CONTAINER_BUNDLE_RUNTIME.
 #
+# ===========================================================================
+# Custom Service Files (CONTAINER_SERVICE_FILE)
+# ===========================================================================
+#
+# For containers requiring specific startup configuration (ports, volumes,
+# capabilities, dependencies), provide custom service files instead of
+# auto-generated ones using the CONTAINER_SERVICE_FILE varflag:
+#
+#   CONTAINER_SERVICE_FILE[container-name] = "${UNPACKDIR}/myservice.service"
+#   CONTAINER_SERVICE_FILE[other-container] = "${UNPACKDIR}/other.container"
+#
+# Usage in image recipe:
+#   SRC_URI += "file://myapp.service"
+#   BUNDLED_CONTAINERS = "myapp-container:docker:autostart"
+#   CONTAINER_SERVICE_FILE[myapp-container] = "${UNPACKDIR}/myapp.service"
+#
+# The custom file replaces the auto-generated service. For Docker, provide
+# a .service file; for Podman, provide a .container Quadlet file.
+#
+# See docs/container-bundling.md for detailed examples.
+#
 # See also: container-bundle.bbclass
 
 # Inherit shared functions for multiconfig/machine/arch mapping
@@ -163,6 +184,26 @@ python __anonymous() {
     if deps:
         d.appendVarFlag('do_rootfs', 'depends', deps)
 }
+
+# Build CONTAINER_SERVICE_FILE_MAP from varflags for shell access
+# Format: container1=/path/to/file1;container2=/path/to/file2
+def get_container_service_file_map(d):
+    """Build a semicolon-separated map of container names to custom service files"""
+    bundled = (d.getVar('BUNDLED_CONTAINERS') or "").split()
+    if not bundled:
+        return ""
+
+    mappings = []
+    for entry in bundled:
+        parts = entry.split(':')
+        container_name = parts[0]
+        custom_file = d.getVarFlag('CONTAINER_SERVICE_FILE', container_name)
+        if custom_file:
+            mappings.append(f"{container_name}={custom_file}")
+
+    return ";".join(mappings)
+
+CONTAINER_SERVICE_FILE_MAP = "${@get_container_service_file_map(d)}"
 
 # Path to vrunner.sh from vcontainer-native
 VRUNNER_PATH = "${STAGING_BINDIR_NATIVE}/vrunner.sh"
@@ -419,7 +460,21 @@ merge_installed_bundles() {
 
             bbnote "Creating autostart service for $source ($runtime_type, restart=$restart_policy)"
 
+            # Check for custom service file in bundle's services directory
+            # Custom files are stored as: services/<source-sanitized>.(service|container)
+            local source_sanitized=$(echo "$source" | sed 's|[/:]|_|g')
+            local custom_service_file=""
+
             if [ "$runtime_type" = "docker" ]; then
+                custom_service_file="${BUNDLES_DIR}/${runtime_type}/services/${source_sanitized}.service"
+            elif [ "$runtime_type" = "podman" ]; then
+                custom_service_file="${BUNDLES_DIR}/${runtime_type}/services/${source_sanitized}.container"
+            fi
+
+            if [ -n "$custom_service_file" ] && [ -f "$custom_service_file" ]; then
+                bbnote "Using custom service file from bundle: $custom_service_file"
+                install_custom_service_from_bundle "$source" "$service_name" "$runtime_type" "$custom_service_file"
+            elif [ "$runtime_type" = "docker" ]; then
                 generate_docker_service_from_bundle "$service_name" "$image_name" "$image_tag" "$restart_policy"
             elif [ "$runtime_type" = "podman" ]; then
                 generate_podman_service_from_bundle "$service_name" "$image_name" "$image_tag" "$restart_policy"
@@ -430,6 +485,51 @@ merge_installed_bundles() {
     # Clean up bundle files from final image (they're just intermediate artifacts)
     rm -rf "${BUNDLES_DIR}"
     bbnote "Cleaned up container bundle files"
+
+    return 0
+}
+
+# Install a custom service file from a bundle package
+# Args: source service_name runtime_type custom_file
+install_custom_service_from_bundle() {
+    local source="$1"
+    local service_name="$2"
+    local runtime_type="$3"
+    local custom_file="$4"
+
+    if [ ! -f "$custom_file" ]; then
+        bbwarn "Custom service file not found: $custom_file (for container $source)"
+        return 1
+    fi
+
+    if [ "$runtime_type" = "docker" ]; then
+        # Docker: Install as systemd service
+        local service_dir="${IMAGE_ROOTFS}/lib/systemd/system"
+        local service_file="${service_dir}/${service_name}.service"
+
+        mkdir -p "$service_dir"
+        install -m 0644 "$custom_file" "$service_file"
+
+        # Enable the service via symlink
+        local wants_dir="${IMAGE_ROOTFS}/etc/systemd/system/multi-user.target.wants"
+        mkdir -p "$wants_dir"
+        ln -sf "/lib/systemd/system/${service_name}.service" "${wants_dir}/${service_name}.service"
+
+        bbnote "Installed custom service from bundle: $custom_file -> ${service_name}.service"
+
+    elif [ "$runtime_type" = "podman" ]; then
+        # Podman: Install as Quadlet container file
+        local quadlet_dir="${IMAGE_ROOTFS}/etc/containers/systemd"
+        local container_file="${quadlet_dir}/${service_name}.container"
+
+        mkdir -p "$quadlet_dir"
+        install -m 0644 "$custom_file" "$container_file"
+
+        bbnote "Installed custom Quadlet file from bundle: $custom_file -> ${service_name}.container"
+    else
+        bbwarn "Unknown runtime '$runtime_type' for custom service file from bundle, skipping"
+        return 1
+    fi
 
     return 0
 }
@@ -648,6 +748,47 @@ EOF
         bbnote "Created Quadlet file ${service_name}.container for Podman container ${image_name}:${image_tag}"
     }
 
+    # Install a custom service file provided by the user
+    # Args: container_name service_name runtime_type custom_file
+    install_custom_service() {
+        local container_name="$1"
+        local service_name="$2"
+        local runtime_type="$3"
+        local custom_file="$4"
+
+        if [ ! -f "$custom_file" ]; then
+            bbfatal "Custom service file not found: $custom_file (for container $container_name)"
+        fi
+
+        if [ "$runtime_type" = "docker" ]; then
+            # Docker: Install as systemd service
+            local service_dir="${IMAGE_ROOTFS}/lib/systemd/system"
+            local service_file="${service_dir}/${service_name}.service"
+
+            mkdir -p "$service_dir"
+            install -m 0644 "$custom_file" "$service_file"
+
+            # Enable the service via symlink
+            local wants_dir="${IMAGE_ROOTFS}/etc/systemd/system/multi-user.target.wants"
+            mkdir -p "$wants_dir"
+            ln -sf "/lib/systemd/system/${service_name}.service" "${wants_dir}/${service_name}.service"
+
+            bbnote "Installed custom service: $custom_file -> ${service_name}.service"
+
+        elif [ "$runtime_type" = "podman" ]; then
+            # Podman: Install as Quadlet container file
+            local quadlet_dir="${IMAGE_ROOTFS}/etc/containers/systemd"
+            local container_file="${quadlet_dir}/${service_name}.container"
+
+            mkdir -p "$quadlet_dir"
+            install -m 0644 "$custom_file" "$container_file"
+
+            bbnote "Installed custom Quadlet file: $custom_file -> ${service_name}.container"
+        else
+            bbwarn "Unknown runtime '$runtime_type' for custom service file, skipping"
+        fi
+    }
+
     # Install autostart services for containers with autostart policy
     install_autostart_services() {
         bbnote "Processing container autostart services..."
@@ -697,7 +838,21 @@ EOF
 
             bbnote "Creating autostart service for $container_name ($runtime_type, restart=$restart_policy)"
 
-            if [ "$runtime_type" = "docker" ]; then
+            # Check for custom service file via CONTAINER_SERVICE_FILE varflag
+            # This is evaluated at rootfs time, so we use a Python helper
+            local custom_service_file="${CONTAINER_SERVICE_FILE_MAP}"
+            local custom_file=""
+
+            # Parse the map to find this container's custom file
+            # Format: container1=/path/to/file1;container2=/path/to/file2
+            if [ -n "$custom_service_file" ]; then
+                custom_file=$(echo "$custom_service_file" | tr ';' '\n' | grep "^${container_name}=" | cut -d= -f2-)
+            fi
+
+            if [ -n "$custom_file" ] && [ -f "$custom_file" ]; then
+                bbnote "Using custom service file for $container_name: $custom_file"
+                install_custom_service "$container_name" "$service_name" "$runtime_type" "$custom_file"
+            elif [ "$runtime_type" = "docker" ]; then
                 generate_docker_service "$service_name" "${CONTAINER_IMAGE_NAME}" "${CONTAINER_IMAGE_TAG}" "$restart_policy"
             elif [ "$runtime_type" = "podman" ]; then
                 generate_podman_service "$service_name" "${CONTAINER_IMAGE_NAME}" "${CONTAINER_IMAGE_TAG}" "$restart_policy"
