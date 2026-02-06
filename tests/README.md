@@ -162,6 +162,8 @@ BBMULTICONFIG = "vruntime-aarch64 vruntime-x86-64"
 | `TestVdkrRecipes` | vdkr recipe builds | `bitbake vcontainer-tarball` |
 | `TestMulticonfig` | Multiconfig setup | `BBMULTICONFIG` configured |
 | `TestBundledContainersBoot` | **Boot image and verify containers** | Full image with Docker/Podman |
+| `TestCustomServiceFileSupport` | CONTAINER_SERVICE_FILE varflag support | None (file check only) |
+| `TestCustomServiceFileBoot` | Custom service files installed correctly | Full image with autostart containers |
 
 ### Boot Tests (TestBundledContainersBoot)
 
@@ -440,7 +442,9 @@ tests/
 │   ├── TestBundledContainers        # end-to-end bundling
 │   ├── TestVdkrRecipes              # vdkr builds
 │   ├── TestMulticonfig              # multiconfig setup
-│   └── TestBundledContainersBoot    # boot and verify containers
+│   ├── TestBundledContainersBoot    # boot and verify containers
+│   ├── TestCustomServiceFileSupport # CONTAINER_SERVICE_FILE varflag support
+│   └── TestCustomServiceFileBoot    # custom service file boot verification
 ├── test_multiarch_oci.py            # Multi-architecture OCI tests
 │   ├── TestOCIImageIndexDetection   # multi-arch OCI detection
 │   ├── TestPlatformSelection        # arch selection (aarch64/x86_64)
