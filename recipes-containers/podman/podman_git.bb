@@ -88,8 +88,8 @@ do_compile() {
 	# can find the needed headers files and libraries
 	export GOARCH=${TARGET_GOARCH}
 	export CGO_ENABLED="1"
-	export CGO_CFLAGS="${CFLAGS} --sysroot=${STAGING_DIR_TARGET}"
-	export CGO_LDFLAGS="${LDFLAGS} --sysroot=${STAGING_DIR_TARGET}"
+	export CGO_CFLAGS="${CFLAGS}"
+	export CGO_LDFLAGS="${LDFLAGS}"
 
 	# podman now builds go-md2man and requires the host/build details
 	export NATIVE_GOOS=${BUILD_GOOS}

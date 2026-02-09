@@ -74,8 +74,8 @@ do_compile() {
         # Pass the needed cflags/ldflags so that cgo
         # can find the needed headers files and libraries
         export GOARCH=${TARGET_GOARCH}
-        export CGO_CFLAGS="${CFLAGS} --sysroot=${STAGING_DIR_TARGET}"
-        export CGO_LDFLAGS="${LDFLAGS} --sysroot=${STAGING_DIR_TARGET}"
+        export CGO_CFLAGS="${CFLAGS}"
+        export CGO_LDFLAGS="${LDFLAGS}"
 
         # -trimpath removes build paths from the binary (required for reproducible builds)
         oe_runmake GO=${GO} BUILDTAGS="${BUILDTAGS}" GO_BUILD_FLAGS="-trimpath -buildmode=pie" binaries

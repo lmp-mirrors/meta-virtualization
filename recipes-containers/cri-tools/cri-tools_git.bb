@@ -50,8 +50,8 @@ do_compile() {
 	export GOARCH="${TARGET_GOARCH}"
 	# Pass the needed cflags/ldflags so that cgo can find the needed headers files and libraries
 	export CGO_ENABLED="1"
-	export CGO_CFLAGS="${CFLAGS} --sysroot=${STAGING_DIR_TARGET}"
-	export CGO_LDFLAGS="${LDFLAGS} --sysroot=${STAGING_DIR_TARGET}"
+	export CGO_CFLAGS="${CFLAGS}"
+	export CGO_LDFLAGS="${LDFLAGS}"
 	export CFLAGS=""
 	export LDFLAGS=""
 	export CC="${CC}"
