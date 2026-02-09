@@ -595,25 +595,26 @@ IMAGE_CMD:oci() {
                         oci_delta_copied=0
                         oci_delta_skipped=0
                         # Walk the directory and copy only files not in bundle
-                        while IFS= read -r oci_src_file; do
+                        # Copy files (delta-only)
+                        find "${IMAGE_ROOTFS}$oci_dir" \( -type f -o -type l \) | while IFS= read -r oci_src_file; do
                             oci_rel_path="${oci_src_file#${IMAGE_ROOTFS}}"
                             oci_dst_file="$image_bundle_name/rootfs$oci_rel_path"
                             if [ ! -e "$oci_dst_file" ]; then
                                 mkdir -p "$(dirname "$oci_dst_file")"
                                 cp -a "$oci_src_file" "$oci_dst_file"
-                                oci_delta_copied=$((oci_delta_copied + 1))
+                                oci_delta_copied=$(expr $oci_delta_copied + 1)
                             else
-                                oci_delta_skipped=$((oci_delta_skipped + 1))
+                                oci_delta_skipped=$(expr $oci_delta_skipped + 1)
                             fi
-                        done < <(find "${IMAGE_ROOTFS}$oci_dir" -type f -o -type l)
+                        done
                         # Also copy empty directories
-                        while IFS= read -r oci_src_dir; do
+                        find "${IMAGE_ROOTFS}$oci_dir" -type d | while IFS= read -r oci_src_dir; do
                             oci_rel_path="${oci_src_dir#${IMAGE_ROOTFS}}"
                             oci_dst_dir="$image_bundle_name/rootfs$oci_rel_path"
                             if [ ! -e "$oci_dst_dir" ]; then
                                 mkdir -p "$oci_dst_dir"
                             fi
-                        done < <(find "${IMAGE_ROOTFS}$oci_dir" -type d)
+                        done
                         bbnote "OCI: Added directory $oci_dir (delta: $oci_delta_copied copied, $oci_delta_skipped skipped)"
                     else
                         bbwarn "OCI: Directory not found in IMAGE_ROOTFS: $oci_dir"
