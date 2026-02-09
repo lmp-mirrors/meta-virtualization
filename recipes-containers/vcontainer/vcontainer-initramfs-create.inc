@@ -43,6 +43,13 @@ python () {
         d.setVar('SSTATE_SKIP_CREATION', '1')
         d.setVarFlag('do_compile', 'nostamp', '1')
         d.setVarFlag('do_deploy', 'nostamp', '1')
+
+    # Conditionally set mcdepends when our multiconfig is configured
+    # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
+    mc = d.getVar('VCONTAINER_MULTICONFIG')
+    bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
+    if mc in bbmulticonfig:
+        d.setVarFlag('do_compile', 'mcdepends', 'mc:%s::virtual/kernel:do_deploy' % mc)
 }
 
 # Only populate native sysroot, skip target sysroot to avoid libgcc conflicts
@@ -56,7 +63,7 @@ INHIBIT_DEFAULT_DEPS = "1"
 # Both initramfs and rootfs images are in the same multiconfig
 do_compile[depends] = "${VCONTAINER_RUNTIME}-tiny-initramfs-image:do_image_complete"
 do_compile[depends] += "${VCONTAINER_RUNTIME}-rootfs-image:do_image_complete"
-do_compile[mcdepends] = "mc:${VCONTAINER_MULTICONFIG}::virtual/kernel:do_deploy"
+# mcdepends set conditionally in anonymous python below
 
 S = "${UNPACKDIR}"
 B = "${WORKDIR}/build"

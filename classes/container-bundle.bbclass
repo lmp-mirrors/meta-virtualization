@@ -215,6 +215,14 @@ def is_remote_container(source):
     return '/' in base or '.' in base
 
 python __anonymous() {
+    # Conditionally set mcdepends when vruntime multiconfig is configured
+    # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
+    vruntime_mc = d.getVar('VRUNTIME_MULTICONFIG')
+    bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
+    if vruntime_mc and vruntime_mc in bbmulticonfig:
+        d.setVarFlag('do_compile', 'mcdepends',
+            'mc::%s:vdkr-initramfs-create:do_deploy mc::%s:vpdmn-initramfs-create:do_deploy' % (vruntime_mc, vruntime_mc))
+
     bundles = (d.getVar('CONTAINER_BUNDLES') or "").split()
     if not bundles:
         return
@@ -486,12 +494,7 @@ do_install() {
 
 FILES:${PN} = "${datadir}/container-bundles"
 
-# Automatically trigger multiconfig blob builds
-# Note: This does NOT create circular dependencies because the blob build chain
-# (vdkr/vpdmn-initramfs-create -> vdkr/vpdmn-rootfs-image) is completely separate
-# from container image recipes. Circular deps only occur if bundle packages are
-# globally added to all images (including container images themselves).
-do_compile[mcdepends] = "mc::${VRUNTIME_MULTICONFIG}:vdkr-initramfs-create:do_deploy mc::${VRUNTIME_MULTICONFIG}:vpdmn-initramfs-create:do_deploy"
+# mcdepends set conditionally in __anonymous() above
 
 # ===========================================================================
 # Optional Deploy for OCI Base Layer Usage

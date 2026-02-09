@@ -124,17 +124,20 @@ def get_available_architectures(d):
 #   VCONTAINER_ARCHITECTURES = "aarch64"
 VCONTAINER_ARCHITECTURES ?= "x86_64 aarch64"
 
-# Trigger multiconfig blob builds automatically via mcdepends
-# Build BOTH architectures so a single bitbake command produces a complete SDK
-do_populate_sdk[mcdepends] = "\
-    mc::vruntime-x86-64:vdkr-initramfs-create:do_deploy \
-    mc::vruntime-x86-64:vpdmn-initramfs-create:do_deploy \
-    mc::vruntime-aarch64:vdkr-initramfs-create:do_deploy \
-    mc::vruntime-aarch64:vpdmn-initramfs-create:do_deploy \
-    "
-
 # Print banner at parse time (before builds start)
+# Also conditionally set mcdepends based on available multiconfigs
 python () {
+    # Conditionally set mcdepends based on available multiconfigs
+    # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
+    bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
+    mcdeps = []
+    for mc in ['vruntime-x86-64', 'vruntime-aarch64']:
+        if mc in bbmulticonfig:
+            mcdeps.append('mc::%s:vdkr-initramfs-create:do_deploy' % mc)
+            mcdeps.append('mc::%s:vpdmn-initramfs-create:do_deploy' % mc)
+    if mcdeps:
+        d.setVarFlag('do_populate_sdk', 'mcdepends', ' '.join(mcdeps))
+
     # Only print for main multiconfig (not vruntime-* multiconfigs)
     mc = d.getVar('BB_CURRENT_MC') or ''
     if mc == '' and d.getVar('BB_WORKERCONTEXT') != '1':

@@ -144,17 +144,20 @@ DEPENDS += "vcontainer-native coreutils-native"
 VRUNTIME_MULTICONFIG = "${@get_vruntime_multiconfig(d)}"
 VRUNTIME_MACHINE = "${@get_vruntime_machine(d)}"
 
-# Use mcdepends to automatically build vdkr/vpdmn blobs via multiconfig
-# This ensures blobs are built as part of the normal Yocto build flow
-# Requires BBMULTICONFIG = "vruntime-aarch64 vruntime-x86-64" in local.conf
-do_rootfs[mcdepends] = "mc::${VRUNTIME_MULTICONFIG}:vdkr-initramfs-create:do_deploy mc::${VRUNTIME_MULTICONFIG}:vpdmn-initramfs-create:do_deploy"
-
 # Generate dependencies for BUNDLED_CONTAINERS at parse time
 # Format: name:runtime[:autostart][:external]
 # - If :external present, no dependency generated (third-party blob)
 # - If name ends in -oci, derive recipe name and generate dependency
 # - Otherwise, generate dependency on name:do_image_complete
 python __anonymous() {
+    # Conditionally set mcdepends when vruntime multiconfig is configured
+    # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
+    vruntime_mc = d.getVar('VRUNTIME_MULTICONFIG')
+    bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
+    if vruntime_mc and vruntime_mc in bbmulticonfig:
+        d.setVarFlag('do_rootfs', 'mcdepends',
+            'mc::%s:vdkr-initramfs-create:do_deploy mc::%s:vpdmn-initramfs-create:do_deploy' % (vruntime_mc, vruntime_mc))
+
     bundled = (d.getVar('BUNDLED_CONTAINERS') or "").split()
     if not bundled:
         return
