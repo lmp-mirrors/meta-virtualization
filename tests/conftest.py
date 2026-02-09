@@ -245,6 +245,12 @@ def pytest_addoption(parser):
         default=False,
         help="Skip registry tests that require network access to docker.io",
     )
+    parser.addoption(
+        "--secure-registry",
+        action="store_true",
+        default=False,
+        help="Run secure registry tests (requires openssl, htpasswd)",
+    )
 
 
 def _cleanup_stale_test_state():
@@ -577,6 +583,25 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "network: marks tests that require network access"
     )
+    config.addinivalue_line(
+        "markers", "secure: marks tests that require secure registry mode (TLS/auth)"
+    )
+
+
+@pytest.fixture
+def skip_secure(request):
+    """Skip if secure registry tests not enabled.
+
+    Use with tests that require secure registry infrastructure:
+    - openssl for certificate generation
+    - htpasswd for authentication setup
+    - CONTAINER_REGISTRY_SECURE=1 baked into script
+
+    Enable with: pytest --secure-registry
+    """
+    if not request.config.getoption("--secure-registry"):
+        pytest.skip("Secure registry tests not enabled (use --secure-registry)")
+    return False
 
 
 # ============================================================================

@@ -171,6 +171,247 @@ DOCKER_REGISTRY_INSECURE = "localhost:5000"
 CONTAINER_REGISTRY_STORAGE = "/data/container-registry"
 ```
 
+## Authentication
+
+Support for pushing to authenticated registries (Docker Hub, GitHub Container Registry, private registries).
+
+### Authentication Modes
+
+| Mode | BitBake | Script | Description |
+|------|---------|--------|-------------|
+| `none` | Yes | Yes | No authentication (default, local registries) |
+| `home` | Yes | Yes | Use `~/.docker/config.json` (opt-in) |
+| `authfile` | Yes | Yes | Explicit Docker-style config.json path |
+| `credsfile` | Yes | Yes | Simple key=value credentials file |
+| `env` | No | Yes | Environment variables (script only) |
+
+### BitBake Configuration
+
+```bitbake
+# Authentication mode
+CONTAINER_REGISTRY_AUTH_MODE = "none"      # Default, no auth
+CONTAINER_REGISTRY_AUTH_MODE = "home"      # Use ~/.docker/config.json
+CONTAINER_REGISTRY_AUTH_MODE = "authfile"  # Explicit auth file
+CONTAINER_REGISTRY_AUTH_MODE = "credsfile" # Simple credentials file
+
+# For authfile mode
+CONTAINER_REGISTRY_AUTHFILE = "/path/to/docker-config.json"
+
+# For credsfile mode
+CONTAINER_REGISTRY_CREDSFILE = "${HOME}/.config/container-registry/credentials"
+```
+
+### Script Options
+
+```bash
+# Use existing Docker login (~/.docker/config.json)
+container-registry.sh push --use-home-auth
+
+# Explicit auth file
+container-registry.sh push --authfile /path/to/docker-config.json
+
+# Simple credentials file
+container-registry.sh push --credsfile ~/.config/container-registry/credentials
+
+# Environment variables
+export CONTAINER_REGISTRY_AUTH_MODE=env
+export CONTAINER_REGISTRY_TOKEN=ghp_xxxxx
+container-registry.sh push
+
+# Direct credentials (less secure - in shell history)
+container-registry.sh push --creds user:password
+container-registry.sh push --token ghp_xxxxx
+
+# Import from authenticated source registry
+container-registry.sh import ghcr.io/org/private:v1 --src-authfile ~/.docker/config.json
+container-registry.sh import ghcr.io/org/private:v1 --src-credsfile ~/.config/ghcr-creds
+```
+
+### Credentials File Format
+
+Simple key=value format (not checked into source control):
+
+```bash
+# ~/.config/container-registry/credentials
+# Username/password OR token (token takes precedence)
+CONTAINER_REGISTRY_USER=myuser
+CONTAINER_REGISTRY_PASSWORD=mypassword
+
+# Or for token-based auth (GitHub, GitLab, etc.):
+CONTAINER_REGISTRY_TOKEN=ghp_xxxxxxxxxxxx
+```
+
+Create with proper permissions:
+```bash
+mkdir -p ~/.config/container-registry
+cat > ~/.config/container-registry/credentials << 'EOF'
+CONTAINER_REGISTRY_TOKEN=ghp_xxxxxxxxxxxx
+EOF
+chmod 600 ~/.config/container-registry/credentials
+```
+
+### CI/CD Integration
+
+For CI/CD with BitBake, use `credsfile` mode and have CI write the credentials file:
+
+```yaml
+# Example GitHub Actions
+- name: Setup registry credentials
+  run: |
+    mkdir -p ~/.config/container-registry
+    echo "CONTAINER_REGISTRY_TOKEN=${{ secrets.GHCR_TOKEN }}" > ~/.config/container-registry/credentials
+    chmod 600 ~/.config/container-registry/credentials
+
+- name: Build and push
+  run: |
+    bitbake container-base
+    ./container-registry/container-registry.sh push --credsfile ~/.config/container-registry/credentials
+```
+
+For script-only usage, environment variables are simpler:
+
+```yaml
+- name: Push to registry
+  env:
+    CONTAINER_REGISTRY_AUTH_MODE: env
+    CONTAINER_REGISTRY_TOKEN: ${{ secrets.GHCR_TOKEN }}
+  run: ./container-registry/container-registry.sh push
+```
+
+### Security Notes
+
+- **No credentials in BitBake variables**: Like git fetcher, avoid passwords in metadata that gets logged/shared
+- **Use file-based auth**: Credentials files can be excluded from version control and have proper permissions
+- **Opt-in for home directory**: `home` mode requires explicit opt-in (like `BB_USE_HOME_NPMRC`)
+- **Prefer tokens over passwords**: Tokens can be scoped and revoked
+
+## Secure Registry Mode
+
+Enable TLS and authentication for the local registry (opt-in).
+
+### Configuration
+
+```bitbake
+# Enable secure mode
+CONTAINER_REGISTRY_SECURE = "1"
+
+# Optional: custom username (default: yocto)
+CONTAINER_REGISTRY_USERNAME = "myuser"
+
+# Optional: explicit password (default: auto-generate)
+CONTAINER_REGISTRY_PASSWORD = "mypassword"
+
+# Optional: certificate validity (days)
+CONTAINER_REGISTRY_CERT_DAYS = "365"   # Server cert
+CONTAINER_REGISTRY_CA_DAYS = "3650"    # CA cert (10 years)
+
+# Optional: additional SAN entries for server cert
+CONTAINER_REGISTRY_CERT_SAN = "DNS:myhost.local,IP:192.168.1.100"
+```
+
+### Setup
+
+PKI (CA and server certificates) is auto-generated during the bitbake build:
+
+```bash
+# Generate script AND PKI infrastructure
+bitbake container-registry-index -c generate_registry_script
+
+# Build target image (CA cert is automatically baked in)
+bitbake container-image-host
+```
+
+The `generate_registry_script` task automatically generates the PKI if it doesn't exist. No manual steps required.
+
+### Starting the Registry
+
+To actually run the registry (for pushing/pulling images):
+
+```bash
+# Start registry (generates htpasswd auth on first run)
+./container-registry/container-registry.sh start
+```
+
+Output:
+```
+Setting up authentication...
+  Password saved to: .../auth/password
+Starting SECURE container registry...
+  URL: https://localhost:5000
+```
+
+### Generated Files
+
+```
+${CONTAINER_REGISTRY_STORAGE}/
+├── pki/                 # Generated by: bitbake ... -c generate_registry_script
+│   ├── ca.key           # CA private key (600)
+│   ├── ca.crt           # CA certificate - baked into target images
+│   ├── server.key       # Server private key (600)
+│   └── server.crt       # Server certificate with SAN
+├── auth/                # Generated by: container-registry.sh start
+│   ├── htpasswd         # Bcrypt credentials for registry
+│   └── password         # Plaintext password for reference (600)
+└── ...
+```
+
+### Push (auto-uses credentials)
+
+```bash
+./container-registry/container-registry.sh push
+# Automatically uses:
+#   --dest-cert-dir=.../pki
+#   --dest-creds=yocto:<auto-password>
+```
+
+### Target Integration
+
+Install CA certificate on target images:
+
+```bitbake
+# Automatically included when CONTAINER_REGISTRY_SECURE = "1"
+# and IMAGE_FEATURES:append = " container-registry"
+IMAGE_INSTALL:append = " container-registry-ca"
+```
+
+This installs CA cert to:
+- `/etc/docker/certs.d/{registry}/ca.crt` (Docker)
+- `/etc/containers/certs.d/{registry}/ca.crt` (Podman/CRI-O)
+- `/usr/local/share/ca-certificates/container-registry-ca.crt` (system)
+
+### vdkr with Secure Registry
+
+```bash
+# Pass secure mode and CA cert to VM
+vdkr --secure-registry --ca-cert $STORAGE/pki/ca.crt pull myimage
+
+# Or with credentials
+vdkr --secure-registry --ca-cert $STORAGE/pki/ca.crt \
+     --registry-user yocto --registry-password mypass pull myimage
+```
+
+### Verification
+
+```bash
+# Verify TLS with curl
+curl --cacert $STORAGE/pki/ca.crt \
+     -u yocto:$(cat $STORAGE/auth/password) \
+     https://localhost:5000/v2/_catalog
+
+# Check server certificate SAN
+openssl x509 -in $STORAGE/pki/server.crt -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+### Secure Mode vs Insecure Mode
+
+| Feature | Insecure (`SECURE=0`) | Secure (`SECURE=1`) |
+|---------|----------------------|---------------------|
+| Protocol | HTTP | HTTPS |
+| TLS | None | Self-signed CA + server cert |
+| Auth | Optional | Required (htpasswd) |
+| Target config | `insecure-registries` | CA cert distribution |
+| Skopeo args | `--dest-tls-verify=false` | `--dest-cert-dir` |
+
 ## vdkr Registry Usage
 
 ### Pull Behavior with Registry Fallback
@@ -233,9 +474,11 @@ This installs:
 |------|-------------|
 | `container-registry-index.bb` | Generates helper script with baked-in paths |
 | `container-registry-populate.bb` | Alternative bitbake-driven push |
+| `container-registry-ca.bb` | Target package for CA certificate (secure mode) |
 | `container-oci-registry-config.bb` | OCI tools config (Podman/Skopeo/Buildah/CRI-O) |
 | `docker-registry-config.bb` | Docker daemon config |
-| `files/container-registry-dev.yml` | Development registry config |
+| `files/container-registry-dev.yml` | Development registry config (HTTP) |
+| `files/container-registry-secure.yml` | Secure registry config template (HTTPS+auth) |
 
 ## Storage
 
