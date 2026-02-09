@@ -48,7 +48,7 @@ export LDFLAGS = ""
 TOOLCHAIN = "gcc"
 
 # podmans Makefile expects BUILDFLAGS to be set but go.bbclass defines them in GOBUILDFLAGS
-export BUILDFLAGS = "${GOBUILDFLAGS}"
+export BUILDFLAGS = "${GOBUILDFLAGS} -buildvcs=false"
 
 inherit go goarch
 inherit container-host
