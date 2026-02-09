@@ -183,6 +183,16 @@ python __anonymous() {
 
     if deps:
         d.appendVarFlag('do_rootfs', 'depends', deps)
+
+    # Auto-add registry config package when secure registry is configured
+    # This ensures the target can pull from the registry at runtime
+    if d.getVar('CONTAINER_REGISTRY_SECURE') == '1':
+        # Determine which config package based on container engine
+        engine = d.getVar('VIRTUAL-RUNTIME_container_engine') or ''
+        if 'docker' in engine:
+            d.appendVar('IMAGE_INSTALL', ' docker-registry-config')
+        elif engine in ('podman', 'containerd', 'cri-o'):
+            d.appendVar('IMAGE_INSTALL', ' container-oci-registry-config')
 }
 
 # Build CONTAINER_SERVICE_FILE_MAP from varflags for shell access
