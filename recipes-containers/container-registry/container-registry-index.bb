@@ -115,12 +115,127 @@ python do_generate_registry_script() {
     tag_strategy = d.getVar('CONTAINER_REGISTRY_TAG_STRATEGY') or 'latest'
     target_arch = d.getVar('TARGET_ARCH') or ''
 
+    # Secure mode settings
+    secure_mode = d.getVar('CONTAINER_REGISTRY_SECURE') or '0'
+    auth_enabled = d.getVar('CONTAINER_REGISTRY_AUTH') or '0'
+    registry_username = d.getVar('CONTAINER_REGISTRY_USERNAME') or 'yocto'
+    ca_days = d.getVar('CONTAINER_REGISTRY_CA_DAYS') or '3650'
+    cert_days = d.getVar('CONTAINER_REGISTRY_CERT_DAYS') or '365'
+    custom_san = d.getVar('CONTAINER_REGISTRY_CERT_SAN') or ''
+
     # Create storage directory
     os.makedirs(registry_storage, exist_ok=True)
     os.makedirs(deploy_dir, exist_ok=True)
 
+    # Generate PKI infrastructure for secure mode
+    if secure_mode == '1':
+        import subprocess
+
+        pki_dir = os.path.join(registry_storage, 'pki')
+        auth_dir = os.path.join(registry_storage, 'auth')
+        os.makedirs(pki_dir, exist_ok=True)
+        os.makedirs(auth_dir, exist_ok=True)
+
+        ca_key = os.path.join(pki_dir, 'ca.key')
+        ca_crt = os.path.join(pki_dir, 'ca.crt')
+        server_key = os.path.join(pki_dir, 'server.key')
+        server_csr = os.path.join(pki_dir, 'server.csr')
+        server_crt = os.path.join(pki_dir, 'server.crt')
+
+        # Find openssl from native sysroot
+        openssl_bin = os.path.join(native_sysroot, 'usr', 'bin', 'openssl')
+        if not os.path.exists(openssl_bin):
+            openssl_bin = 'openssl'  # Fall back to system openssl
+
+        # Generate CA if it doesn't exist
+        if not os.path.exists(ca_crt):
+            bb.plain("Generating PKI infrastructure for secure registry...")
+
+            # Generate CA private key
+            subprocess.run([
+                openssl_bin, 'genrsa', '-out', ca_key, '4096'
+            ], check=True, capture_output=True)
+            os.chmod(ca_key, 0o600)
+
+            # Generate CA certificate
+            subprocess.run([
+                openssl_bin, 'req', '-new', '-x509', '-days', ca_days,
+                '-key', ca_key, '-out', ca_crt,
+                '-subj', '/CN=Container Registry CA/O=Yocto/C=US'
+            ], check=True, capture_output=True)
+
+            bb.plain(f"  Generated CA certificate: {ca_crt}")
+
+        # Generate server cert if it doesn't exist
+        if not os.path.exists(server_crt):
+            # Build SAN list
+            registry_host = registry_url.split(':')[0] if ':' in registry_url else registry_url
+            san_entries = [
+                'DNS:localhost',
+                f'DNS:{registry_host}',
+                'IP:127.0.0.1',
+                'IP:10.0.2.2'
+            ]
+            if custom_san:
+                san_entries.extend(custom_san.split(','))
+            san_string = ','.join(san_entries)
+
+            # Generate server private key
+            subprocess.run([
+                openssl_bin, 'genrsa', '-out', server_key, '4096'
+            ], check=True, capture_output=True)
+            os.chmod(server_key, 0o600)
+
+            # Create OpenSSL config for SAN
+            openssl_conf = os.path.join(pki_dir, 'openssl.cnf')
+            with open(openssl_conf, 'w') as f:
+                f.write(f'''[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = {registry_host}
+O = Yocto
+C = US
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName = {san_string}
+
+[v3_ca]
+subjectAltName = {san_string}
+''')
+
+            # Generate CSR
+            subprocess.run([
+                openssl_bin, 'req', '-new', '-key', server_key,
+                '-out', server_csr, '-config', openssl_conf
+            ], check=True, capture_output=True)
+
+            # Sign server cert with CA
+            subprocess.run([
+                openssl_bin, 'x509', '-req', '-days', cert_days,
+                '-in', server_csr, '-CA', ca_crt, '-CAkey', ca_key,
+                '-CAcreateserial', '-out', server_crt,
+                '-extensions', 'v3_ca', '-extfile', openssl_conf
+            ], check=True, capture_output=True)
+
+            bb.plain(f"  Generated server certificate with SAN: {', '.join(san_entries)}")
+
+        bb.plain(f"  PKI directory: {pki_dir}")
+
     # Copy config file to storage directory and update storage path
-    src_config = os.path.join(d.getVar('THISDIR'), 'files', 'container-registry-dev.yml')
+    # Use secure config when CONTAINER_REGISTRY_SECURE=1
+    if secure_mode == '1':
+        src_config = os.path.join(d.getVar('THISDIR'), 'files', 'container-registry-secure.yml')
+        if not os.path.exists(src_config):
+            bb.warn("Secure mode enabled but container-registry-secure.yml not found, using dev config")
+            src_config = os.path.join(d.getVar('THISDIR'), 'files', 'container-registry-dev.yml')
+    else:
+        src_config = os.path.join(d.getVar('THISDIR'), 'files', 'container-registry-dev.yml')
+
     config_file = os.path.join(registry_storage, 'registry-config.yml')
     with open(src_config, 'r') as f:
         config_content = f.read()
@@ -129,6 +244,23 @@ python do_generate_registry_script() {
         'rootdirectory: /tmp/container-registry',
         f'rootdirectory: {registry_storage}'
     )
+    config_content = config_content.replace(
+        '__STORAGE_PATH__',
+        registry_storage
+    )
+    config_content = config_content.replace(
+        '__PKI_DIR__',
+        os.path.join(registry_storage, 'pki')
+    )
+    config_content = config_content.replace(
+        '__AUTH_DIR__',
+        os.path.join(registry_storage, 'auth')
+    )
+    # Remove auth section if AUTH is not enabled (TLS-only mode)
+    if secure_mode == '1' and auth_enabled != '1':
+        import re
+        # Remove the auth block (including htpasswd subsection)
+        config_content = re.sub(r'\n# htpasswd authentication\nauth:\n  htpasswd:\n    realm:.*\n    path:.*\n', '\n', config_content)
     with open(config_file, 'w') as f:
         f.write(config_content)
 
@@ -155,13 +287,13 @@ python do_generate_registry_script() {
 
 set -e
 
-# Pre-configured paths from bitbake
+# Pre-configured paths from bitbake (overridable via environment)
 REGISTRY_BIN="{registry_bin}"
 SKOPEO_BIN="{skopeo_bin}"
-REGISTRY_CONFIG="{config_file}"
-REGISTRY_STORAGE="{registry_storage}"
-REGISTRY_URL="{registry_url}"
-REGISTRY_NAMESPACE="{registry_namespace}"
+REGISTRY_STORAGE="${{CONTAINER_REGISTRY_STORAGE:-{registry_storage}}}"
+REGISTRY_URL="${{CONTAINER_REGISTRY_URL:-{registry_url}}}"
+REGISTRY_NAMESPACE="${{CONTAINER_REGISTRY_NAMESPACE:-{registry_namespace}}}"
+REGISTRY_CONFIG="$REGISTRY_STORAGE/registry-config.yml"
 
 # Deploy directories - can be overridden via environment
 # DEPLOY_DIR_IMAGES: parent directory containing per-machine deploy dirs
@@ -173,8 +305,27 @@ DEPLOY_DIR_IMAGE="${{DEPLOY_DIR_IMAGE:-{deploy_dir_image}}}"
 DEFAULT_TAG_STRATEGY="{tag_strategy}"
 DEFAULT_TARGET_ARCH="{target_arch}"
 
-PID_FILE="/tmp/container-registry.pid"
-LOG_FILE="/tmp/container-registry.log"
+# Authentication settings (can be overridden via CLI options or env vars)
+AUTH_MODE="${{CONTAINER_REGISTRY_AUTH_MODE:-none}}"
+AUTHFILE="${{CONTAINER_REGISTRY_AUTHFILE:-}}"
+CREDSFILE="${{CONTAINER_REGISTRY_CREDSFILE:-}}"
+
+# Secure mode settings (baked from bitbake)
+SECURE_MODE="${{CONTAINER_REGISTRY_SECURE:-{secure_mode}}}"
+AUTH_ENABLED="${{CONTAINER_REGISTRY_AUTH:-{auth_enabled}}}"
+REGISTRY_USERNAME="${{CONTAINER_REGISTRY_USERNAME:-{registry_username}}}"
+CA_CERT_DAYS="{ca_days}"
+SERVER_CERT_DAYS="{cert_days}"
+CUSTOM_SAN="{custom_san}"
+
+# Directories for secure mode
+PKI_DIR="$REGISTRY_STORAGE/pki"
+AUTH_DIR="$REGISTRY_STORAGE/auth"
+
+# Port-based PID/LOG files (allows multiple instances on different ports)
+REGISTRY_PORT="${{REGISTRY_URL##*:}}"
+PID_FILE="/tmp/container-registry-$REGISTRY_PORT.pid"
+LOG_FILE="/tmp/container-registry-$REGISTRY_PORT.log"
 
 # Generate tags based on strategy
 # Usage: generate_tags "strategy1 strategy2 ..."
@@ -240,7 +391,359 @@ generate_tags() {{
     echo $tags
 }}
 
+# Parse a simple credentials file (key=value format)
+# Sets CONTAINER_REGISTRY_USER, CONTAINER_REGISTRY_PASSWORD, CONTAINER_REGISTRY_TOKEN
+parse_credsfile() {{
+    local file="$1"
+    [ ! -f "$file" ] && {{ echo "Error: Credentials file not found: $file" >&2; return 1; }}
+
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+
+        # Trim whitespace
+        key=$(echo "$key" | xargs)
+        value=$(echo "$value" | xargs)
+
+        # Remove surrounding quotes
+        value="${{value#\\"}}"
+        value="${{value%\\"}}"
+        value="${{value#'}}"
+        value="${{value%'}}"
+
+        case "$key" in
+            CONTAINER_REGISTRY_USER) export CONTAINER_REGISTRY_USER="$value" ;;
+            CONTAINER_REGISTRY_PASSWORD) export CONTAINER_REGISTRY_PASSWORD="$value" ;;
+            CONTAINER_REGISTRY_TOKEN) export CONTAINER_REGISTRY_TOKEN="$value" ;;
+        esac
+    done < "$file"
+}}
+
+# ============================================================================
+# Secure Registry PKI and Auth Setup
+# ============================================================================
+
+# Generate PKI infrastructure (CA + server certificate)
+# Creates: $PKI_DIR/ca.key, ca.crt, server.key, server.crt
+setup_pki() {{
+    # Check for openssl
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "Error: openssl is required for secure mode but not found"
+        echo "Install with: sudo apt install openssl"
+        return 1
+    fi
+
+    mkdir -p "$PKI_DIR"
+
+    # Generate CA if not exists
+    if [ ! -f "$PKI_DIR/ca.key" ] || [ ! -f "$PKI_DIR/ca.crt" ]; then
+        echo "Generating CA certificate..."
+        openssl genrsa -out "$PKI_DIR/ca.key" 4096
+        chmod 600 "$PKI_DIR/ca.key"
+
+        openssl req -new -x509 -days "$CA_CERT_DAYS" \\
+            -key "$PKI_DIR/ca.key" \\
+            -out "$PKI_DIR/ca.crt" \\
+            -subj "/CN=Yocto Container Registry CA/O=Yocto Project"
+
+        echo "  Generated CA certificate: $PKI_DIR/ca.crt"
+    else
+        echo "  Using existing CA certificate: $PKI_DIR/ca.crt"
+    fi
+
+    # Generate server certificate if not exists
+    if [ ! -f "$PKI_DIR/server.key" ] || [ ! -f "$PKI_DIR/server.crt" ]; then
+        echo "Generating server certificate..."
+
+        # Build SAN list
+        # Extract host from registry URL (strip port)
+        local registry_host=$(echo "$REGISTRY_URL" | cut -d':' -f1)
+        local san_list="DNS:localhost,DNS:$registry_host,IP:127.0.0.1,IP:10.0.2.2"
+
+        # Add custom SAN entries
+        if [ -n "$CUSTOM_SAN" ]; then
+            san_list="$san_list,$CUSTOM_SAN"
+        fi
+
+        echo "  SAN entries: $san_list"
+
+        # Create OpenSSL config for SAN
+        local ssl_conf="$PKI_DIR/openssl.cnf"
+        cat > "$ssl_conf" << SSLEOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = $registry_host
+O = Yocto Project
+
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = $san_list
+SSLEOF
+
+        # Generate server key
+        openssl genrsa -out "$PKI_DIR/server.key" 2048
+        chmod 600 "$PKI_DIR/server.key"
+
+        # Generate CSR
+        openssl req -new \\
+            -key "$PKI_DIR/server.key" \\
+            -out "$PKI_DIR/server.csr" \\
+            -config "$ssl_conf"
+
+        # Sign with CA
+        openssl x509 -req \\
+            -in "$PKI_DIR/server.csr" \\
+            -CA "$PKI_DIR/ca.crt" \\
+            -CAkey "$PKI_DIR/ca.key" \\
+            -CAcreateserial \\
+            -out "$PKI_DIR/server.crt" \\
+            -days "$SERVER_CERT_DAYS" \\
+            -extensions v3_req \\
+            -extfile "$ssl_conf"
+
+        # Cleanup temp files
+        rm -f "$PKI_DIR/server.csr" "$ssl_conf"
+
+        echo "  Generated server certificate with SAN: localhost, $registry_host, 127.0.0.1, 10.0.2.2"
+    else
+        echo "  Using existing server certificate: $PKI_DIR/server.crt"
+    fi
+}}
+
+# Setup htpasswd authentication
+# Creates: $AUTH_DIR/htpasswd, $AUTH_DIR/password
+setup_auth() {{
+    # Check for htpasswd (from apache2-utils)
+    if ! command -v htpasswd >/dev/null 2>&1; then
+        echo "Error: htpasswd is required for secure mode but not found"
+        echo "Install with: sudo apt install apache2-utils"
+        return 1
+    fi
+
+    mkdir -p "$AUTH_DIR"
+
+    local password=""
+
+    # Password priority:
+    # 1. CONTAINER_REGISTRY_PASSWORD environment variable
+    # 2. Existing $AUTH_DIR/password file
+    # 3. Auto-generate new password
+    if [ -n "${{CONTAINER_REGISTRY_PASSWORD:-}}" ]; then
+        password="$CONTAINER_REGISTRY_PASSWORD"
+        echo "  Using password from environment variable"
+    elif [ -f "$AUTH_DIR/password" ]; then
+        password=$(cat "$AUTH_DIR/password")
+        echo "  Using existing password from $AUTH_DIR/password"
+    else
+        # Generate random password (16 chars, alphanumeric)
+        password=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
+        echo "  Generated new random password"
+    fi
+
+    # Always update htpasswd (in case username changed)
+    echo "  Creating htpasswd for user: $REGISTRY_USERNAME"
+    htpasswd -Bbn "$REGISTRY_USERNAME" "$password" > "$AUTH_DIR/htpasswd"
+
+    # Save password for reference (used by script and bbclass)
+    echo -n "$password" > "$AUTH_DIR/password"
+    chmod 600 "$AUTH_DIR/password"
+
+    echo "  Password saved to: $AUTH_DIR/password"
+}}
+
+# Get TLS arguments for skopeo
+# Usage: get_tls_args [dest|src]
+# Returns: TLS arguments string for skopeo
+get_tls_args() {{
+    local direction="${{1:-dest}}"
+    local prefix=""
+
+    if [ "$direction" = "src" ]; then
+        prefix="--src"
+    else
+        prefix="--dest"
+    fi
+
+    if [ "$SECURE_MODE" = "1" ] && [ -f "$PKI_DIR/ca.crt" ]; then
+        # skopeo --dest-cert-dir expects a directory with only CA certs
+        # If we point it at PKI_DIR which has ca.key, it thinks it's a client key
+        # Create a clean certs directory with just the CA cert
+        local certs_dir="$REGISTRY_STORAGE/certs"
+        if [ ! -f "$certs_dir/ca.crt" ] || [ "$PKI_DIR/ca.crt" -nt "$certs_dir/ca.crt" ]; then
+            mkdir -p "$certs_dir"
+            cp "$PKI_DIR/ca.crt" "$certs_dir/ca.crt"
+        fi
+        echo "$prefix-cert-dir $certs_dir"
+    else
+        echo "$prefix-tls-verify=false"
+    fi
+}}
+
+# Get the base URL (http or https depending on mode)
+get_base_url() {{
+    if [ "$SECURE_MODE" = "1" ]; then
+        echo "https://$REGISTRY_URL"
+    else
+        echo "http://$REGISTRY_URL"
+    fi
+}}
+
+# Get curl TLS arguments
+get_curl_tls_args() {{
+    if [ "$SECURE_MODE" = "1" ] && [ -f "$PKI_DIR/ca.crt" ]; then
+        echo "--cacert $PKI_DIR/ca.crt"
+    fi
+}}
+
+# Get curl auth arguments (for auth-enabled mode)
+get_curl_auth_args() {{
+    if [ "$AUTH_ENABLED" = "1" ] && [ -f "$AUTH_DIR/password" ]; then
+        local password=$(cat "$AUTH_DIR/password")
+        echo "-u $REGISTRY_USERNAME:$password"
+    fi
+}}
+
+# Build authentication arguments for skopeo based on auth mode
+# Usage: get_auth_args [dest|src]
+# Returns: authentication arguments string for skopeo
+get_auth_args() {{
+    local direction="${{1:-dest}}"
+    local mode="${{AUTH_MODE:-none}}"
+    local prefix=""
+
+    if [ "$direction" = "src" ]; then
+        prefix="--src"
+    else
+        prefix="--dest"
+    fi
+
+    case "$mode" in
+        none)
+            # In auth-enabled mode with no explicit auth, auto-use generated credentials
+            if [ "$AUTH_ENABLED" = "1" ] && [ -f "$AUTH_DIR/password" ]; then
+                local password=$(cat "$AUTH_DIR/password")
+                echo "$prefix-creds $REGISTRY_USERNAME:$password"
+            else
+                echo ""
+            fi
+            ;;
+        home)
+            # Use ~/.docker/config.json (like BB_USE_HOME_NPMRC pattern)
+            local home_auth="$HOME/.docker/config.json"
+            if [ ! -f "$home_auth" ]; then
+                echo "Error: AUTH_MODE=home but $home_auth not found" >&2
+                echo "Run 'docker login' first or use --authfile/--credsfile" >&2
+                return 1
+            fi
+            echo "$prefix-authfile $home_auth"
+            ;;
+        authfile)
+            [ -z "$AUTHFILE" ] && {{ echo "Error: --authfile required" >&2; return 1; }}
+            [ ! -f "$AUTHFILE" ] && {{ echo "Error: Auth file not found: $AUTHFILE" >&2; return 1; }}
+            echo "$prefix-authfile $AUTHFILE"
+            ;;
+        credsfile)
+            [ -z "$CREDSFILE" ] && {{ echo "Error: --credsfile required" >&2; return 1; }}
+            parse_credsfile "$CREDSFILE" || return 1
+            # Fall through to check credentials
+            if [ -n "${{CONTAINER_REGISTRY_TOKEN:-}}" ]; then
+                echo "$prefix-registry-token $CONTAINER_REGISTRY_TOKEN"
+            elif [ -n "${{CONTAINER_REGISTRY_USER:-}}" ] && [ -n "${{CONTAINER_REGISTRY_PASSWORD:-}}" ]; then
+                echo "$prefix-creds $CONTAINER_REGISTRY_USER:$CONTAINER_REGISTRY_PASSWORD"
+            else
+                echo "Error: Credentials file must contain TOKEN or USER+PASSWORD" >&2
+                return 1
+            fi
+            ;;
+        env)
+            # Environment variable mode (script only, not bbclass)
+            if [ -n "${{CONTAINER_REGISTRY_TOKEN:-}}" ]; then
+                echo "$prefix-registry-token $CONTAINER_REGISTRY_TOKEN"
+            elif [ -n "${{CONTAINER_REGISTRY_USER:-}}" ] && [ -n "${{CONTAINER_REGISTRY_PASSWORD:-}}" ]; then
+                echo "$prefix-creds $CONTAINER_REGISTRY_USER:$CONTAINER_REGISTRY_PASSWORD"
+            else
+                echo "Error: AUTH_MODE=env requires CONTAINER_REGISTRY_TOKEN or USER+PASSWORD" >&2
+                return 1
+            fi
+            ;;
+        creds)
+            # Direct credentials (set by --creds option)
+            [ -z "$DIRECT_CREDS" ] && {{ echo "Error: --creds value missing" >&2; return 1; }}
+            echo "$prefix-creds $DIRECT_CREDS"
+            ;;
+        token)
+            # Direct token (set by --token option)
+            [ -z "$DIRECT_TOKEN" ] && {{ echo "Error: --token value missing" >&2; return 1; }}
+            echo "$prefix-registry-token $DIRECT_TOKEN"
+            ;;
+        *)
+            echo "Error: Unknown auth mode: $mode" >&2
+            return 1
+            ;;
+    esac
+}}
+
+# Generate registry config file if it doesn't exist
+# Called automatically on start when REGISTRY_STORAGE is overridden
+generate_config() {{
+    [ -f "$REGISTRY_CONFIG" ] && return 0
+
+    echo "Generating registry config: $REGISTRY_CONFIG"
+    local port="${{REGISTRY_URL##*:}}"
+    mkdir -p "$(dirname "$REGISTRY_CONFIG")"
+
+    {{
+        echo "version: 0.1"
+        echo "log:"
+        echo "  level: info"
+        echo "  formatter: text"
+        echo "storage:"
+        echo "  filesystem:"
+        echo "    rootdirectory: $REGISTRY_STORAGE"
+        echo "  delete:"
+        echo "    enabled: true"
+        echo "  redirect:"
+        echo "    disable: true"
+        echo "http:"
+        echo "  addr: :$port"
+        echo "  headers:"
+        echo "    X-Content-Type-Options: [nosniff]"
+        if [ "$SECURE_MODE" = "1" ]; then
+            echo "  tls:"
+            echo "    certificate: $PKI_DIR/server.crt"
+            echo "    key: $PKI_DIR/server.key"
+        fi
+        if [ "$AUTH_ENABLED" = "1" ]; then
+            echo "auth:"
+            echo "  htpasswd:"
+            echo "    realm: Yocto Container Registry"
+            echo "    path: $AUTH_DIR/htpasswd"
+        fi
+        echo "health:"
+        echo "  storagedriver:"
+        echo "    enabled: true"
+        echo "    interval: 10s"
+        echo "    threshold: 3"
+    }} > "$REGISTRY_CONFIG"
+}}
+
 cmd_start() {{
+    # Migration: check old PID file location
+    local old_pid_file="/tmp/container-registry.pid"
+    if [ ! -f "$PID_FILE" ] && [ -f "$old_pid_file" ] && [ "$PID_FILE" != "$old_pid_file" ]; then
+        if kill -0 "$(cat "$old_pid_file")" 2>/dev/null; then
+            PID_FILE="$old_pid_file"
+        else
+            rm -f "$old_pid_file"
+        fi
+    fi
+
     if [ -f "$PID_FILE" ] && kill -0 "$(cat $PID_FILE)" 2>/dev/null; then
         echo "Registry already running (PID: $(cat $PID_FILE))"
         return 0
@@ -254,10 +757,37 @@ cmd_start() {{
 
     mkdir -p "$REGISTRY_STORAGE"
 
-    echo "Starting container registry..."
-    echo "  URL:     http://$REGISTRY_URL"
+    # Generate config if it doesn't exist (e.g., when using custom REGISTRY_STORAGE)
+    generate_config
+
+    # Setup PKI for secure mode, auth is optional
+    if [ "$SECURE_MODE" = "1" ]; then
+        echo "Generating PKI infrastructure..."
+        setup_pki || return 1
+        echo ""
+        if [ "$AUTH_ENABLED" = "1" ]; then
+            echo "Setting up authentication..."
+            setup_auth || return 1
+            echo ""
+            echo "Starting SECURE container registry (TLS + auth)..."
+        else
+            echo "Starting SECURE container registry (TLS only)..."
+        fi
+        echo "  URL:     https://$REGISTRY_URL"
+    else
+        echo "Starting container registry..."
+        echo "  URL:     http://$REGISTRY_URL"
+    fi
+
     echo "  Storage: $REGISTRY_STORAGE"
     echo "  Config:  $REGISTRY_CONFIG"
+    if [ "$SECURE_MODE" = "1" ]; then
+        echo "  PKI:     $PKI_DIR"
+        if [ "$AUTH_ENABLED" = "1" ]; then
+            echo "  Auth:    $AUTH_DIR"
+            echo "  User:    $REGISTRY_USERNAME"
+        fi
+    fi
 
     nohup "$REGISTRY_BIN" serve "$REGISTRY_CONFIG" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
@@ -266,6 +796,11 @@ cmd_start() {{
     if kill -0 "$(cat $PID_FILE)" 2>/dev/null; then
         echo "Registry started (PID: $(cat $PID_FILE))"
         echo "Logs: $LOG_FILE"
+        if [ "$SECURE_MODE" = "1" ]; then
+            echo ""
+            echo "To install CA cert on targets, add to IMAGE_INSTALL:"
+            echo '  IMAGE_INSTALL:append = " container-registry-ca"'
+        fi
     else
         echo "Failed to start registry. Check $LOG_FILE"
         cat "$LOG_FILE"
@@ -274,6 +809,12 @@ cmd_start() {{
 }}
 
 cmd_stop() {{
+    # Migration: check old PID file location
+    local old_pid_file="/tmp/container-registry.pid"
+    if [ ! -f "$PID_FILE" ] && [ -f "$old_pid_file" ] && [ "$PID_FILE" != "$old_pid_file" ]; then
+        PID_FILE="$old_pid_file"
+    fi
+
     if [ ! -f "$PID_FILE" ]; then
         echo "Registry not running"
         return 0
@@ -292,13 +833,33 @@ cmd_stop() {{
 }}
 
 cmd_status() {{
+    # Migration: check old PID file location
+    local old_pid_file="/tmp/container-registry.pid"
+    if [ ! -f "$PID_FILE" ] && [ -f "$old_pid_file" ] && [ "$PID_FILE" != "$old_pid_file" ]; then
+        if kill -0 "$(cat "$old_pid_file")" 2>/dev/null; then
+            PID_FILE="$old_pid_file"
+        else
+            rm -f "$old_pid_file"
+        fi
+    fi
+
     if [ -f "$PID_FILE" ] && kill -0 "$(cat $PID_FILE)" 2>/dev/null; then
         echo "Registry running (PID: $(cat $PID_FILE))"
-        echo "URL: http://$REGISTRY_URL"
-        if curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
+        local base_url=$(get_base_url)
+        echo "URL: $base_url"
+        local tls_args=$(get_curl_tls_args)
+        local auth_args=$(get_curl_auth_args)
+        if curl -s $tls_args $auth_args "$base_url/v2/" >/dev/null 2>&1; then
             echo "Status: healthy"
         else
             echo "Status: not responding"
+        fi
+        if [ "$SECURE_MODE" = "1" ]; then
+            if [ "$AUTH_ENABLED" = "1" ]; then
+                echo "Mode: secure (TLS + auth)"
+            else
+                echo "Mode: secure (TLS only)"
+            fi
         fi
     else
         echo "Registry not running"
@@ -342,9 +903,12 @@ get_oci_arch() {{
 is_manifest_list() {{
     local image="$1"
     local tag="$2"
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
 
-    local content_type=$(curl -s -I -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \\
-        "http://$REGISTRY_URL/v2/$image/manifests/$tag" 2>/dev/null | grep -i "content-type" | head -1)
+    local content_type=$(curl -s -I $tls_args $auth_args -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \\
+        "$base_url/v2/$image/manifests/$tag" 2>/dev/null | grep -i "content-type" | head -1)
 
     echo "$content_type" | grep -qE "manifest.list|image.index"
 }}
@@ -355,9 +919,12 @@ is_manifest_list() {{
 get_manifest_list() {{
     local image="$1"
     local tag="$2"
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
 
-    curl -s -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \\
-        "http://$REGISTRY_URL/v2/$image/manifests/$tag" 2>/dev/null
+    curl -s $tls_args $auth_args -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \\
+        "$base_url/v2/$image/manifests/$tag" 2>/dev/null
 }}
 
 # Get manifest digest and size for an image by tag
@@ -366,9 +933,12 @@ get_manifest_list() {{
 get_manifest_info() {{
     local image="$1"
     local tag="$2"
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
 
-    local headers=$(curl -s -I -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \\
-        "http://$REGISTRY_URL/v2/$image/manifests/$tag" 2>/dev/null)
+    local headers=$(curl -s -I $tls_args $auth_args -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \\
+        "$base_url/v2/$image/manifests/$tag" 2>/dev/null)
 
     local digest=$(echo "$headers" | grep -i "docker-content-digest" | awk '{{print $2}}' | tr -d '\\r\\n')
     local size=$(echo "$headers" | grep -i "content-length" | awk '{{print $2}}' | tr -d '\\r\\n')
@@ -377,24 +947,41 @@ get_manifest_info() {{
 }}
 
 # Push image by digest (returns the digest)
-# Usage: push_by_digest <oci_dir> <image_name>
+# Usage: push_by_digest <oci_dir> <image_name> [auth_args]
 push_by_digest() {{
     local oci_dir="$1"
     local image_name="$2"
+    local push_auth_args="${{3:-}}"
     local temp_tag="temp-${{RANDOM}}-$(date +%s)"
 
-    # Push with temporary tag
-    "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+    # Get TLS arguments
+    local tls_args=$(get_tls_args dest)
+
+    # Push with temporary tag (capture output for error debugging)
+    local push_output
+    if ! push_output=$("$SKOPEO_BIN" copy $tls_args $push_auth_args \\
         "oci:$oci_dir" \\
-        "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$image_name:$temp_tag" >/dev/null 2>&1
+        "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$image_name:$temp_tag" 2>&1); then
+        echo "ERROR: skopeo copy failed: $push_output" >&2
+        return 1
+    fi
 
     # Get digest for the pushed image
     local info=$(get_manifest_info "$REGISTRY_NAMESPACE/$image_name" "$temp_tag")
     local digest=$(echo "$info" | cut -d: -f1-2)  # sha256:xxx
     local size=$(echo "$info" | cut -d: -f3)
 
+    # Validate we got both digest and size
+    if [ -z "$digest" ] || [ -z "$size" ]; then
+        echo "ERROR: Failed to get manifest info for pushed image (digest=$digest, size=$size)" >&2
+        return 1
+    fi
+
     # Delete the temp tag (leave the blobs)
-    curl -s -X DELETE "http://$REGISTRY_URL/v2/$REGISTRY_NAMESPACE/$image_name/manifests/$temp_tag" >/dev/null 2>&1 || true
+    local base_url=$(get_base_url)
+    local curl_tls_args=$(get_curl_tls_args)
+    local curl_auth_args=$(get_curl_auth_args)
+    curl -s -X DELETE $curl_tls_args $curl_auth_args "$base_url/v2/$REGISTRY_NAMESPACE/$image_name/manifests/$temp_tag" >/dev/null 2>&1 || true
 
     echo "$digest:$size"
 }}
@@ -440,18 +1027,25 @@ except: pass
             local existing_size=$(echo "$existing_info" | cut -d: -f3)
 
             # Inspect to get architecture
-            local existing_arch=$("$SKOPEO_BIN" inspect --tls-verify=false \\
+            local inspect_tls_args=$(get_tls_args dest | sed 's/--dest/--/')
+            local existing_arch=$("$SKOPEO_BIN" inspect $inspect_tls_args \\
                 "docker://$REGISTRY_URL/$image:$tag" 2>/dev/null | \\
                 python3 -c "import sys,json; print(json.load(sys.stdin).get('Architecture',''))" 2>/dev/null)
 
-            if [ -n "$existing_arch" ] && [ "$existing_arch" != "$new_arch" ]; then
-                # Different arch - include it in manifest list
+            if [ -n "$existing_arch" ] && [ "$existing_arch" != "$new_arch" ] && [ -n "$existing_size" ]; then
+                # Different arch - include it in manifest list (only if we have valid size)
                 manifests=$(cat <<MANIFEST
 {{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "$existing_digest", "size": $existing_size, "platform": {{"architecture": "$existing_arch", "os": "linux"}}}}
 MANIFEST
 )
             fi
         fi
+    fi
+
+    # Validate required parameters
+    if [ -z "$new_digest" ] || [ -z "$new_size" ] || [ -z "$new_arch" ]; then
+        echo "ERROR: Missing required manifest parameters (digest=$new_digest, size=$new_size, arch=$new_arch)" >&2
+        return 1
     fi
 
     # Add our new manifest
@@ -465,13 +1059,22 @@ $new_manifest"
     fi
 
     # Create manifest list JSON
-    local manifest_list=$(python3 -c "
+    local manifest_list
+    manifest_list=$(python3 -c "
 import sys, json
 manifests = []
-for line in sys.stdin:
+for i, line in enumerate(sys.stdin):
     line = line.strip()
     if line:
-        manifests.append(json.loads(line))
+        try:
+            manifests.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            print(f'ERROR: Invalid JSON on line {{i+1}}: {{e}}', file=sys.stderr)
+            print(f'  Content: {{line[:100]}}...', file=sys.stderr)
+            sys.exit(1)
+if not manifests:
+    print('ERROR: No valid manifests to create list', file=sys.stderr)
+    sys.exit(1)
 result = {{
     'schemaVersion': 2,
     'mediaType': 'application/vnd.oci.image.index.v1+json',
@@ -480,11 +1083,20 @@ result = {{
 print(json.dumps(result, indent=2))
 " <<< "$manifests")
 
+    if [ -z "$manifest_list" ]; then
+        echo "ERROR: Failed to create manifest list" >&2
+        return 1
+    fi
+
     # Push manifest list
+    local base_url=$(get_base_url)
+    local curl_tls_args=$(get_curl_tls_args)
+    local curl_auth_args=$(get_curl_auth_args)
     local status=$(curl -s -o /dev/null -w "%{{http_code}}" -X PUT \\
+        $curl_tls_args $curl_auth_args \\
         -H "Content-Type: application/vnd.oci.image.index.v1+json" \\
         -d "$manifest_list" \\
-        "http://$REGISTRY_URL/v2/$image/manifests/$tag")
+        "$base_url/v2/$image/manifests/$tag")
 
     [ "$status" = "201" ] || [ "$status" = "200" ]
 }}
@@ -510,6 +1122,35 @@ cmd_push() {{
                 ;;
             --version|-v)
                 version="$2"
+                shift 2
+                ;;
+            # Authentication options
+            --auth-mode)
+                AUTH_MODE="$2"
+                shift 2
+                ;;
+            --use-home-auth)
+                AUTH_MODE="home"
+                shift
+                ;;
+            --authfile)
+                AUTH_MODE="authfile"
+                AUTHFILE="$2"
+                shift 2
+                ;;
+            --credsfile)
+                AUTH_MODE="credsfile"
+                CREDSFILE="$2"
+                shift 2
+                ;;
+            --creds)
+                AUTH_MODE="creds"
+                DIRECT_CREDS="$2"
+                shift 2
+                ;;
+            --token)
+                AUTH_MODE="token"
+                DIRECT_TOKEN="$2"
                 shift 2
                 ;;
             -*)
@@ -543,11 +1184,18 @@ cmd_push() {{
     # Export version for generate_tags
     export IMAGE_VERSION="$version"
 
-    if ! curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
-        echo "Registry not responding at http://$REGISTRY_URL"
+    local base_url=$(get_base_url)
+    local curl_tls_args=$(get_curl_tls_args)
+    local curl_auth_args=$(get_curl_auth_args)
+    if ! curl -s $curl_tls_args $curl_auth_args "$base_url/v2/" >/dev/null 2>&1; then
+        echo "Registry not responding at $base_url"
         echo "Start it first: $0 start"
         return 1
     fi
+
+    # Get authentication arguments
+    local auth_args
+    auth_args=$(get_auth_args dest) || return 1
 
     # Determine tags to use
     local tags
@@ -575,12 +1223,16 @@ cmd_push() {{
         echo ""
 
         echo "  Uploading image blobs..."
-        local digest_info=$(push_by_digest "$oci_dir" "$name")
+        local digest_info
+        if ! digest_info=$(push_by_digest "$oci_dir" "$name" "$auth_args"); then
+            echo "  ERROR: Failed to push image"
+            return 1
+        fi
         local digest=$(echo "$digest_info" | cut -d: -f1-2)
         local size=$(echo "$digest_info" | cut -d: -f3)
 
-        if [ -z "$digest" ]; then
-            echo "  ERROR: Failed to push image"
+        if [ -z "$digest" ] || [ -z "$size" ]; then
+            echo "  ERROR: Failed to get image digest/size (digest=$digest, size=$size)"
             return 1
         fi
 
@@ -592,7 +1244,7 @@ cmd_push() {{
                 echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag (manifest list)"
             else
                 echo "  WARNING: Failed to update manifest list, falling back to direct push"
-                "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+                "$SKOPEO_BIN" copy --dest-tls-verify=false $auth_args \\
                     "oci:$oci_dir" \\
                     "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
             fi
@@ -656,12 +1308,16 @@ cmd_push() {{
 
             # Push image by digest first
             echo "  Uploading image blobs..."
-            local digest_info=$(push_by_digest "$oci_dir" "$name")
+            local digest_info
+            if ! digest_info=$(push_by_digest "$oci_dir" "$name" "$auth_args"); then
+                echo "  ERROR: Failed to push image"
+                continue
+            fi
             local digest=$(echo "$digest_info" | cut -d: -f1-2)
             local size=$(echo "$digest_info" | cut -d: -f3)
 
-            if [ -z "$digest" ]; then
-                echo "  ERROR: Failed to push image"
+            if [ -z "$digest" ] || [ -z "$size" ]; then
+                echo "  ERROR: Failed to get image digest/size (digest=$digest, size=$size)"
                 continue
             fi
 
@@ -674,7 +1330,7 @@ cmd_push() {{
                     echo "  -> $REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag (manifest list)"
                 else
                     echo "  WARNING: Failed to update manifest list, falling back to direct push"
-                    "$SKOPEO_BIN" copy --dest-tls-verify=false \\
+                    "$SKOPEO_BIN" copy --dest-tls-verify=false $auth_args \\
                         "oci:$oci_dir" \\
                         "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$name:$tag"
                 fi
@@ -706,8 +1362,11 @@ cmd_push() {{
 }}
 
 cmd_catalog() {{
-    curl -s "http://$REGISTRY_URL/v2/_catalog" | python3 -m json.tool 2>/dev/null || \\
-        curl -s "http://$REGISTRY_URL/v2/_catalog"
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
+    curl -s $tls_args $auth_args "$base_url/v2/_catalog" | python3 -m json.tool 2>/dev/null || \\
+        curl -s $tls_args $auth_args "$base_url/v2/_catalog"
 }}
 
 cmd_tags() {{
@@ -727,7 +1386,10 @@ cmd_tags() {{
         image="$REGISTRY_NAMESPACE/$image"
     fi
 
-    local result=$(curl -s "http://$REGISTRY_URL/v2/$image/tags/list")
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
+    local result=$(curl -s $tls_args $auth_args "$base_url/v2/$image/tags/list")
 
     # Check for errors or empty result
     if [ -z "$result" ]; then
@@ -750,15 +1412,19 @@ cmd_tags() {{
 }}
 
 cmd_list() {{
-    if ! curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
-        echo "Registry not responding at http://$REGISTRY_URL"
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
+
+    if ! curl -s $tls_args $auth_args "$base_url/v2/" >/dev/null 2>&1; then
+        echo "Registry not responding at $base_url"
         return 1
     fi
 
     echo "Images in $REGISTRY_URL:"
     echo ""
 
-    local repos=$(curl -s "http://$REGISTRY_URL/v2/_catalog" | python3 -c "import sys,json; print('\\n'.join(json.load(sys.stdin).get('repositories',[])))" 2>/dev/null)
+    local repos=$(curl -s $tls_args $auth_args "$base_url/v2/_catalog" | python3 -c "import sys,json; print('\\n'.join(json.load(sys.stdin).get('repositories',[])))" 2>/dev/null)
 
     if [ -z "$repos" ]; then
         echo "  (none)"
@@ -766,7 +1432,7 @@ cmd_list() {{
     fi
 
     for repo in $repos; do
-        local tags=$(curl -s "http://$REGISTRY_URL/v2/$repo/tags/list" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('tags',[])))" 2>/dev/null)
+        local tags=$(curl -s $tls_args $auth_args "$base_url/v2/$repo/tags/list" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('tags',[])))" 2>/dev/null)
         if [ -n "$tags" ]; then
             echo "  $repo: $tags"
         else
@@ -776,22 +1442,78 @@ cmd_list() {{
 }}
 
 cmd_import() {{
-    local source="${{2:-}}"
-    local dest_name="${{3:-}}"
+    shift  # Remove 'import' from args
+
+    local source=""
+    local dest_name=""
+    local src_auth_args=""
+
+    # Parse options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            # Source registry authentication options
+            --src-authfile)
+                src_auth_args="--src-authfile $2"
+                shift 2
+                ;;
+            --src-credsfile)
+                parse_credsfile "$2" || return 1
+                if [ -n "${{CONTAINER_REGISTRY_TOKEN:-}}" ]; then
+                    src_auth_args="--src-registry-token $CONTAINER_REGISTRY_TOKEN"
+                elif [ -n "${{CONTAINER_REGISTRY_USER:-}}" ] && [ -n "${{CONTAINER_REGISTRY_PASSWORD:-}}" ]; then
+                    src_auth_args="--src-creds $CONTAINER_REGISTRY_USER:$CONTAINER_REGISTRY_PASSWORD"
+                else
+                    echo "Error: Credentials file must contain TOKEN or USER+PASSWORD" >&2
+                    return 1
+                fi
+                shift 2
+                ;;
+            --src-creds)
+                src_auth_args="--src-creds $2"
+                shift 2
+                ;;
+            --src-token)
+                src_auth_args="--src-registry-token $2"
+                shift 2
+                ;;
+            -*)
+                echo "Unknown option: $1"
+                return 1
+                ;;
+            *)
+                # Positional args: source, then dest_name
+                if [ -z "$source" ]; then
+                    source="$1"
+                elif [ -z "$dest_name" ]; then
+                    dest_name="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [ -z "$source" ]; then
-        echo "Usage: $0 import <source-image> [local-name]"
+        echo "Usage: $0 import <source-image> [local-name] [options]"
         echo ""
         echo "Examples:"
         echo "  $0 import docker.io/library/alpine:latest"
         echo "  $0 import docker.io/library/alpine:latest my-alpine"
         echo "  $0 import quay.io/podman/hello:latest hello"
         echo "  $0 import ghcr.io/owner/image:tag"
+        echo ""
+        echo "Authentication options (for source registry):"
+        echo "  --src-authfile <path>    Docker config.json for source"
+        echo "  --src-credsfile <path>   Credentials file for source"
+        echo "  --src-creds <user:pass>  Direct credentials for source"
+        echo "  --src-token <token>      Bearer token for source"
         return 1
     fi
 
-    if ! curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
-        echo "Registry not responding at http://$REGISTRY_URL"
+    local base_url=$(get_base_url)
+    local curl_tls_args=$(get_curl_tls_args)
+    local curl_auth_args=$(get_curl_auth_args)
+    if ! curl -s $curl_tls_args $curl_auth_args "$base_url/v2/" >/dev/null 2>&1; then
+        echo "Registry not responding at $base_url"
         echo "Start it first: $0 start"
         return 1
     fi
@@ -813,8 +1535,14 @@ cmd_import() {{
     echo "       To: $REGISTRY_URL/$REGISTRY_NAMESPACE/$dest_name:$tag"
     echo ""
 
+    # Get destination TLS and auth arguments
+    local dest_tls_args=$(get_tls_args dest)
+    local dest_auth_args=$(get_auth_args dest) || return 1
+
     "$SKOPEO_BIN" copy \\
-        --dest-tls-verify=false \\
+        $dest_tls_args \\
+        $dest_auth_args \\
+        $src_auth_args \\
         "docker://$source" \\
         "docker://$REGISTRY_URL/$REGISTRY_NAMESPACE/$dest_name:$tag"
 
@@ -841,8 +1569,12 @@ cmd_delete() {{
         return 1
     fi
 
-    if ! curl -s "http://$REGISTRY_URL/v2/" >/dev/null 2>&1; then
-        echo "Registry not responding at http://$REGISTRY_URL"
+    local base_url=$(get_base_url)
+    local tls_args=$(get_curl_tls_args)
+    local auth_args=$(get_curl_auth_args)
+
+    if ! curl -s $tls_args $auth_args "$base_url/v2/" >/dev/null 2>&1; then
+        echo "Registry not responding at $base_url"
         return 1
     fi
 
@@ -868,8 +1600,8 @@ cmd_delete() {{
     local digest=""
     for accept in "application/vnd.oci.image.manifest.v1+json" \
                   "application/vnd.docker.distribution.manifest.v2+json"; do
-        digest=$(curl -s -I -H "Accept: $accept" \
-            "http://$REGISTRY_URL/v2/$name/manifests/$tag" 2>/dev/null \
+        digest=$(curl -s -I $tls_args $auth_args -H "Accept: $accept" \
+            "$base_url/v2/$name/manifests/$tag" 2>/dev/null \
             | grep -i "docker-content-digest" | awk '{{print $2}}' | tr -d '\r\n')
         [ -n "$digest" ] && break
     done
@@ -883,7 +1615,8 @@ cmd_delete() {{
 
     # Delete by digest
     local status=$(curl -s -o /dev/null -w "%{{http_code}}" -X DELETE \
-        "http://$REGISTRY_URL/v2/$name/manifests/$digest")
+        $tls_args $auth_args \
+        "$base_url/v2/$name/manifests/$digest")
 
     if [ "$status" = "202" ]; then
         echo "  Deleted successfully"
@@ -965,6 +1698,20 @@ cmd_help() {{
     echo "  --strategy, -s <str>   Tag strategy (default: $DEFAULT_TAG_STRATEGY)"
     echo "  --version, -v <ver>    Version for semver strategy (e.g., 1.2.3)"
     echo ""
+    echo "Authentication options (for push command):"
+    echo "  --use-home-auth        Use ~/.docker/config.json (like BB_USE_HOME_NPMRC)"
+    echo "  --authfile <path>      Docker-style config.json file"
+    echo "  --credsfile <path>     Simple key=value credentials file"
+    echo "  --creds <user:pass>    Direct credentials (less secure)"
+    echo "  --token <token>        Bearer token directly (less secure)"
+    echo "  --auth-mode <mode>     Mode: none, home, authfile, credsfile, env"
+    echo ""
+    echo "Import authentication options (for source registry):"
+    echo "  --src-authfile <path>  Docker config.json for source"
+    echo "  --src-credsfile <path> Credentials file for source"
+    echo "  --src-creds <user:pass> Direct credentials for source"
+    echo "  --src-token <token>    Bearer token for source"
+    echo ""
     echo "Tag strategies (can combine: 'sha branch latest'):"
     echo "  timestamp              YYYYMMDD-HHMMSS format"
     echo "  sha, git               Short git commit hash"
@@ -994,8 +1741,19 @@ cmd_help() {{
     echo "  $0 push container-base -t latest -t v1.0.0 # Multiple explicit tags"
     echo "  $0 push --strategy 'sha branch latest'     # All images, strategy"
     echo "  $0 push --strategy semver --version 1.2.3  # All images, SemVer"
+    echo ""
+    echo "Authentication examples:"
+    echo "  $0 push --use-home-auth                    # Use ~/.docker/config.json"
+    echo "  $0 push --authfile /path/to/auth.json      # Explicit auth file"
+    echo "  $0 push --credsfile ~/.config/creds        # Simple credentials file"
+    echo "  $0 import ghcr.io/org/img:v1 --src-credsfile ~/.config/ghcr-creds"
+    echo ""
+    echo "Import examples:"
     echo "  $0 import docker.io/library/alpine:latest"
     echo "  $0 import docker.io/library/busybox:latest my-busybox"
+    echo "  $0 import ghcr.io/org/private:v1 --src-authfile ~/.docker/config.json"
+    echo ""
+    echo "Other examples:"
     echo "  $0 delete container-base:20260112-143022"
     echo "  $0 list"
     echo "  $0 tags container-base"
@@ -1007,6 +1765,14 @@ cmd_help() {{
     echo "  IMAGE_VERSION                     Version for semver/version strategies"
     echo "  TARGET_ARCH                       Architecture for arch strategy"
     echo ""
+    echo "Authentication environment variables:"
+    echo "  CONTAINER_REGISTRY_AUTH_MODE      Auth mode: none, home, authfile, credsfile, env"
+    echo "  CONTAINER_REGISTRY_AUTHFILE       Path to Docker config.json"
+    echo "  CONTAINER_REGISTRY_CREDSFILE      Path to simple credentials file"
+    echo "  CONTAINER_REGISTRY_USER           Username (env mode only)"
+    echo "  CONTAINER_REGISTRY_PASSWORD       Password (env mode only)"
+    echo "  CONTAINER_REGISTRY_TOKEN          Token (env mode only)"
+    echo ""
     echo "Configuration (baked from bitbake):"
     echo "  Registry URL:   $REGISTRY_URL"
     echo "  Namespace:      $REGISTRY_NAMESPACE"
@@ -1014,6 +1780,26 @@ cmd_help() {{
     echo "  Target arch:    $DEFAULT_TARGET_ARCH"
     echo "  Storage:        $REGISTRY_STORAGE"
     echo "  Deploy dirs:    $DEPLOY_DIR_IMAGES/*/"
+    if [ "$SECURE_MODE" = "1" ]; then
+        echo ""
+        if [ "$AUTH_ENABLED" = "1" ]; then
+            echo "Secure mode: ENABLED (TLS + authentication)"
+        else
+            echo "Secure mode: ENABLED (TLS only)"
+        fi
+        echo "  PKI directory:  $PKI_DIR"
+        echo ""
+        echo "  CA certificate: $PKI_DIR/ca.crt"
+        echo '    Install on targets: IMAGE_INSTALL:append = " container-registry-ca"'
+        if [ "$AUTH_ENABLED" = "1" ]; then
+            echo ""
+            echo "Authentication: ENABLED"
+            echo "  Auth directory: $AUTH_DIR"
+            echo "  Username:       $REGISTRY_USERNAME"
+            echo "  Password file:  $AUTH_DIR/password"
+            echo "    View password: cat $AUTH_DIR/password"
+        fi
+    fi
 }}
 
 case "${{1:-help}}" in
@@ -1052,7 +1838,7 @@ esac
     bb.plain("")
 }
 
-do_generate_registry_script[depends] += "docker-distribution-native:do_populate_sysroot skopeo-native:do_populate_sysroot"
+do_generate_registry_script[depends] += "docker-distribution-native:do_populate_sysroot skopeo-native:do_populate_sysroot openssl-native:do_populate_sysroot"
 addtask do_generate_registry_script
 
 EXCLUDE_FROM_WORLD = "1"
