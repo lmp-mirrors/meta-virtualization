@@ -1140,29 +1140,21 @@ python do_sync_go_files() {
 addtask sync_go_files after do_create_module_cache before do_compile
 
 
-do_fix_go_mod_permissions() {
-    # Go module cache is intentionally read-only for integrity, but this breaks
-    # BitBake's rm -rf cleanup (sstate_eventhandler_reachablestamps).
-    # Make all files writable so workdir can be cleaned properly.
-    #
-    # Check multiple possible locations where Go module cache might exist
+go_mod_fix_module_cache_permissions() {
+    # Go creates read-only files in the module cache by design.
+    # Fix permissions after do_compile so do_rm_work can clean up.
     for modpath in "${S}/pkg/mod" "${S}/src/import/pkg/mod"; do
         if [ -d "$modpath" ]; then
             chmod -R u+w "$modpath" 2>/dev/null || true
-            bbnote "Fixed permissions on Go module cache: $modpath"
         fi
     done
-    # Also check sources subdirectory (for recipes with WORKDIR/sources layout)
     if [ -d "${WORKDIR}/sources" ]; then
         find "${WORKDIR}/sources" -type d -name "mod" -path "*/pkg/mod" 2>/dev/null | while read modpath; do
             chmod -R u+w "$modpath" 2>/dev/null || true
-            bbnote "Fixed permissions on Go module cache: $modpath"
         done
     fi
 }
-
-# Run after sync_go_files (which is the last Go module setup task) and before compile
-addtask fix_go_mod_permissions after do_sync_go_files before do_compile
+do_compile[postfuncs] += "go_mod_fix_module_cache_permissions"
 
 
 python do_go_mod_recommend() {
