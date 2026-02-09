@@ -22,8 +22,12 @@
 #   docker_network=1       Enable networking (configure eth0, DNS)
 #   docker_registry=<url>  Default registry for unqualified images (e.g., 10.0.2.2:5000/yocto)
 #   docker_insecure_registry=<host:port>  Mark registry as insecure (HTTP). Can repeat.
+#   docker_registry_secure=1              Enable TLS verification for registry
+#   docker_registry_ca=1                  CA certificate available in /mnt/share/ca.crt
+#   docker_registry_user=<user>           Registry username for authentication
+#   docker_registry_pass=<base64>         Base64-encoded registry password
 #
-# Version: 2.4.0
+# Version: 2.5.0
 
 # Set runtime-specific parameters before sourcing common code
 VCONTAINER_RUNTIME_NAME="vdkr"
@@ -31,12 +35,20 @@ VCONTAINER_RUNTIME_CMD="docker"
 VCONTAINER_RUNTIME_PREFIX="docker"
 VCONTAINER_STATE_DIR="/var/lib/docker"
 VCONTAINER_SHARE_NAME="vdkr_share"
-VCONTAINER_VERSION="2.4.0"
+VCONTAINER_VERSION="2.5.0"
 
 # Docker-specific: default registry for unqualified image names
 # Set via kernel param: docker_registry=10.0.2.2:5000/yocto
 # Or baked into rootfs: /etc/vdkr/registry.conf
 DOCKER_DEFAULT_REGISTRY=""
+
+# Secure registry mode (TLS verification)
+# Set via kernel param: docker_registry_secure=1
+# CA cert passed via: virtio-9p share at /mnt/share/ca.crt
+DOCKER_REGISTRY_SECURE=""
+DOCKER_REGISTRY_CA=""
+DOCKER_REGISTRY_USER=""
+DOCKER_REGISTRY_PASS=""
 
 # Source common init functions
 # When installed as /init, common file is at /vcontainer-init-common.sh
@@ -53,6 +65,97 @@ load_registry_config() {
             log "Loaded baked registry: $DOCKER_DEFAULT_REGISTRY"
         fi
         # VDKR_INSECURE_REGISTRIES is handled in start_dockerd
+    fi
+}
+
+# Parse secure registry settings from kernel cmdline
+parse_secure_registry_config() {
+    # Check for secure mode flag
+    GREP_RESULT=$(grep -o 'docker_registry_secure=[^ ]*' /proc/cmdline 2>/dev/null || true)
+    if [ -n "$GREP_RESULT" ]; then
+        DOCKER_REGISTRY_SECURE=$(echo "$GREP_RESULT" | sed 's/docker_registry_secure=//')
+        log "Secure registry mode: $DOCKER_REGISTRY_SECURE"
+    fi
+
+    # Check for CA certificate in shared folder (passed via virtio-9p)
+    if [ -f "/mnt/share/ca.crt" ]; then
+        DOCKER_REGISTRY_CA="/mnt/share/ca.crt"
+        log "Found CA certificate in shared folder"
+    fi
+
+    # Check for registry user
+    GREP_RESULT=$(grep -o 'docker_registry_user=[^ ]*' /proc/cmdline 2>/dev/null || true)
+    if [ -n "$GREP_RESULT" ]; then
+        DOCKER_REGISTRY_USER=$(echo "$GREP_RESULT" | sed 's/docker_registry_user=//')
+        log "Registry user: $DOCKER_REGISTRY_USER"
+    fi
+
+    # Check for registry password (base64 encoded)
+    GREP_RESULT=$(grep -o 'docker_registry_pass=[^ ]*' /proc/cmdline 2>/dev/null || true)
+    if [ -n "$GREP_RESULT" ]; then
+        DOCKER_REGISTRY_PASS=$(echo "$GREP_RESULT" | sed 's/docker_registry_pass=//')
+        log "Received registry password from cmdline"
+    fi
+}
+
+# Install CA certificate for secure registry
+# Creates /etc/docker/certs.d/{registry}/ca.crt
+install_registry_ca() {
+    if [ "$DOCKER_REGISTRY_SECURE" != "1" ]; then
+        return 0
+    fi
+
+    if [ -z "$DOCKER_DEFAULT_REGISTRY" ]; then
+        log "WARNING: Secure mode enabled but no registry configured"
+        return 0
+    fi
+
+    # Extract registry host (strip path/namespace)
+    local registry_host=$(echo "$DOCKER_DEFAULT_REGISTRY" | cut -d'/' -f1)
+
+    # Install CA cert if provided via shared folder
+    if [ -n "$DOCKER_REGISTRY_CA" ] && [ -f "$DOCKER_REGISTRY_CA" ]; then
+        local cert_dir="/etc/docker/certs.d/$registry_host"
+        mkdir -p "$cert_dir"
+
+        # Copy CA cert from shared folder
+        if cp "$DOCKER_REGISTRY_CA" "$cert_dir/ca.crt" 2>/dev/null && [ -s "$cert_dir/ca.crt" ]; then
+            log "Installed CA certificate: $cert_dir/ca.crt"
+        else
+            log "WARNING: Failed to copy CA certificate from $DOCKER_REGISTRY_CA"
+            rm -f "$cert_dir/ca.crt"
+        fi
+    else
+        # Check if CA cert exists from baked rootfs
+        local cert_dir="/etc/docker/certs.d/$registry_host"
+        if [ -f "$cert_dir/ca.crt" ]; then
+            log "Using baked CA certificate: $cert_dir/ca.crt"
+        else
+            log "WARNING: Secure mode enabled but no CA certificate available"
+        fi
+    fi
+
+    # Setup Docker auth if credentials provided
+    if [ -n "$DOCKER_REGISTRY_USER" ] && [ -n "$DOCKER_REGISTRY_PASS" ]; then
+        local password=$(echo "$DOCKER_REGISTRY_PASS" | base64 -d 2>/dev/null)
+        if [ -n "$password" ]; then
+            mkdir -p /root/.docker
+            # Create auth config
+            local auth=$(echo -n "$DOCKER_REGISTRY_USER:$password" | base64 | tr -d '\n')
+            cat > /root/.docker/config.json << EOF
+{
+  "auths": {
+    "$registry_host": {
+      "auth": "$auth"
+    }
+  }
+}
+EOF
+            chmod 600 /root/.docker/config.json
+            log "Configured Docker auth for: $registry_host"
+        else
+            log "WARNING: Failed to decode registry password"
+        fi
     fi
 }
 
@@ -141,10 +244,16 @@ start_dockerd() {
     if [ -n "$DOCKER_DEFAULT_REGISTRY" ]; then
         # Extract host:port for insecure registry config (strip path/namespace)
         REGISTRY_HOST=$(echo "$DOCKER_DEFAULT_REGISTRY" | cut -d'/' -f1)
-        # Auto-add to insecure registries if it looks like a local/private registry
-        if echo "$REGISTRY_HOST" | grep -qE '^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
-            DOCKER_OPTS="$DOCKER_OPTS --insecure-registry=$REGISTRY_HOST"
-            log "Auto-added insecure registry: $REGISTRY_HOST"
+
+        # In secure mode, DO NOT add to insecure-registries (use TLS verification)
+        if [ "$DOCKER_REGISTRY_SECURE" = "1" ]; then
+            log "Secure mode: using TLS verification for $REGISTRY_HOST"
+        else
+            # Auto-add to insecure registries if it looks like a local/private registry
+            if echo "$REGISTRY_HOST" | grep -qE '^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; then
+                DOCKER_OPTS="$DOCKER_OPTS --insecure-registry=$REGISTRY_HOST"
+                log "Auto-added insecure registry: $REGISTRY_HOST"
+            fi
         fi
     fi
 
@@ -568,6 +677,12 @@ configure_networking
 
 # Load baked registry config (can be overridden by kernel cmdline)
 load_registry_config
+
+# Parse secure registry settings from kernel cmdline
+parse_secure_registry_config
+
+# Install CA certificate for secure registry
+install_registry_ca
 
 # Start containerd and dockerd (Docker-specific)
 start_containerd

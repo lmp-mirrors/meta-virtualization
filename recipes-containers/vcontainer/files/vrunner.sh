@@ -311,6 +311,10 @@ PORT_FORWARDS=()
 # Registry configuration
 DOCKER_REGISTRY=""
 INSECURE_REGISTRIES=()
+SECURE_REGISTRY="false"
+CA_CERT=""
+REGISTRY_USER=""
+REGISTRY_PASS=""
 
 # Batch import mode
 BATCH_IMPORT="false"
@@ -379,6 +383,26 @@ while [ $# -gt 0 ]; do
         --insecure-registry)
             # Mark a registry as insecure (HTTP)
             INSECURE_REGISTRIES+=("$2")
+            shift 2
+            ;;
+        --secure-registry)
+            # Enable TLS verification for registry
+            SECURE_REGISTRY="true"
+            shift
+            ;;
+        --ca-cert)
+            # Path to CA certificate for TLS verification
+            CA_CERT="$2"
+            shift 2
+            ;;
+        --registry-user)
+            # Registry username
+            REGISTRY_USER="$2"
+            shift 2
+            ;;
+        --registry-pass)
+            # Registry password
+            REGISTRY_PASS="$2"
             shift 2
             ;;
         --interactive|-it)
@@ -1153,6 +1177,22 @@ for reg in "${INSECURE_REGISTRIES[@]}"; do
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_insecure_registry=$reg"
 done
 
+# Secure registry mode (TLS verification)
+# CA certificate is passed via virtio-9p share, not kernel cmdline (too large)
+if [ "$SECURE_REGISTRY" = "true" ]; then
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_registry_secure=1"
+fi
+
+# Registry credentials
+if [ -n "$REGISTRY_USER" ]; then
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_registry_user=$REGISTRY_USER"
+fi
+if [ -n "$REGISTRY_PASS" ]; then
+    # Base64 encode the password to handle special characters
+    REGISTRY_PASS_B64=$(echo -n "$REGISTRY_PASS" | base64 -w0)
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_registry_pass=$REGISTRY_PASS_B64"
+fi
+
 # Tell init script if interactive mode
 if [ "$INTERACTIVE" = "true" ]; then
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_interactive=1"
@@ -1246,6 +1286,8 @@ if [ "$DAEMON_MODE" = "start" ]; then
     # Use security_model=none for simplest file sharing (no permission mapping)
     # This allows writes from container (running as root) to propagate to host
     QEMU_OPTS="$QEMU_OPTS -virtfs local,path=$DAEMON_SHARE_DIR,mount_tag=$SHARE_TAG,security_model=none,id=$SHARE_TAG"
+    # Tell init script to mount the share
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
 
     # Add virtio-serial device for command channel
     # Using virtserialport creates /dev/vport0p1 in guest, host sees unix socket
@@ -1296,6 +1338,12 @@ if [ "$DAEMON_MODE" = "start" ]; then
                 log "INFO" "Port forward configured: $HOST_PORT -> $CONTAINER_PORT"
             done
         fi
+    fi
+
+    # Copy CA certificate to shared folder (too large for kernel cmdline)
+    if [ -n "$CA_CERT" ] && [ -f "$CA_CERT" ]; then
+        cp "$CA_CERT" "$DAEMON_SHARE_DIR/ca.crt"
+        log "DEBUG" "CA certificate copied to shared folder"
     fi
 
     log "INFO" "Starting daemon..."
@@ -1404,6 +1452,21 @@ if [ "$DAEMON_MODE" = "start" ]; then
         rm -f "$DAEMON_PID_FILE" "$DAEMON_SOCKET"
         exit 1
     fi
+fi
+
+# For non-daemon mode with CA cert, we need virtio-9p to pass the cert
+# (kernel cmdline is too small for base64-encoded certs)
+if [ -n "$CA_CERT" ] && [ -f "$CA_CERT" ]; then
+    # Create temp share dir for CA cert
+    CA_SHARE_DIR="$TEMP_DIR/ca_share"
+    mkdir -p "$CA_SHARE_DIR"
+    cp "$CA_CERT" "$CA_SHARE_DIR/ca.crt"
+
+    # Add virtio-9p mount for CA cert
+    SHARE_TAG="${TOOL_NAME}_share"
+    QEMU_OPTS="$QEMU_OPTS -virtfs local,path=$CA_SHARE_DIR,mount_tag=$SHARE_TAG,security_model=none,readonly=on,id=cashare"
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
+    log "DEBUG" "CA certificate available via virtio-9p"
 fi
 
 log "INFO" "Starting QEMU..."

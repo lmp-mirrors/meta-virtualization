@@ -31,6 +31,15 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 TOOLCHAIN_SHAR_EXT_TMPL = "${THISDIR}/files/toolchain-shar-extract.sh"
 
+# Declare script sources so BitBake tracks changes and rebuilds when they change
+SRC_URI = "\
+    file://vrunner.sh \
+    file://vcontainer-common.sh \
+    file://vdkr.sh \
+    file://vpdmn.sh \
+    file://toolchain-shar-extract.sh \
+"
+
 # No target sysroot - host tools only (like buildtools-tarball)
 TOOLCHAIN_TARGET_TASK = ""
 TARGET_ARCH = "none"
@@ -62,6 +71,7 @@ EXCLUDE_FROM_WORLD = "1"
 inherit populate_sdk
 inherit toolchain-scripts-base
 inherit nopackages
+inherit container-registry
 
 # Must be set AFTER inherit populate_sdk (class sets it to target arch)
 REAL_MULTIMACH_TARGET_SYS = "none"
@@ -169,6 +179,8 @@ create_sdk_files:append () {
     TOPDIR="${TOPDIR}"
     THISDIR="${THISDIR}"
     ARCHITECTURES="${VCONTAINER_ARCHITECTURES}"
+    CONTAINER_REGISTRY_SECURE="${CONTAINER_REGISTRY_SECURE}"
+    CONTAINER_REGISTRY_CA_CERT="${CONTAINER_REGISTRY_CA_CERT}"
 
     # SDK output directory
     SDK_OUT="${SDK_OUTPUT}/${SDKPATH}"
@@ -290,6 +302,18 @@ create_sdk_files:append () {
         bbnote "Installed vpdmn"
     fi
 
+    # Copy CA certificate for secure registry mode (if available)
+    SECURE_MODE="${CONTAINER_REGISTRY_SECURE}"
+    CA_CERT="${CONTAINER_REGISTRY_CA_CERT}"
+    if [ "${SECURE_MODE}" = "1" ] && [ -f "${CA_CERT}" ]; then
+        mkdir -p "${SDK_OUT}/registry"
+        cp "${CA_CERT}" "${SDK_OUT}/registry/ca.crt"
+        bbnote "Included secure registry CA certificate"
+    elif [ "${SECURE_MODE}" = "1" ]; then
+        bbwarn "Secure registry mode enabled but CA cert not found at ${CA_CERT}"
+        bbwarn "Run: bitbake container-registry-index -c generate_registry_script"
+    fi
+
     # Create README
     cat > "${SDK_OUT}/README.txt" <<EOF
 vcontainer Standalone SDK
@@ -314,6 +338,10 @@ Contents:
   vdkr-blobs/           - Docker QEMU blobs (per-arch subdirectories)
   vpdmn-blobs/          - Podman QEMU blobs (per-arch subdirectories)
   sysroots/             - SDK binaries (QEMU, socat, libraries)
+  registry/ca.crt       - CA cert for secure registry (if CONTAINER_REGISTRY_SECURE=1)
+
+Secure Registry Usage:
+  vdkr --secure-registry --ca-cert registry/ca.crt pull myimage
 
 Requirements:
   - Linux x86_64 host

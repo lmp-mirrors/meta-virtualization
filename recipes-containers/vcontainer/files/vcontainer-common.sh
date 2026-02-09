@@ -752,6 +752,12 @@ build_runner_args() {
         args+=("--insecure-registry" "$reg")
     done
 
+    # Add secure registry options
+    [ "$SECURE_REGISTRY" = "true" ] && args+=("--secure-registry")
+    [ -n "$CA_CERT" ] && args+=("--ca-cert" "$CA_CERT")
+    [ -n "$REGISTRY_USER" ] && args+=("--registry-user" "$REGISTRY_USER")
+    [ -n "$REGISTRY_PASS" ] && args+=("--registry-pass" "$REGISTRY_PASS")
+
     echo "${args[@]}"
 }
 
@@ -767,8 +773,20 @@ DISABLE_KVM="false"
 NO_DAEMON="false"
 REGISTRY=""
 INSECURE_REGISTRIES=()
+SECURE_REGISTRY="false"
+CA_CERT=""
+REGISTRY_USER=""
+REGISTRY_PASS=""
 COMMAND=""
 COMMAND_ARGS=()
+
+# Auto-detect bundled CA certificate for secure registry
+# If CA cert is bundled in the tarball, automatically enable secure mode
+BUNDLED_CA_CERT="$SCRIPT_DIR/registry/ca.crt"
+if [ -f "$BUNDLED_CA_CERT" ]; then
+    SECURE_REGISTRY="true"
+    CA_CERT="$BUNDLED_CA_CERT"
+fi
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -838,6 +856,22 @@ while [ $# -gt 0 ]; do
             ;;
         --insecure-registry)
             INSECURE_REGISTRIES+=("$2")
+            shift 2
+            ;;
+        --secure-registry)
+            SECURE_REGISTRY="true"
+            shift
+            ;;
+        --ca-cert)
+            CA_CERT="$2"
+            shift 2
+            ;;
+        --registry-user)
+            REGISTRY_USER="$2"
+            shift 2
+            ;;
+        --registry-password|--registry-pass)
+            REGISTRY_PASS="$2"
             shift 2
             ;;
         -it|--interactive)
