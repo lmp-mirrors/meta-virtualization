@@ -15,7 +15,7 @@ INHIBIT_DEFAULT_DEPS = "1"
 LINUX_VERSION ?= "6.18"
 PV = "v${LINUX_VERSION}+git${SRCREV}"
 
-SRCREV = "ebcec46ecca9c422a95635aab45ebeef36a4dbae"
+SRCREV = "6ab6280418f524cda3e9f30ca0ac4367c58abdcf"
 SRC_URI = "\
         git://git.yoctoproject.org/yocto-kernel-cache;branch=yocto-${LINUX_VERSION} \
         "

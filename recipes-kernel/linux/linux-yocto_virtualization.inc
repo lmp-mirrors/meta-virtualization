@@ -79,3 +79,6 @@ KERNEL_FEATURES:append = "${@distro_cond_feature('cfg/kubernetes.scc', 'k3s', d 
 
 # selinux
 KERNEL_FEATURES:append = "${@distro_cond_feature('cgl/features/selinux/selinux.cfg', 'selinux', d )}"
+
+# vcontainer
+KERNEL_FEATURES:append = "${@distro_cond_feature('cfg/container.scc', 'vcontainer', d)}"
