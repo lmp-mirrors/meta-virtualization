@@ -280,6 +280,12 @@ python __anonymous() {
     d.setVar('_PROCESSED_BUNDLES', ' '.join(processed_bundles))
     d.setVar('_BUNDLE_RUNTIME', runtime)
 
+    # Remote containers are fetched during do_fetch (network is allowed there).
+    # extend_recipe_sysroot populates the native sysroot so skopeo is available.
+    if remote_urls:
+        d.appendVarFlag('do_fetch', 'prefuncs', ' extend_recipe_sysroot')
+        d.appendVarFlag('do_fetch', 'postfuncs', ' do_fetch_containers')
+
     # Build service file map for custom service files
     # Format: container1=/path/to/file1;container2=/path/to/file2
     service_mappings = []
@@ -324,7 +330,7 @@ python do_fetch_containers() {
     fetched_dir = os.path.join(workdir, 'fetched')
     os.makedirs(fetched_dir, exist_ok=True)
 
-    # Find skopeo in native sysroot (available after do_prepare_recipe_sysroot)
+    # Find skopeo in native sysroot (populated by extend_recipe_sysroot prefunc)
     # skopeo-native installs to sbindir, not bindir
     staging_sbindir = d.getVar('STAGING_SBINDIR_NATIVE')
     skopeo = os.path.join(staging_sbindir, 'skopeo')
@@ -363,8 +369,9 @@ python do_fetch_containers() {
             bb.fatal(f"Failed to fetch container '{url}': {e}")
 }
 
-do_fetch_containers[network] = "1"
-addtask fetch_containers after do_prepare_recipe_sysroot before do_compile
+# do_fetch_containers runs as a postfunc of do_fetch (set in __anonymous
+# when remote containers are configured). This keeps network access within
+# do_fetch where it is permitted by yocto-check-layer.
 
 do_compile() {
     set -e

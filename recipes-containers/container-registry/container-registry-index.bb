@@ -84,7 +84,18 @@ python do_container_registry_index() {
     bb.plain(f"Pushed {len(pushed_refs)} image references to {registry}")
 }
 
-addtask do_container_registry_index before do_build
+addtask do_container_registry_index
+
+python do_build() {
+    bb.plain("")
+    bb.plain("Container registry push requires explicit invocation (network access")
+    bb.plain("is not permitted during the normal build chain).")
+    bb.plain("")
+    bb.plain("To push OCI images to the registry, run:")
+    bb.plain("")
+    bb.plain("  bitbake container-registry-index -c container_registry_index")
+    bb.plain("")
+}
 
 # Generate a helper script with paths baked in
 # Script is placed alongside registry storage (outside tmp/) so it persists
