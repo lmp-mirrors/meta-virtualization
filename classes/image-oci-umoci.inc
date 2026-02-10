@@ -584,6 +584,16 @@ IMAGE_CMD:oci() {
                     bbnote "OCI: Copying pre-installed packages from $oci_preinstall_rootfs"
                     # Use rsync to merge into bundle rootfs (handles symlinks properly)
                     rsync -a --no-owner --no-group "$oci_preinstall_rootfs/" "$image_bundle_name/rootfs/"
+
+                    # Create usrmerge symlinks in the first packages layer.
+                    # Normally done by ROOTFS_PREPROCESS_COMMAND in do_rootfs,
+                    # which doesn't run for multi-layer rootfs directories.
+                    if [ "$oci_pkg_layer_num" = "1" ]; then
+                        if ${@bb.utils.contains('DISTRO_FEATURES', 'usrmerge', 'true', 'false', d)}; then
+                            bbnote "OCI: Creating usrmerge symlinks in first layer"
+                            create_merged_usr_symlinks "$image_bundle_name/rootfs"
+                        fi
+                    fi
                 else
                     bbwarn "OCI: Pre-installed rootfs not found at $oci_preinstall_rootfs"
                 fi
