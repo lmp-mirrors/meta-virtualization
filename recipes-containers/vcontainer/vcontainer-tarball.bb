@@ -124,11 +124,9 @@ def get_available_architectures(d):
 #   VCONTAINER_ARCHITECTURES = "aarch64"
 VCONTAINER_ARCHITECTURES ?= "x86_64 aarch64"
 
-# Print banner at parse time (before builds start)
-# Also conditionally set mcdepends based on available multiconfigs
+# Conditionally set mcdepends based on available multiconfigs
+# (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
 python () {
-    # Conditionally set mcdepends based on available multiconfigs
-    # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
     bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
     mcdeps = []
     for mc in ['vruntime-x86-64', 'vruntime-aarch64']:
@@ -138,36 +136,7 @@ python () {
     if mcdeps:
         d.setVarFlag('do_populate_sdk', 'mcdepends', ' '.join(mcdeps))
 
-    # Only print for main multiconfig (not vruntime-* multiconfigs)
-    mc = d.getVar('BB_CURRENT_MC') or ''
-    if mc == '' and d.getVar('BB_WORKERCONTEXT') != '1':
-        archs = d.getVar('VCONTAINER_ARCHITECTURES')
-        bb.plain("")
-        bb.plain("=" * 70)
-        bb.plain("vcontainer-tarball: Building SDK with multiconfig dependencies")
-        bb.plain("")
-        bb.plain("  Architectures: %s" % archs)
-        bb.plain("")
-        bb.plain("  This will automatically build:")
-        for arch in archs.split():
-            mc_name = "vruntime-aarch64" if arch == "aarch64" else "vruntime-x86-64"
-            bb.plain("    - mc:%s:vdkr-initramfs-create" % mc_name)
-            bb.plain("    - mc:%s:vpdmn-initramfs-create" % mc_name)
-        bb.plain("")
-        bb.plain("  To build only one architecture, set in local.conf:")
-        bb.plain("    VCONTAINER_ARCHITECTURES = \"x86_64\"")
-        bb.plain("    VCONTAINER_ARCHITECTURES = \"aarch64\"")
-        bb.plain("")
-        force = d.getVar('VCONTAINER_FORCE_BUILD') or ''
-        if force == '1':
-            bb.plain("  VCONTAINER_FORCE_BUILD = \"1\" (enabled)")
-            bb.plain("    All vcontainer tasks will rebuild unconditionally.")
-        else:
-            bb.plain("  Incremental builds enabled (default).")
-            bb.plain("    To force full rebuild, set in local.conf:")
-            bb.plain("      VCONTAINER_FORCE_BUILD = \"1\"")
-        bb.plain("=" * 70)
-        bb.plain("")
+    # Build-time banner is in do_populate_sdk:append() below
 }
 
 # ===========================================================================
