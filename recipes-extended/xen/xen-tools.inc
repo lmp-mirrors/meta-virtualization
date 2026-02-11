@@ -334,6 +334,8 @@ FILES:${PN}-libxenmanage-dev = " \
     ${libdir}/pkgconfig/xenmanage.pc \
     ${datadir}/pkgconfig/xenmanage.pc \
     "
+# libxenmanage is only in xen-4.21+
+ALLOW_EMPTY:${PN}-libxenmanage = "1"
 
 FILES:${PN}-libxenguest = "${libdir}/libxenguest.so.*"
 FILES:${PN}-libxenguest-dev = " \
