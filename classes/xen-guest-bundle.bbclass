@@ -103,6 +103,14 @@
 # Explicit rootfs/kernel paths (for external/3rd-party guests):
 #   XEN_GUEST_ROOTFS[my-vendor-guest] = "vendor-rootfs.ext4"
 #   XEN_GUEST_KERNEL[my-vendor-guest] = "vendor-kernel"
+#   XEN_GUEST_KERNEL[my-hvm-guest] = "none"          # HVM: no kernel
+#
+# 3rd-party guest import (convert fetched sources to Xen-ready images):
+#   XEN_GUEST_SOURCE_TYPE[guest] = "rootfs_dir"       # import handler type
+#   XEN_GUEST_SOURCE_FILE[guest] = "alpine-rootfs"    # file/dir in UNPACKDIR
+#   XEN_GUEST_IMAGE_SIZE[guest] = "128"               # target image MB
+#
+# Built-in import types: rootfs_dir, qcow2, ext4, raw
 #
 # ===========================================================================
 # Integration with xen-guest-cross-install.bbclass
@@ -124,6 +132,28 @@ XEN_GUEST_EXTRA_DEFAULT ?= "root=/dev/xvda ro ip=dhcp"
 XEN_GUEST_DISK_DEVICE_DEFAULT ?= "xvda"
 
 # ===========================================================================
+# Import system for 3rd-party guests
+# ===========================================================================
+#
+# Convert fetched source formats (tarballs, qcow2, etc.) into Xen-ready disk
+# images using extensible named handlers. Shell functions named
+# xen_guest_import_<type>() are dispatched at build time.
+#
+# Per-guest varflags:
+#   XEN_GUEST_SOURCE_TYPE[guest] = "rootfs_dir"   # import handler type
+#   XEN_GUEST_SOURCE_FILE[guest] = "alpine-rootfs" # file/dir in UNPACKDIR
+#   XEN_GUEST_IMAGE_SIZE[guest] = "128"            # target image MB
+#
+# Built-in import types: rootfs_dir, qcow2, ext4, raw
+# Extensible: any class/recipe/bbappend can add xen_guest_import_<type>()
+
+XEN_GUEST_IMAGE_SIZE_DEFAULT ?= "256"
+XEN_GUEST_IMPORT_DEPENDS_rootfs_dir = "e2fsprogs-native:do_populate_sysroot"
+XEN_GUEST_IMPORT_DEPENDS_qcow2 = "qemu-system-native:do_populate_sysroot"
+XEN_GUEST_IMPORT_DEPENDS_ext4 = ""
+XEN_GUEST_IMPORT_DEPENDS_raw = ""
+
+# ===========================================================================
 # Parse-time dependency generation
 # ===========================================================================
 
@@ -134,6 +164,7 @@ python __anonymous() {
 
     processed = []
     deps = ""
+    external_guests = []
 
     for entry in bundles:
         parts = entry.split(':')
@@ -145,6 +176,8 @@ python __anonymous() {
         # Generate dependency on guest recipe (unless external)
         if not is_external:
             deps += " %s:do_image_complete" % guest_name
+        else:
+            external_guests.append(guest_name)
 
         # Store processed entry: guest_name:autostart_flag
         autostart_flag = "autostart" if is_autostart else ""
@@ -152,6 +185,9 @@ python __anonymous() {
 
     if deps:
         d.appendVarFlag('do_compile', 'depends', deps)
+
+    if external_guests:
+        d.setVar('_XEN_GUEST_EXTERNAL_NAMES', ' '.join(external_guests))
 
     d.setVar('_PROCESSED_XEN_BUNDLES', ' '.join(processed))
 
@@ -190,6 +226,47 @@ python __anonymous() {
         param_mappings.append("%s=%s" % (guest_name, params))
 
     d.setVar('_XEN_GUEST_PARAMS_MAP', ';'.join(param_mappings))
+
+    # Build import map from varflags and resolve dependencies
+    # Format: guest=type|file|size;guest2=...
+    import_mappings = []
+    import_types_used = set()
+    needs_shared_kernel = False
+
+    for entry in bundles:
+        guest_name = entry.split(':')[0]
+        source_type = d.getVarFlag('XEN_GUEST_SOURCE_TYPE', guest_name)
+        if source_type:
+            source_file = d.getVarFlag('XEN_GUEST_SOURCE_FILE', guest_name) or ""
+            image_size = d.getVarFlag('XEN_GUEST_IMAGE_SIZE', guest_name) or d.getVar('XEN_GUEST_IMAGE_SIZE_DEFAULT')
+            import_mappings.append("%s=%s|%s|%s" % (guest_name, source_type, source_file, image_size))
+            import_types_used.add(source_type)
+
+        # Determine if this guest needs the shared kernel
+        kernel_flag = d.getVarFlag('XEN_GUEST_KERNEL', guest_name)
+        if not kernel_flag or kernel_flag != "none":
+            # No explicit kernel or not "none" → may need shared kernel
+            if not kernel_flag:
+                needs_shared_kernel = True
+
+    d.setVar('_XEN_GUEST_IMPORT_MAP', ';'.join(import_mappings))
+
+    # Add native tool dependencies for import types used
+    import_deps = ""
+    for itype in import_types_used:
+        dep = d.getVar('XEN_GUEST_IMPORT_DEPENDS_%s' % itype)
+        if dep:
+            import_deps += " %s" % dep
+    if import_deps:
+        d.appendVarFlag('do_compile', 'depends', import_deps)
+
+    # rootfs_dir needs fakeroot for mkfs.ext4 -d ownership
+    if 'rootfs_dir' in import_types_used:
+        d.setVarFlag('do_compile', 'fakeroot', '1')
+
+    # Auto-add virtual/kernel dependency if any guest uses shared kernel
+    if needs_shared_kernel:
+        d.appendVarFlag('do_compile', 'depends', ' virtual/kernel:do_deploy')
 }
 
 S = "${UNPACKDIR}/sources"
@@ -197,6 +274,113 @@ B = "${WORKDIR}/build"
 
 do_patch[noexec] = "1"
 do_configure[noexec] = "1"
+
+python xen_guest_external_license_warn() {
+    names = d.getVar('_XEN_GUEST_EXTERNAL_NAMES')
+    if names:
+        bb.warn("Bundling external guest image(s): %s\n"
+                "Ensure you have rights to redistribute these images.\n"
+                "Check the guest license terms before distribution." % names)
+}
+do_compile[prefuncs] += "xen_guest_external_license_warn"
+
+# ===========================================================================
+# Import handlers for 3rd-party guest formats
+# ===========================================================================
+# Shell functions named xen_guest_import_<type>(source, output, size_mb).
+# Extensible: recipes/bbappends can define additional handlers.
+
+# rootfs_dir: extracted rootfs directory → ext4 image
+xen_guest_import_rootfs_dir() {
+    local source_path="$1"
+    local output_path="$2"
+    local size_mb="$3"
+
+    if [ ! -d "$source_path" ]; then
+        bbfatal "rootfs_dir import: source '$source_path' is not a directory"
+    fi
+
+    bbnote "rootfs_dir import: creating ${size_mb}MB ext4 from $source_path"
+
+    # Create sparse file and format with directory contents
+    dd if=/dev/zero of="$output_path" bs=1M count=0 seek="$size_mb"
+    mkfs.ext4 -F -d "$source_path" "$output_path"
+}
+
+# qcow2: QCOW2 disk image → raw image
+xen_guest_import_qcow2() {
+    local source_path="$1"
+    local output_path="$2"
+    local size_mb="$3"
+
+    if [ ! -f "$source_path" ]; then
+        bbfatal "qcow2 import: source '$source_path' not found"
+    fi
+
+    bbnote "qcow2 import: converting $source_path to raw"
+    qemu-img convert -f qcow2 -O raw "$source_path" "$output_path"
+}
+
+# ext4: ext4 image → copy
+xen_guest_import_ext4() {
+    local source_path="$1"
+    local output_path="$2"
+    local size_mb="$3"
+
+    if [ ! -f "$source_path" ]; then
+        bbfatal "ext4 import: source '$source_path' not found"
+    fi
+
+    bbnote "ext4 import: copying $source_path"
+    cp "$source_path" "$output_path"
+}
+
+# raw: raw disk image → copy
+xen_guest_import_raw() {
+    local source_path="$1"
+    local output_path="$2"
+    local size_mb="$3"
+
+    if [ ! -f "$source_path" ]; then
+        bbfatal "raw import: source '$source_path' not found"
+    fi
+
+    bbnote "raw import: copying $source_path"
+    cp "$source_path" "$output_path"
+}
+
+# Resolve import source for a guest from _XEN_GUEST_IMPORT_MAP
+# Returns: type|source_path|size_mb  or empty if guest has no import
+resolve_import_source() {
+    local guest="$1"
+    local import_map="${_XEN_GUEST_IMPORT_MAP}"
+
+    local entry=$(echo "$import_map" | tr ';' '\n' | grep "^${guest}=")
+    if [ -z "$entry" ]; then
+        return 1
+    fi
+
+    local info=$(echo "$entry" | cut -d= -f2-)
+    local source_type=$(echo "$info" | cut -d'|' -f1)
+    local source_file=$(echo "$info" | cut -d'|' -f2)
+    local size_mb=$(echo "$info" | cut -d'|' -f3)
+
+    # Resolve source path
+    local source_path=""
+    if [ -n "$source_file" ]; then
+        if [ -e "${UNPACKDIR}/$source_file" ]; then
+            source_path="${UNPACKDIR}/$source_file"
+        elif [ -e "$source_file" ]; then
+            source_path="$source_file"
+        fi
+    fi
+
+    if [ -z "$source_path" ]; then
+        bbfatal "Import source '$source_file' not found for guest '$guest'"
+    fi
+
+    echo "${source_type}|${source_path}|${size_mb}"
+}
 
 # ===========================================================================
 # do_compile: resolve guests and generate configs
@@ -226,23 +410,48 @@ do_compile() {
 
         bbnote "Processing guest: $guest_name (autostart=$autostart_flag)"
 
-        # Resolve rootfs
-        rootfs_path=$(resolve_bundle_rootfs "$guest_name")
-        if [ -z "$rootfs_path" ]; then
-            bbfatal "Cannot resolve rootfs for guest '$guest_name'"
+        # Resolve rootfs - check import system first, then DEPLOY_DIR_IMAGE
+        import_info=""
+        if echo "${_XEN_GUEST_IMPORT_MAP}" | tr ';' '\n' | grep -q "^${guest_name}="; then
+            import_info=$(resolve_import_source "$guest_name")
         fi
-        rootfs_basename=$(basename "$rootfs_path")
 
-        # Resolve kernel
+        if [ -n "$import_info" ]; then
+            # Import path: convert fetched source to disk image
+            local import_type=$(echo "$import_info" | cut -d'|' -f1)
+            local import_source=$(echo "$import_info" | cut -d'|' -f2)
+            local import_size=$(echo "$import_info" | cut -d'|' -f3)
+
+            rootfs_basename="${guest_name}.img"
+            local output_path="${B}/images/${rootfs_basename}"
+
+            bbnote "Importing guest '$guest_name': type=$import_type source=$import_source size=${import_size}MB"
+
+            # Static dispatch - BitBake needs to see function names to include them
+            case "$import_type" in
+                rootfs_dir) xen_guest_import_rootfs_dir "$import_source" "$output_path" "$import_size" ;;
+                qcow2)      xen_guest_import_qcow2 "$import_source" "$output_path" "$import_size" ;;
+                ext4)       xen_guest_import_ext4 "$import_source" "$output_path" "$import_size" ;;
+                raw)        xen_guest_import_raw "$import_source" "$output_path" "$import_size" ;;
+                *)          bbfatal "Unknown import type '$import_type' for guest '$guest_name'" ;;
+            esac
+        else
+            # Standard path: resolve from DEPLOY_DIR_IMAGE
+            rootfs_path=$(resolve_bundle_rootfs "$guest_name")
+            if [ -z "$rootfs_path" ]; then
+                bbfatal "Cannot resolve rootfs for guest '$guest_name'"
+            fi
+            rootfs_basename=$(basename "$rootfs_path")
+            cp "$(readlink -f "$rootfs_path")" "${B}/images/${rootfs_basename}"
+        fi
+
+        # Resolve kernel (supports shared, custom, and HVM/none modes)
         kernel_path=$(resolve_bundle_kernel "$guest_name")
-        if [ -z "$kernel_path" ]; then
-            bbfatal "Cannot resolve kernel for guest '$guest_name'"
+        kernel_basename=""
+        if [ -n "$kernel_path" ]; then
+            kernel_basename=$(basename "$kernel_path")
+            cp "$(readlink -f "$kernel_path")" "${B}/images/${kernel_basename}"
         fi
-        kernel_basename=$(basename "$kernel_path")
-
-        # Copy to build dir (readlink -f resolves versioned symlinks)
-        cp "$(readlink -f "$rootfs_path")" "${B}/images/${rootfs_basename}"
-        cp "$(readlink -f "$kernel_path")" "${B}/images/${kernel_basename}"
 
         # Generate or install config
         config_map="${_XEN_GUEST_CONFIG_FILE_MAP}"
@@ -309,29 +518,48 @@ resolve_bundle_rootfs() {
     return 1
 }
 
-# Resolve guest kernel path from DEPLOY_DIR_IMAGE
+# Resolve guest kernel path
+# Three modes:
+#   1. XEN_GUEST_KERNEL[guest] = "none" → HVM mode, return empty (no kernel)
+#   2. XEN_GUEST_KERNEL[guest] = "<path>" → check UNPACKDIR then DEPLOY_DIR_IMAGE
+#   3. (not set) → shared kernel from DEPLOY_DIR_IMAGE/${KERNEL_IMAGETYPE}
 resolve_bundle_kernel() {
     local guest="$1"
     local params_map="${_XEN_GUEST_PARAMS_MAP}"
 
-    # Check for explicit kernel override (field 7)
+    # Check for explicit kernel override (field 8)
     local guest_params=$(echo "$params_map" | tr ';' '\n' | grep "^${guest}=" | cut -d= -f2-)
     local override=""
     if [ -n "$guest_params" ]; then
         override=$(echo "$guest_params" | cut -d'|' -f8)
     fi
 
+    # Mode 1: HVM - no kernel needed
+    if [ "$override" = "none" ]; then
+        bbnote "Guest '$guest' uses HVM mode (no kernel)"
+        return 0
+    fi
+
+    # Mode 2: explicit kernel path
     if [ -n "$override" ]; then
-        local path="${DEPLOY_DIR_IMAGE}/$override"
+        # Check UNPACKDIR first (for fetched/custom kernels)
+        local path="${UNPACKDIR}/$override"
         if [ -e "$path" ]; then
             echo "$path"
             return 0
         fi
-        bbwarn "XEN_GUEST_KERNEL override '$override' not found at $path"
+
+        # Then check DEPLOY_DIR_IMAGE
+        path="${DEPLOY_DIR_IMAGE}/$override"
+        if [ -e "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+        bbwarn "XEN_GUEST_KERNEL override '$override' not found in UNPACKDIR or DEPLOY_DIR_IMAGE"
         return 1
     fi
 
-    # Default: shared kernel (same MACHINE)
+    # Mode 3: shared kernel (same MACHINE)
     local path="${DEPLOY_DIR_IMAGE}/${KERNEL_IMAGETYPE}"
     if [ -e "$path" ]; then
         echo "$path"
@@ -343,6 +571,8 @@ resolve_bundle_kernel() {
 }
 
 # Generate a Xen guest configuration file with final target paths
+# If kernel_basename is empty (HVM mode), kernel= and extra= lines are omitted.
+# HVM guests should use XEN_GUEST_CONFIG_FILE for full control.
 generate_bundle_config() {
     local guest="$1"
     local rootfs_basename="$2"
@@ -366,9 +596,15 @@ memory = $memory
 vcpus = $vcpus
 disk = ['file:/var/lib/xen/images/$rootfs_basename,$disk_device,rw']
 vif = ['$vif']
+EOF
+
+    # PV guests get kernel + extra; HVM guests omit these
+    if [ -n "$kernel_basename" ]; then
+        cat >> "$outfile" << EOF
 kernel = "/var/lib/xen/images/$kernel_basename"
 extra = "$extra"
 EOF
+    fi
 }
 
 # ===========================================================================
