@@ -1019,13 +1019,13 @@ if [ -n "$INPUT_PATH" ] && [ "$INPUT_TYPE" != "none" ]; then
     dd if=/dev/zero of="$INPUT_IMG" bs=1M count=$SIZE_MB 2>/dev/null
 
     if [ -d "$INPUT_PATH" ]; then
-        mke2fs -t ext4 -d "$INPUT_PATH" "$INPUT_IMG" 2>/dev/null
+        mke2fs -t ext4 -d "$INPUT_PATH" "$INPUT_IMG" >/dev/null 2>&1
     else
         # Single file - create temp dir with the file
         EXTRACT_DIR="$TEMP_DIR/input-extract"
         mkdir -p "$EXTRACT_DIR"
         cp "$INPUT_PATH" "$EXTRACT_DIR/"
-        mke2fs -t ext4 -d "$EXTRACT_DIR" "$INPUT_IMG" 2>/dev/null
+        mke2fs -t ext4 -d "$EXTRACT_DIR" "$INPUT_IMG" >/dev/null 2>&1
     fi
 
     DISK_OPTS="-drive file=$INPUT_IMG,if=virtio,format=raw"
@@ -1054,7 +1054,7 @@ if [ -n "$STATE_DIR" ] && ! type hv_skip_state_disk >/dev/null 2>&1; then
         log "INFO" "Creating new state disk at $STATE_IMG..."
         # Create 2GB state disk for Docker storage
         dd if=/dev/zero of="$STATE_IMG" bs=1M count=2048 2>/dev/null
-        mke2fs -t ext4 "$STATE_IMG" 2>/dev/null
+        mke2fs -t ext4 "$STATE_IMG" >/dev/null 2>&1
     else
         log "INFO" "Using existing state disk: $STATE_IMG"
     fi
@@ -1087,7 +1087,7 @@ if [ -n "$INPUT_STORAGE" ] && [ -z "$STATE_DIR" ]; then
     log "DEBUG" "Tar size: ${TAR_SIZE_KB}KB, State disk: ${STATE_SIZE_MB}MB"
 
     dd if=/dev/zero of="$STATE_IMG" bs=1M count=$STATE_SIZE_MB 2>/dev/null
-    mke2fs -t ext4 "$STATE_IMG" 2>/dev/null
+    mke2fs -t ext4 "$STATE_IMG" >/dev/null 2>&1
 
     # Mount and extract tar
     MOUNT_DIR="$TEMP_DIR/state-mount"
@@ -1109,7 +1109,7 @@ if [ -n "$INPUT_STORAGE" ] && [ -z "$STATE_DIR" ]; then
         EXTRACT_DIR="$TEMP_DIR/state-extract"
         mkdir -p "$EXTRACT_DIR"
         tar --no-same-owner --strip-components=1 --exclude=volumes/backingFsBlockDev -xf "$INPUT_STORAGE" -C "$EXTRACT_DIR"
-        mke2fs -t ext4 -d "$EXTRACT_DIR" "$STATE_IMG" 2>/dev/null
+        mke2fs -t ext4 -d "$EXTRACT_DIR" "$STATE_IMG" >/dev/null 2>&1
     fi
 
     # Use cache=directsync to ensure writes are flushed to disk
@@ -1392,6 +1392,14 @@ fi
 
 # Non-interactive mode: run VM in background and capture output
 VM_OUTPUT="$TEMP_DIR/vm_output.txt"
+
+# Suppress kernel console messages in non-verbose mode to keep output clean
+SAVED_PRINTK=""
+if [ "$VERBOSE" != "true" ] && [ -w /proc/sys/kernel/printk ]; then
+    SAVED_PRINTK=$(cat /proc/sys/kernel/printk | awk '{print $1}')
+    echo 1 > /proc/sys/kernel/printk
+fi
+
 hv_start_vm_background "$KERNEL_APPEND" "$VM_OUTPUT" "$TIMEOUT"
 
 # Monitor for completion
@@ -1441,6 +1449,23 @@ for i in $(seq 1 $TIMEOUT); do
     sleep 1
 done
 
+# If VM ended before markers were detected, wait for console to flush
+if [ "$COMPLETE" = "false" ] && ! hv_is_vm_running; then
+    sleep 2
+    case "$OUTPUT_TYPE" in
+        text)
+            grep -q "===OUTPUT_END===" "$VM_OUTPUT" 2>/dev/null && COMPLETE=true
+            ;;
+        tar)
+            grep -q "===TAR_END===" "$VM_OUTPUT" 2>/dev/null && COMPLETE=true
+            ;;
+        storage)
+            grep -qE "===STORAGE_END===|===9P_STORAGE_DONE===" "$VM_OUTPUT" 2>/dev/null && COMPLETE=true
+            ;;
+    esac
+    [ "$COMPLETE" = "true" ] && log "DEBUG" "Markers found after VM exit"
+fi
+
 # Wait for VM to exit gracefully (poweroff from inside flushes disks properly)
 if [ "$COMPLETE" = "true" ] && hv_is_vm_running; then
     log "DEBUG" "Waiting for VM to complete graceful shutdown..."
@@ -1452,10 +1477,15 @@ if hv_is_vm_running; then
     hv_stop_vm
 fi
 
+# Restore kernel console messages
+if [ -n "$SAVED_PRINTK" ]; then
+    echo "$SAVED_PRINTK" > /proc/sys/kernel/printk
+fi
+
 # Extract results
 if [ "$COMPLETE" = "true" ]; then
     # Get exit code
-    EXIT_CODE=$(grep -oP '===EXIT_CODE=\K[0-9]+' "$VM_OUTPUT" | head -1)
+    EXIT_CODE=$(sed -n 's/.*===EXIT_CODE=\([0-9]*\).*/\1/p' "$VM_OUTPUT" | head -1)
     EXIT_CODE="${EXIT_CODE:-0}"
 
     case "$OUTPUT_TYPE" in
@@ -1544,10 +1574,11 @@ if [ "$COMPLETE" = "true" ]; then
     exit "${EXIT_CODE:-0}"
 else
     log "ERROR" "Command execution failed or timed out"
-    log "ERROR" "QEMU output saved to: $VM_OUTPUT"
+    KEEP_TEMP=true
+    log "ERROR" "VM output saved to: $VM_OUTPUT"
 
     if [ "$VERBOSE" = "true" ]; then
-        log "DEBUG" "=== Last 50 lines of QEMU output ==="
+        log "DEBUG" "=== Last 50 lines of VM output ==="
         tail -50 "$VM_OUTPUT"
     fi
 

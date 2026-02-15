@@ -357,7 +357,7 @@ hv_start_vm_background() {
     # Use the domain name as VM identifier
     HV_VM_PID="$$"  # Use our PID as a placeholder for compatibility
 
-    if [ -n "$DAEMON_SOCKET" ]; then
+    if [ "$DAEMON_MODE" = "start" ]; then
         # Daemon mode: bridge xl console (hvc1) to the daemon unix socket
         # xl console -n 1 connects to the second PV console (hvc1)
         socat "UNIX-LISTEN:$DAEMON_SOCKET,fork" "EXEC:xl console -n 1 $HV_DOMNAME" &
@@ -366,7 +366,7 @@ hv_start_vm_background() {
     else
         # Ephemeral mode: capture guest console (hvc0) to log file
         # so the monitoring loop in vrunner.sh can see output markers
-        xl console "$HV_DOMNAME" >> "$log_file" 2>&1 &
+        stdbuf -oL xl console "$HV_DOMNAME" >> "$log_file" 2>&1 &
         _XEN_CONSOLE_PID=$!
         log "DEBUG" "Console capture started (PID: $_XEN_CONSOLE_PID)"
     fi
