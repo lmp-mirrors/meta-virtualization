@@ -13,8 +13,8 @@
 # Key differences from QEMU backend:
 #   - Block devices appear as /dev/xvd* instead of /dev/vd*
 #   - Network uses bridge + iptables NAT instead of QEMU slirp
-#   - Console uses PV console (hvc0/hvc1) instead of virtio-serial
-#   - 9p file sharing uses trans=xen instead of trans=virtio
+#   - Console uses PV console (hvc0) with serial='pty' for PTY on Dom0
+#   - Daemon IPC uses direct PTY I/O (no socat bridge needed)
 #   - VM tracking uses domain name instead of PID
 
 # ============================================================================
@@ -43,8 +43,12 @@ hv_setup_arch() {
             ;;
     esac
 
-    # Xen domain name (unique per instance)
-    HV_DOMNAME="vxn-$$"
+    # Xen domain name: use container name if set, otherwise PID-based
+    if [ -n "${CONTAINER_NAME:-}" ]; then
+        HV_DOMNAME="vxn-${CONTAINER_NAME}"
+    else
+        HV_DOMNAME="vxn-$$"
+    fi
     HV_VM_PID=""
 
     # Xen domain config path (generated at runtime)
@@ -97,6 +101,8 @@ hv_prepare_container() {
     fi
 
     # Parse image name and any trailing command from "docker run [opts] <image> [cmd...]"
+    # Uses word counting + cut to extract the user command portion from the
+    # original string, preserving internal spaces (e.g., -c "echo hello && sleep 5").
     local args
     args=$(echo "$DOCKER_CMD" | sed 's/^[a-z]* run //')
 
@@ -104,14 +110,14 @@ hv_prepare_container() {
     local user_cmd=""
     local skip_next=false
     local found_image=false
+    local word_count=0
     for arg in $args; do
+        if [ "$found_image" = "true" ]; then
+            break
+        fi
+        word_count=$((word_count + 1))
         if [ "$skip_next" = "true" ]; then
             skip_next=false
-            continue
-        fi
-        if [ "$found_image" = "true" ]; then
-            # Everything after image name is the user command
-            user_cmd="$user_cmd $arg"
             continue
         fi
         case "$arg" in
@@ -130,7 +136,21 @@ hv_prepare_container() {
                 ;;
         esac
     done
-    user_cmd=$(echo "$user_cmd" | sed 's/^ *//')
+
+    # Extract user command from original string using cut (preserves internal spaces)
+    if [ "$found_image" = "true" ]; then
+        user_cmd=$(echo "$args" | cut -d' ' -f$((word_count + 1))-)
+        # If cut returns the whole string (no fields after image), clear it
+        [ "$user_cmd" = "$args" ] && [ "$word_count" -ge "$(echo "$args" | wc -w)" ] && user_cmd=""
+    fi
+
+    # Strip /bin/sh -c wrapper from user command — the guest already wraps
+    # with /bin/sh -c in exec_in_container_background(), so passing it through
+    # would create nested shells with broken quoting.
+    case "$user_cmd" in
+        "/bin/sh -c "*)  user_cmd="${user_cmd#/bin/sh -c }" ;;
+        "sh -c "*)       user_cmd="${user_cmd#sh -c }" ;;
+    esac
 
     if [ -z "$image" ]; then
         log "DEBUG" "hv_prepare_container: no image found in DOCKER_CMD"
@@ -245,22 +265,17 @@ hv_build_network_opts() {
 hv_build_9p_opts() {
     local share_dir="$1"
     local share_tag="$2"
-    # For Xen, 9p is configured in the domain config, not as a command-line option
-    # We accumulate these and include them in the config file
-    _XEN_9P+=("{ 'tag': '$share_tag', 'path': '$share_dir', 'security_model': 'none' }")
-    # Return empty string since Xen doesn't use command-line 9p options
-    echo ""
+    # Xen 9p (xen_9pfsd) is not reliable in all environments (e.g. nested
+    # QEMU→Xen). Keep the interface for future use but don't depend on it
+    # for daemon IPC — we use serial/PTY + socat instead.
+    _XEN_9P+=("'tag=$share_tag,path=$share_dir,security_model=none,type=xen_9pfsd'")
 }
 
 hv_build_daemon_opts() {
     HV_DAEMON_OPTS=""
-    # Xen uses PV console (hvc1) for daemon command channel
-    # The init scripts already have /dev/hvc1 as a fallback for the daemon port
-    # No extra config needed - hvc1 is automatically available in PV guests
-    #
-    # For the host-side socket, we'll use xl console with a pipe
-    # The daemon socket is handled differently for Xen:
-    # We create a socat bridge between the Xen console and a unix socket
+    # Xen daemon mode uses hvc0 with serial='pty' for bidirectional IPC.
+    # The PTY is created on Dom0 and bridged to a Unix socket via socat.
+    # This is the same approach runx used (serial_start).
 }
 
 hv_build_vm_cmd() {
@@ -316,6 +331,8 @@ extra = "console=hvc0 quiet loglevel=0 init=/init vcontainer.blk=xvd vcontainer.
 disk = [ $disk_array ]
 vif = [ $vif_array ]
 
+serial = 'pty'
+
 on_poweroff = "destroy"
 on_reboot = "destroy"
 on_crash = "destroy"
@@ -353,16 +370,36 @@ hv_start_vm_background() {
     # Create the domain
     xl create "$HV_XEN_CFG" >> "$log_file" 2>&1
 
-    # For background monitoring, we need a PID-like concept
-    # Use the domain name as VM identifier
-    HV_VM_PID="$$"  # Use our PID as a placeholder for compatibility
+    # Xen domains don't have a PID on Dom0 — xl manages them by name.
+    # For daemon mode, start a lightweight monitor process that stays alive
+    # while the domain exists. This gives vcontainer-common.sh a real PID
+    # to check in /proc/$pid for daemon_is_running().
+    HV_VM_PID="$$"
 
     if [ "$DAEMON_MODE" = "start" ]; then
-        # Daemon mode: bridge xl console (hvc1) to the daemon unix socket
-        # xl console -n 1 connects to the second PV console (hvc1)
-        socat "UNIX-LISTEN:$DAEMON_SOCKET,fork" "EXEC:xl console -n 1 $HV_DOMNAME" &
-        _XEN_SOCAT_PID=$!
-        log "DEBUG" "Console-socket bridge started (PID: $_XEN_SOCAT_PID)"
+        # Daemon mode: get the domain's hvc0 PTY for direct I/O.
+        # serial='pty' in the xl config creates a PTY on Dom0.
+        # We read/write this PTY directly — no socat bridge needed.
+        local domid
+        domid=$(xl domid "$HV_DOMNAME" 2>/dev/null)
+        if [ -n "$domid" ]; then
+            _XEN_PTY=$(xenstore-read "/local/domain/$domid/console/tty" 2>/dev/null)
+            if [ -n "$_XEN_PTY" ]; then
+                log "DEBUG" "Domain $HV_DOMNAME (domid $domid) console PTY: $_XEN_PTY"
+                echo "$_XEN_PTY" > "$DAEMON_SOCKET_DIR/daemon.pty"
+            else
+                log "ERROR" "Could not read console PTY from xenstore for domid $domid"
+            fi
+        else
+            log "ERROR" "Could not get domid for $HV_DOMNAME"
+        fi
+
+        # Monitor process: stays alive while domain exists.
+        # vcontainer-common.sh checks /proc/$pid → alive means daemon running.
+        # When domain dies (xl destroy, guest reboot), monitor exits.
+        local _domname="$HV_DOMNAME"
+        (while xl list "$_domname" >/dev/null 2>&1; do sleep 10; done) &
+        HV_VM_PID=$!
     else
         # Ephemeral mode: capture guest console (hvc0) to log file
         # so the monitoring loop in vrunner.sh can see output markers
@@ -412,11 +449,6 @@ hv_destroy_vm() {
     # Clean up console capture (ephemeral mode)
     if [ -n "${_XEN_CONSOLE_PID:-}" ]; then
         kill $_XEN_CONSOLE_PID 2>/dev/null || true
-    fi
-
-    # Clean up console bridge (daemon mode)
-    if [ -n "${_XEN_SOCAT_PID:-}" ]; then
-        kill $_XEN_SOCAT_PID 2>/dev/null || true
     fi
 }
 
@@ -524,6 +556,181 @@ hv_daemon_is_running() {
     [ -n "$HV_DOMNAME" ] && xl list "$HV_DOMNAME" >/dev/null 2>&1
 }
 
+# PTY-based daemon readiness check.
+# The guest emits ===PONG=== on hvc0 at daemon startup and in response to PING.
+# We read the PTY (saved by hv_start_vm_background) looking for this marker.
+hv_daemon_ping() {
+    local pty_file="$DAEMON_SOCKET_DIR/daemon.pty"
+    [ -f "$pty_file" ] || return 1
+    local pty
+    pty=$(cat "$pty_file")
+    [ -c "$pty" ] || return 1
+
+    # Open PTY for read/write on fd 3
+    exec 3<>"$pty"
+
+    # Send PING (guest also emits PONG at startup)
+    echo "===PING===" >&3
+
+    # Read lines looking for PONG (skip boot messages, log lines)
+    local line
+    while IFS= read -t 5 -r line <&3; do
+        line=$(echo "$line" | tr -d '\r')
+        case "$line" in
+            *"===PONG==="*) exec 3<&- 3>&-; return 0 ;;
+        esac
+    done
+
+    exec 3<&- 3>&- 2>/dev/null
+    return 1
+}
+
+# PTY-based daemon command send.
+# Writes base64-encoded command to PTY, reads response with markers.
+# Same protocol as socat-based daemon_send in vrunner.sh.
+hv_daemon_send() {
+    local cmd="$1"
+    local pty_file="$DAEMON_SOCKET_DIR/daemon.pty"
+    [ -f "$pty_file" ] || { log "ERROR" "No daemon PTY file"; return 1; }
+    local pty
+    pty=$(cat "$pty_file")
+    [ -c "$pty" ] || { log "ERROR" "PTY $pty not a character device"; return 1; }
+
+    # Update activity timestamp
+    touch "$DAEMON_SOCKET_DIR/activity" 2>/dev/null || true
+
+    # Encode command
+    local cmd_b64
+    cmd_b64=$(echo -n "$cmd" | base64 -w0)
+
+    # Open PTY for read/write on fd 3
+    exec 3<>"$pty"
+
+    # Drain any pending output (boot messages, prior log lines)
+    while IFS= read -t 0.5 -r _discard <&3; do :; done
+
+    # Send command
+    echo "$cmd_b64" >&3
+
+    # Read response with markers
+    local EXIT_CODE=0
+    local in_output=false
+    local line
+    while IFS= read -t 60 -r line <&3; do
+        line=$(echo "$line" | tr -d '\r')
+        case "$line" in
+            *"===OUTPUT_START==="*)
+                in_output=true
+                ;;
+            *"===OUTPUT_END==="*)
+                in_output=false
+                ;;
+            *"===EXIT_CODE="*"==="*)
+                EXIT_CODE=$(echo "$line" | sed 's/.*===EXIT_CODE=\([0-9]*\)===/\1/')
+                ;;
+            *"===END==="*)
+                break
+                ;;
+            *)
+                if [ "$in_output" = "true" ]; then
+                    echo "$line"
+                fi
+                ;;
+        esac
+    done
+
+    exec 3<&- 3>&- 2>/dev/null
+    return ${EXIT_CODE:-0}
+}
+
+# Run a container in a memres (persistent) DomU.
+# Hot-plugs an input disk, sends ===RUN_CONTAINER=== command via PTY,
+# reads output, detaches disk.
+# Usage: hv_daemon_run_container <resolved_cmd> <input_disk_path>
+hv_daemon_run_container() {
+    local cmd="$1"
+    local input_disk="$2"
+
+    hv_daemon_load_state
+    if [ -z "$HV_DOMNAME" ]; then
+        log "ERROR" "No memres domain name"
+        return 1
+    fi
+
+    # Hot-plug the input disk as xvdb (read-only)
+    if [ -n "$input_disk" ] && [ -f "$input_disk" ]; then
+        log "INFO" "Hot-plugging container disk to $HV_DOMNAME..."
+        xl block-attach "$HV_DOMNAME" "format=raw,vdev=xvdb,access=ro,target=$input_disk" 2>/dev/null || {
+            log "ERROR" "Failed to attach block device"
+            return 1
+        }
+        sleep 1  # Let the kernel register the device
+    fi
+
+    # Build the command line: ===RUN_CONTAINER===<cmd_b64>
+    local raw_line="===RUN_CONTAINER==="
+    if [ -n "$cmd" ]; then
+        raw_line="${raw_line}$(echo -n "$cmd" | base64 -w0)"
+    fi
+
+    # Send via PTY and read response (same protocol as hv_daemon_send)
+    local pty_file="$DAEMON_SOCKET_DIR/daemon.pty"
+    [ -f "$pty_file" ] || { log "ERROR" "No daemon PTY file"; return 1; }
+    local pty
+    pty=$(cat "$pty_file")
+    [ -c "$pty" ] || { log "ERROR" "PTY $pty not a character device"; return 1; }
+
+    touch "$DAEMON_SOCKET_DIR/activity" 2>/dev/null || true
+
+    exec 3<>"$pty"
+
+    # Drain pending output
+    while IFS= read -t 0.5 -r _discard <&3; do :; done
+
+    # Send command
+    echo "$raw_line" >&3
+
+    # Read response with markers
+    local EXIT_CODE=0
+    local in_output=false
+    local line
+    while IFS= read -t 120 -r line <&3; do
+        line=$(echo "$line" | tr -d '\r')
+        case "$line" in
+            *"===OUTPUT_START==="*)
+                in_output=true
+                ;;
+            *"===OUTPUT_END==="*)
+                in_output=false
+                ;;
+            *"===EXIT_CODE="*"==="*)
+                EXIT_CODE=$(echo "$line" | sed 's/.*===EXIT_CODE=\([0-9]*\)===/\1/')
+                ;;
+            *"===ERROR==="*)
+                in_output=true
+                ;;
+            *"===END==="*)
+                break
+                ;;
+            *)
+                if [ "$in_output" = "true" ]; then
+                    echo "$line"
+                fi
+                ;;
+        esac
+    done
+
+    exec 3<&- 3>&- 2>/dev/null
+
+    # Detach the input disk
+    if [ -n "$input_disk" ] && [ -f "$input_disk" ]; then
+        log "DEBUG" "Detaching container disk from $HV_DOMNAME..."
+        xl block-detach "$HV_DOMNAME" xvdb 2>/dev/null || true
+    fi
+
+    return ${EXIT_CODE:-0}
+}
+
 hv_daemon_stop() {
     hv_daemon_load_state
     if [ -z "$HV_DOMNAME" ]; then
@@ -532,10 +739,15 @@ hv_daemon_stop() {
 
     log "INFO" "Shutting down Xen domain $HV_DOMNAME..."
 
-    # Send shutdown command via socket first (graceful guest shutdown)
-    if [ -S "$DAEMON_SOCKET" ]; then
-        echo "===SHUTDOWN===" | socat - "UNIX-CONNECT:$DAEMON_SOCKET" 2>/dev/null || true
-        sleep 2
+    # Send shutdown command via PTY (graceful guest shutdown)
+    local pty_file="$DAEMON_SOCKET_DIR/daemon.pty"
+    if [ -f "$pty_file" ]; then
+        local pty
+        pty=$(cat "$pty_file")
+        if [ -c "$pty" ]; then
+            echo "===SHUTDOWN===" > "$pty" 2>/dev/null || true
+            sleep 2
+        fi
     fi
 
     # Try graceful xl shutdown
@@ -554,11 +766,14 @@ hv_daemon_stop() {
         xl destroy "$HV_DOMNAME" 2>/dev/null || true
     fi
 
-    # Clean up console bridge
-    if [ -n "${_XEN_SOCAT_PID:-}" ]; then
-        kill $_XEN_SOCAT_PID 2>/dev/null || true
+    # Kill monitor process (PID stored in daemon.pid)
+    local pid_file="$DAEMON_SOCKET_DIR/daemon.pid"
+    if [ -f "$pid_file" ]; then
+        local mpid
+        mpid=$(cat "$pid_file" 2>/dev/null)
+        [ -n "$mpid" ] && kill "$mpid" 2>/dev/null || true
     fi
 
-    rm -f "$(_xen_domname_file)"
+    rm -f "$(_xen_domname_file)" "$pty_file" "$pid_file"
     log "INFO" "Xen domain stopped"
 }

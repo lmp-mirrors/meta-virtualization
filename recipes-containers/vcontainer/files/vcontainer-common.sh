@@ -758,6 +758,9 @@ build_runner_args() {
     [ -n "$REGISTRY_USER" ] && args+=("--registry-user" "$REGISTRY_USER")
     [ -n "$REGISTRY_PASS" ] && args+=("--registry-pass" "$REGISTRY_PASS")
 
+    # Xen: pass exit grace period
+    [ -n "${VXN_EXIT_GRACE_PERIOD:-}" ] && args+=("--exit-grace-period" "$VXN_EXIT_GRACE_PERIOD")
+
     echo "${args[@]}"
 }
 
@@ -1386,6 +1389,78 @@ parse_and_prepare_volumes() {
     done
 }
 
+# ============================================================================
+# VXN Container State Helpers (Xen per-container DomU)
+# ============================================================================
+
+# VXN container state directory
+vxn_container_dir() { echo "$HOME/.vxn/containers/$1"; }
+
+vxn_container_is_running() {
+    local cdir="$(vxn_container_dir "$1")"
+    [ -f "$cdir/daemon.domname" ] || return 1
+    local domname=$(cat "$cdir/daemon.domname")
+    xl list "$domname" >/dev/null 2>&1
+}
+
+# Query entrypoint status from a running vxn container.
+# Returns: "Running", "Exited (<code>)", or "Unknown"
+vxn_container_status() {
+    local name="$1"
+    local cdir="$(vxn_container_dir "$name")"
+
+    # DomU not alive at all
+    if ! vxn_container_is_running "$name"; then
+        echo "Exited"
+        return
+    fi
+
+    # Query the guest via PTY for entrypoint status
+    local pty_file="$cdir/daemon.pty"
+    if [ -f "$pty_file" ]; then
+        local pty
+        pty=$(cat "$pty_file")
+        if [ -c "$pty" ]; then
+            # Open PTY, send STATUS query, read response
+            local status_line=""
+            exec 4<>"$pty"
+            # Drain pending output
+            while IFS= read -t 0.3 -r _discard <&4; do :; done
+            echo "===STATUS===" >&4
+            while IFS= read -t 3 -r status_line <&4; do
+                status_line=$(echo "$status_line" | tr -d '\r')
+                case "$status_line" in
+                    *"===RUNNING==="*)
+                        exec 4<&- 4>&- 2>/dev/null
+                        echo "Running"
+                        return
+                        ;;
+                    *"===EXITED="*"==="*)
+                        local code=$(echo "$status_line" | sed 's/.*===EXITED=\([0-9]*\)===/\1/')
+                        exec 4<&- 4>&- 2>/dev/null
+                        echo "Exited ($code)"
+                        return
+                        ;;
+                esac
+            done
+            exec 4<&- 4>&- 2>/dev/null
+        fi
+    fi
+
+    # Could not determine — DomU is alive but status query failed
+    echo "Running"
+}
+
+# Xen: error helper for unsupported commands
+vxn_unsupported() {
+    echo "${VCONTAINER_RUNTIME_NAME}: '$1' is not supported (VM is the container, no runtime inside)" >&2
+    exit 1
+}
+vxn_not_yet() {
+    echo "${VCONTAINER_RUNTIME_NAME}: '$1' is not yet supported" >&2
+    exit 1
+}
+
 # Handle commands
 case "$COMMAND" in
     image)
@@ -1394,6 +1469,7 @@ case "$COMMAND" in
         # docker image rm → docker rmi
         # docker image pull → docker pull
         # etc.
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "image"
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} image requires a subcommand (ls, rm, pull, inspect, tag, push, prune)" >&2
             exit 1
@@ -1448,11 +1524,13 @@ case "$COMMAND" in
         ;;
 
     images)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "images"
         # runtime images
         run_runtime_command "$VCONTAINER_RUNTIME_CMD images ${COMMAND_ARGS[*]}"
         ;;
 
     pull)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "pull"
         # runtime pull <image>
         # Daemon mode already has networking enabled, so this works via daemon
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
@@ -1474,6 +1552,7 @@ case "$COMMAND" in
         ;;
 
     load)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "load"
         # runtime load -i <file>
         # Parse -i argument
         INPUT_FILE=""
@@ -1508,6 +1587,7 @@ case "$COMMAND" in
         ;;
 
     import)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "import"
         # runtime import <tarball> [name:tag] - matches Docker/Podman's import exactly
         # Only accepts tarballs (rootfs archives), not OCI directories
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
@@ -1536,6 +1616,7 @@ case "$COMMAND" in
         ;;
 
     vimport)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "vimport"
         # Extended import: handles OCI directories, tarballs, and plain directories
         # Auto-detects format
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
@@ -1629,6 +1710,7 @@ case "$COMMAND" in
         ;;
 
     save)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "save"
         # runtime save -o <file> <image>
         OUTPUT_FILE=""
         IMAGE_NAME=""
@@ -1685,12 +1767,27 @@ case "$COMMAND" in
         ;;
 
     tag|rmi)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "$COMMAND"
         # Commands that work with existing images
         run_runtime_command "$VCONTAINER_RUNTIME_CMD $COMMAND ${COMMAND_ARGS[*]}"
         ;;
 
     # Container lifecycle commands
     ps)
+        # Xen: list per-container DomUs
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            printf "%-15s %-25s %-15s %-20s\n" "NAME" "IMAGE" "STATUS" "STARTED"
+            for cdir in "$HOME/.vxn/containers"/*/; do
+                [ -d "$cdir" ] || continue
+                name=$(basename "$cdir")
+                ctr_image=$(grep '^IMAGE=' "$cdir/container.meta" 2>/dev/null | cut -d= -f2-)
+                ctr_started=$(grep '^STARTED=' "$cdir/container.meta" 2>/dev/null | cut -d= -f2-)
+                status=$(vxn_container_status "$name")
+                printf "%-15s %-25s %-15s %-20s\n" "$name" "${ctr_image:-unknown}" "$status" "${ctr_started:-unknown}"
+            done
+            exit 0
+        fi
+
         # List containers and show port forwards if daemon is running
         run_runtime_command "$VCONTAINER_RUNTIME_CMD ps ${COMMAND_ARGS[*]}"
         PS_EXIT=$?
@@ -1719,6 +1816,24 @@ case "$COMMAND" in
         ;;
 
     rm)
+        # Xen: remove per-container DomU state
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            for arg in "${COMMAND_ARGS[@]}"; do
+                case "$arg" in -*) continue ;; esac
+                cdir="$(vxn_container_dir "$arg")"
+                if [ -d "$cdir" ]; then
+                    # Stop if still running
+                    if vxn_container_is_running "$arg"; then
+                        RUNNER_ARGS=$(build_runner_args)
+                        "$RUNNER" $RUNNER_ARGS --daemon-socket-dir "$cdir" --state-dir "$cdir" --daemon-stop 2>/dev/null
+                    fi
+                    rm -rf "$cdir"
+                    echo "$arg"
+                fi
+            done
+            exit 0
+        fi
+
         # Remove containers and cleanup any registered port forwards
         for arg in "${COMMAND_ARGS[@]}"; do
             # Skip flags like -f, --force, etc.
@@ -1734,21 +1849,51 @@ case "$COMMAND" in
         ;;
 
     logs)
+        # Xen: retrieve entrypoint log from DomU
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} logs requires <container>" >&2
+                exit 1
+            fi
+            cname="${COMMAND_ARGS[0]}"
+            cdir="$(vxn_container_dir "$cname")"
+            if [ -d "$cdir" ] && vxn_container_is_running "$cname"; then
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-socket-dir "$cdir" --state-dir "$cdir" --daemon-send -- "cat /tmp/entrypoint.log 2>/dev/null"
+                exit $?
+            fi
+            echo "Container $cname not running" >&2
+            exit 1
+        fi
+
         # View container logs
         run_runtime_command "$VCONTAINER_RUNTIME_CMD logs ${COMMAND_ARGS[*]}"
         ;;
 
     inspect)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "inspect"
         # Inspect container or image
         run_runtime_command "$VCONTAINER_RUNTIME_CMD inspect ${COMMAND_ARGS[*]}"
         ;;
 
     start|restart|kill|pause|unpause)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "$COMMAND"
         # Container state commands (no special handling needed)
         run_runtime_command "$VCONTAINER_RUNTIME_CMD $COMMAND ${COMMAND_ARGS[*]}"
         ;;
 
     stop)
+        # Xen: stop per-container DomU
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && [ -n "${COMMAND_ARGS[0]:-}" ]; then
+            cname="${COMMAND_ARGS[0]}"
+            cdir="$(vxn_container_dir "$cname")"
+            if [ -d "$cdir" ]; then
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-socket-dir "$cdir" --state-dir "$cdir" --daemon-stop
+                exit $?
+            fi
+        fi
+
         # Stop container and cleanup any registered port forwards
         if [ ${#COMMAND_ARGS[@]} -ge 1 ]; then
             STOP_CONTAINER_NAME="${COMMAND_ARGS[0]}"
@@ -1762,33 +1907,39 @@ case "$COMMAND" in
 
     # Image commands
     commit)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "commit"
         # Commit container to image
         run_runtime_command "$VCONTAINER_RUNTIME_CMD commit ${COMMAND_ARGS[*]}"
         ;;
 
     history)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "history"
         # Show image history
         run_runtime_command "$VCONTAINER_RUNTIME_CMD history ${COMMAND_ARGS[*]}"
         ;;
 
     # Registry commands
     push)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "push"
         # Push image to registry
         run_runtime_command "$VCONTAINER_RUNTIME_CMD push ${COMMAND_ARGS[*]}"
         ;;
 
     search)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "search"
         # Search registries
         run_runtime_command "$VCONTAINER_RUNTIME_CMD search ${COMMAND_ARGS[*]}"
         ;;
 
     login)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "login"
         # Login to registry - may need credentials via stdin
         # For non-interactive: runtime login -u user -p pass registry
         run_runtime_command "$VCONTAINER_RUNTIME_CMD login ${COMMAND_ARGS[*]}"
         ;;
 
     logout)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "logout"
         # Logout from registry
         run_runtime_command "$VCONTAINER_RUNTIME_CMD logout ${COMMAND_ARGS[*]}"
         ;;
@@ -1797,6 +1948,21 @@ case "$COMMAND" in
     exec)
         if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} exec requires <container> <command>" >&2
+            exit 1
+        fi
+
+        # Xen: exec in per-container DomU
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            cname="${COMMAND_ARGS[0]}"
+            cdir="$(vxn_container_dir "$cname")"
+            if [ -d "$cdir" ] && vxn_container_is_running "$cname"; then
+                shift_args=("${COMMAND_ARGS[@]:1}")
+                exec_cmd="${shift_args[*]}"
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-socket-dir "$cdir" --state-dir "$cdir" --daemon-send -- "$exec_cmd"
+                exit $?
+            fi
+            echo "Container $cname not running" >&2
             exit 1
         fi
 
@@ -1839,6 +2005,7 @@ case "$COMMAND" in
 
     # VM shell - interactive shell into the VM itself (not a container)
     vshell)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "vshell"
         # Opens a shell directly in the vdkr/vpdmn VM for debugging
         # This runs /bin/sh in the VM, not inside a container
         # Useful for:
@@ -1858,6 +2025,7 @@ case "$COMMAND" in
 
     # Runtime cp - copy files to/from container
     cp)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "cp"
         if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} cp requires <src> <dest>" >&2
             echo "Usage: $VCONTAINER_RUNTIME_NAME cp <container>:<path> <local_path>" >&2
@@ -2025,14 +2193,17 @@ case "$COMMAND" in
         ;;
 
     info)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "info"
         run_runtime_command "$VCONTAINER_RUNTIME_CMD info"
         ;;
 
     version)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "version"
         run_runtime_command "$VCONTAINER_RUNTIME_CMD version"
         ;;
 
     system)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "system"
         # Passthrough to runtime system commands (df, prune, events, etc.)
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} system requires a subcommand: df, prune, events, info" >&2
@@ -2181,6 +2352,7 @@ case "$COMMAND" in
         ;;
 
     vrun)
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "vrun"
         # Extended run: run a command in a container (runtime-like syntax)
         # Usage: <tool> vrun [options] <image> [command] [args...]
         # Options:
@@ -2389,6 +2561,13 @@ case "$COMMAND" in
             exit 1
         fi
 
+        # vxn (Xen): ephemeral mode by default.
+        # Detached mode (-d) uses per-container DomU with daemon loop instead.
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            # Detached flag is parsed below; defer NO_DAEMON until after flag parsing
+            :
+        fi
+
         # Check if any volume mounts, network, port forwards, or detach are present
         RUN_HAS_VOLUMES=false
         RUN_HAS_NETWORK=false
@@ -2431,6 +2610,15 @@ case "$COMMAND" in
             i=$((i + 1))
         done
 
+        # Xen: non-detached runs use ephemeral mode unless memres is running
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && [ "$RUN_IS_DETACHED" != "true" ]; then
+            if daemon_is_running; then
+                NO_DAEMON=false
+            else
+                NO_DAEMON=true
+            fi
+        fi
+
         # Volume mounts require daemon mode
         if [ "$RUN_HAS_VOLUMES" = "true" ] && ! daemon_is_running; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Volume mounts require daemon mode. Start with: $VCONTAINER_RUNTIME_NAME memres start" >&2
@@ -2469,7 +2657,7 @@ case "$COMMAND" in
         if [ "$INTERACTIVE" = "true" ]; then
             # Interactive mode with volumes still needs to stop daemon (volumes use share dir)
             # Interactive mode without volumes can use daemon_interactive (faster)
-            if [ "$RUN_HAS_VOLUMES" = "false" ] && daemon_is_running; then
+            if [ "$NO_DAEMON" != "true" ] && [ "$RUN_HAS_VOLUMES" = "false" ] && daemon_is_running; then
                 # Use daemon interactive mode - keeps daemon running
                 [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon interactive mode" >&2
                 RUNNER_ARGS=$(build_runner_args)
@@ -2504,6 +2692,66 @@ case "$COMMAND" in
             fi
         else
             # Non-interactive - use daemon mode when available
+
+            # Xen detached mode: per-container DomU with daemon loop
+            if [ "$RUN_IS_DETACHED" = "true" ] && [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+                # Generate name if not provided
+                [ -z "$RUN_CONTAINER_NAME" ] && RUN_CONTAINER_NAME="$(cat /proc/sys/kernel/random/uuid | cut -c1-8)"
+
+                # Per-container state dir
+                VXN_CTR_DIR="$HOME/.vxn/containers/$RUN_CONTAINER_NAME"
+                mkdir -p "$VXN_CTR_DIR"
+
+                # Build runner args with per-container state/socket dir
+                RUNNER_ARGS=$(build_runner_args)
+                RUNNER_ARGS="$RUNNER_ARGS --daemon-socket-dir $VXN_CTR_DIR --state-dir $VXN_CTR_DIR"
+                RUNNER_ARGS="$RUNNER_ARGS --container-name $RUN_CONTAINER_NAME"
+
+                # Start per-container DomU (daemon mode + initial command)
+                "$RUNNER" $RUNNER_ARGS --daemon-start -- "$RUNTIME_CMD"
+
+                if [ $? -eq 0 ]; then
+                    # Save metadata — extract image name (last positional arg before any cmd)
+                    local_image=""
+                    local_found_image=false
+                    local_skip_next=false
+                    for arg in "${COMMAND_ARGS[@]}"; do
+                        if [ "$local_skip_next" = "true" ]; then
+                            local_skip_next=false
+                            continue
+                        fi
+                        case "$arg" in
+                            --rm|--detach|-d|-i|--interactive|-t|--tty|--privileged|-it) ;;
+                            -p|--publish|-v|--volume|-e|--env|--name|--network|-w|--workdir|--entrypoint|-m|--memory|--cpus)
+                                local_skip_next=true ;;
+                            --publish=*|--volume=*|--env=*|--name=*|--network=*|--workdir=*|--entrypoint=*|--memory=*|--cpus=*) ;;
+                            -*)  ;;
+                            *)
+                                if [ "$local_found_image" = "false" ]; then
+                                    local_image="$arg"
+                                    local_found_image=true
+                                fi
+                                ;;
+                        esac
+                    done
+                    echo "IMAGE=${local_image}" > "$VXN_CTR_DIR/container.meta"
+                    echo "COMMAND=$RUNTIME_CMD" >> "$VXN_CTR_DIR/container.meta"
+                    echo "STARTED=$(date -Iseconds)" >> "$VXN_CTR_DIR/container.meta"
+                    echo "$RUN_CONTAINER_NAME"
+                else
+                    rm -rf "$VXN_CTR_DIR"
+                    exit 1
+                fi
+                exit 0
+            fi
+
+            # Xen memres mode: dispatch container to persistent DomU
+            if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && [ "$NO_DAEMON" != "true" ] && daemon_is_running; then
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using memres DomU" >&2
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-run -- "$RUNTIME_CMD"
+                exit $?
+            fi
 
             # For detached containers with port forwards, add them dynamically via QMP
             if [ "$RUN_IS_DETACHED" = "true" ] && [ "$RUN_HAS_PORT_FORWARDS" = "true" ] && daemon_is_running; then
@@ -2676,71 +2924,144 @@ case "$COMMAND" in
                 echo ""
                 found=0
                 tracked_pids=""
-                for pid_file in "$DEFAULT_STATE_DIR"/*/daemon.pid; do
-                    [ -f "$pid_file" ] || continue
-                    pid=$(cat "$pid_file" 2>/dev/null)
-                    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
-                        instance_dir=$(dirname "$pid_file")
-                        instance_name=$(basename "$instance_dir")
-                        echo "  ${CYAN}$instance_name${NC}"
-                        echo "    PID: $pid"
-                        echo "    State: $instance_dir"
-                        if [ -f "$instance_dir/qemu.log" ]; then
-                            # Try to extract port forwards from qemu command line
-                            ports=$(grep -o 'hostfwd=[^,]*' "$instance_dir/qemu.log" 2>/dev/null | sed 's/hostfwd=tcp:://g; s/-/:/' | tr '\n' ' ')
-                            [ -n "$ports" ] && echo "    Ports: $ports"
-                        fi
-                        echo ""
-                        found=$((found + 1))
-                        tracked_pids="$tracked_pids $pid"
-                    fi
-                done
-                if [ $found -eq 0 ]; then
-                    echo "  (none)"
-                fi
 
-                # Check for zombie/orphan QEMU processes (vdkr or vpdmn)
-                echo ""
-                echo "Checking for orphan QEMU processes..."
-                zombies=""
-                for qemu_pid in $(pgrep -f "qemu-system.*runtime=(docker|podman)" 2>/dev/null || true); do
-                    # Skip if this PID is already tracked
-                    if echo "$tracked_pids" | grep -qw "$qemu_pid"; then
-                        continue
-                    fi
-                    # Also check other tool's state dirs
-                    other_tracked=false
-                    for vpid_file in "$OTHER_STATE_DIR"/*/daemon.pid; do
-                        [ -f "$vpid_file" ] || continue
-                        vpid=$(cat "$vpid_file" 2>/dev/null)
-                        if [ "$vpid" = "$qemu_pid" ]; then
-                            other_tracked=true
-                            break
+                # Xen: check for vxn domains via xl list
+                if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+                    for domname_file in "$DEFAULT_STATE_DIR"/*/daemon.domname; do
+                        [ -f "$domname_file" ] || continue
+                        domname=$(cat "$domname_file" 2>/dev/null)
+                        if [ -n "$domname" ] && xl list "$domname" >/dev/null 2>&1; then
+                            instance_dir=$(dirname "$domname_file")
+                            instance_name=$(basename "$instance_dir")
+                            echo "  ${CYAN}$instance_name${NC}"
+                            echo "    Domain: $domname"
+                            echo "    State: $instance_dir"
+                            if [ -f "$instance_dir/daemon.pty" ]; then
+                                echo "    PTY: $(cat "$instance_dir/daemon.pty")"
+                            fi
+                            echo ""
+                            found=$((found + 1))
                         fi
                     done
-                    if [ "$other_tracked" = "true" ]; then
-                        continue
-                    fi
-                    zombies="$zombies $qemu_pid"
-                done
 
-                if [ -n "$zombies" ]; then
+                    # Also check per-container DomUs
+                    if [ -d "$HOME/.vxn/containers" ]; then
+                        for meta_file in "$HOME/.vxn/containers"/*/container.meta; do
+                            [ -f "$meta_file" ] || continue
+                            ctr_dir=$(dirname "$meta_file")
+                            ctr_name=$(basename "$ctr_dir")
+                            if vxn_container_is_running "$ctr_name"; then
+                                image=$(grep '^IMAGE=' "$meta_file" 2>/dev/null | cut -d= -f2)
+                                started=$(grep '^STARTED=' "$meta_file" 2>/dev/null | cut -d= -f2)
+                                echo "  ${CYAN}$ctr_name${NC} (per-container DomU)"
+                                echo "    Image: ${image:-(unknown)}"
+                                echo "    Started: ${started:-(unknown)}"
+                                echo "    State: $ctr_dir"
+                                echo ""
+                                found=$((found + 1))
+                            fi
+                        done
+                    fi
+
+                    if [ $found -eq 0 ]; then
+                        echo "  (none)"
+                    fi
+
+                    # Check for orphan vxn domains
                     echo ""
-                    echo -e "${YELLOW}Orphan QEMU processes found:${NC}"
-                    for zpid in $zombies; do
-                        # Extract runtime from cmdline
-                        cmdline=$(cat /proc/$zpid/cmdline 2>/dev/null | tr '\0' ' ')
-                        runtime=$(echo "$cmdline" | grep -o 'runtime=[a-z]*' | cut -d= -f2)
-                        state_dir=$(echo "$cmdline" | grep -o 'path=[^,]*daemon.sock' | sed 's|path=||; s|/daemon.sock||')
-                        echo ""
-                        echo "  ${RED}PID $zpid${NC} (${runtime:-unknown})"
-                        [ -n "$state_dir" ] && echo "    State: $state_dir"
-                        echo "    Kill with: kill $zpid"
+                    echo "Checking for orphan Xen domains..."
+                    orphans=""
+                    for domname in $(xl list 2>/dev/null | awk '/^vxn-/{print $1}'); do
+                        tracked=false
+                        for df in "$DEFAULT_STATE_DIR"/*/daemon.domname "$HOME"/.vxn/containers/*/daemon.domname; do
+                            [ -f "$df" ] || continue
+                            if [ "$(cat "$df" 2>/dev/null)" = "$domname" ]; then
+                                tracked=true
+                                break
+                            fi
+                        done
+                        if [ "$tracked" != "true" ]; then
+                            orphans="$orphans $domname"
+                        fi
                     done
-                    echo ""
-                    echo -e "To kill all orphans: ${CYAN}kill$zombies${NC}"
+
+                    if [ -n "$orphans" ]; then
+                        echo -e "${YELLOW}Orphan vxn domains found:${NC}"
+                        for odom in $orphans; do
+                            echo "  ${RED}$odom${NC}"
+                            echo "    Destroy with: xl destroy $odom"
+                        done
+                    else
+                        echo "  (no orphans found)"
+                    fi
                 else
-                    echo "  (no orphans found)"
+                    # QEMU: check PID files
+                    for pid_file in "$DEFAULT_STATE_DIR"/*/daemon.pid; do
+                        [ -f "$pid_file" ] || continue
+                        pid=$(cat "$pid_file" 2>/dev/null)
+                        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+                            instance_dir=$(dirname "$pid_file")
+                            instance_name=$(basename "$instance_dir")
+                            echo "  ${CYAN}$instance_name${NC}"
+                            echo "    PID: $pid"
+                            echo "    State: $instance_dir"
+                            if [ -f "$instance_dir/qemu.log" ]; then
+                                # Try to extract port forwards from qemu command line
+                                ports=$(grep -o 'hostfwd=[^,]*' "$instance_dir/qemu.log" 2>/dev/null | sed 's/hostfwd=tcp:://g; s/-/:/' | tr '\n' ' ')
+                                [ -n "$ports" ] && echo "    Ports: $ports"
+                            fi
+                            echo ""
+                            found=$((found + 1))
+                            tracked_pids="$tracked_pids $pid"
+                        fi
+                    done
+                    if [ $found -eq 0 ]; then
+                        echo "  (none)"
+                    fi
+
+                    # Check for zombie/orphan QEMU processes (vdkr or vpdmn)
+                    echo ""
+                    echo "Checking for orphan QEMU processes..."
+                    zombies=""
+                    for qemu_pid in $(pgrep -f "qemu-system.*runtime=(docker|podman)" 2>/dev/null || true); do
+                        # Skip if this PID is already tracked
+                        if echo "$tracked_pids" | grep -qw "$qemu_pid"; then
+                            continue
+                        fi
+                        # Also check other tool's state dirs
+                        other_tracked=false
+                        for vpid_file in "$OTHER_STATE_DIR"/*/daemon.pid; do
+                            [ -f "$vpid_file" ] || continue
+                            vpid=$(cat "$vpid_file" 2>/dev/null)
+                            if [ "$vpid" = "$qemu_pid" ]; then
+                                other_tracked=true
+                                break
+                            fi
+                        done
+                        if [ "$other_tracked" = "true" ]; then
+                            continue
+                        fi
+                        zombies="$zombies $qemu_pid"
+                    done
+
+                    if [ -n "$zombies" ]; then
+                        echo ""
+                        echo -e "${YELLOW}Orphan QEMU processes found:${NC}"
+                        for zpid in $zombies; do
+                            # Extract runtime from cmdline
+                            cmdline=$(cat /proc/$zpid/cmdline 2>/dev/null | tr '\0' ' ')
+                            runtime=$(echo "$cmdline" | grep -o 'runtime=[a-z]*' | cut -d= -f2)
+                            state_dir=$(echo "$cmdline" | grep -o 'path=[^,]*daemon.sock' | sed 's|path=||; s|/daemon.sock||')
+                            echo ""
+                            echo "  ${RED}PID $zpid${NC} (${runtime:-unknown})"
+                            [ -n "$state_dir" ] && echo "    State: $state_dir"
+                            echo "    Kill with: kill $zpid"
+                        done
+                        echo ""
+                        echo -e "To kill all orphans: ${CYAN}kill$zombies${NC}"
+                    else
+                        echo "  (no orphans found)"
+                    fi
                 fi
                 ;;
             clean-ports)

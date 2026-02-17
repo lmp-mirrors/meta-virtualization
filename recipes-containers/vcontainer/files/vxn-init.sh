@@ -22,9 +22,10 @@
 #   docker_output=<type>   Output type: text (default: text)
 #   docker_network=1       Enable networking
 #   docker_interactive=1   Interactive mode (suppress boot messages)
-#   docker_daemon=1        Daemon mode (command loop on hvc1)
+#   docker_daemon=1        Daemon mode (command loop on hvc0 via serial PTY)
+#   docker_exit_grace=<s>  Grace period (seconds) after entrypoint exits [default: 300]
 #
-# Version: 1.0.0
+# Version: 1.2.0
 
 # Set runtime-specific parameters before sourcing common code
 VCONTAINER_RUNTIME_NAME="vxn"
@@ -32,7 +33,7 @@ VCONTAINER_RUNTIME_CMD="chroot"
 VCONTAINER_RUNTIME_PREFIX="docker"
 VCONTAINER_STATE_DIR="/var/lib/vxn"
 VCONTAINER_SHARE_NAME="vxn_share"
-VCONTAINER_VERSION="1.0.0"
+VCONTAINER_VERSION="1.2.0"
 
 # Source common init functions
 . /vcontainer-init-common.sh
@@ -344,7 +345,7 @@ exec_in_container() {
         export TERM=linux
         printf '\r\033[K'
         if [ "$use_sh" = "true" ]; then
-            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd"
+            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd"
         else
             chroot "$rootfs" $cmd
         fi
@@ -354,7 +355,7 @@ exec_in_container() {
         EXEC_OUTPUT="/tmp/container_output.txt"
         EXEC_EXIT_CODE=0
         if [ "$use_sh" = "true" ]; then
-            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd" \
+            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd" \
                 > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
         else
             chroot "$rootfs" $cmd \
@@ -375,38 +376,158 @@ exec_in_container() {
     umount "$rootfs/dev" 2>/dev/null || true
 }
 
+# Execute a command inside the container rootfs in the background.
+# Used by detached mode: start entrypoint, then enter daemon loop.
+exec_in_container_background() {
+    local rootfs="$1"
+    local cmd="$2"
+    local workdir="${OCI_WORKDIR:-/}"
+
+    # Mount essential filesystems inside the container rootfs
+    mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" "$rootfs/tmp" 2>/dev/null || true
+    mount -t proc proc "$rootfs/proc" 2>/dev/null || true
+    mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+    mount --bind /dev "$rootfs/dev" 2>/dev/null || true
+
+    # Copy resolv.conf for DNS
+    if [ -f /etc/resolv.conf ]; then
+        mkdir -p "$rootfs/etc" 2>/dev/null || true
+        cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+    fi
+
+    # Run in background, save PID
+    # Note: no 'exec' — compound commands (&&, ||, ;) need the wrapper shell
+    chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd" > /tmp/entrypoint.log 2>&1 &
+    ENTRYPOINT_PID=$!
+    echo "$ENTRYPOINT_PID" > /tmp/entrypoint.pid
+    log "Entrypoint PID: $ENTRYPOINT_PID"
+}
+
+# ============================================================================
+# Memres: Run Container from Hot-Plugged Disk
+# ============================================================================
+
+# Run a container from a hot-plugged /dev/xvdb block device.
+# Called by the daemon loop in response to ===RUN_CONTAINER=== command.
+# Mounts the device, finds rootfs, executes entrypoint, unmounts.
+# Output follows the daemon command protocol (===OUTPUT_START/END/EXIT_CODE/END===).
+run_container_from_disk() {
+    local user_cmd="$1"
+
+    # Wait for hot-plugged block device
+    log "Waiting for input device..."
+    local found=false
+    for i in $(seq 1 30); do
+        if [ -b /dev/xvdb ]; then
+            found=true
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$found" != "true" ]; then
+        echo "===ERROR==="
+        echo "Input device /dev/xvdb not found after 15s"
+        echo "===END==="
+        return
+    fi
+
+    # Mount input disk
+    mkdir -p /mnt/input
+    if ! mount /dev/xvdb /mnt/input 2>/dev/null; then
+        echo "===ERROR==="
+        echo "Failed to mount /dev/xvdb"
+        echo "===END==="
+        return
+    fi
+    log "Input disk mounted"
+
+    # Find container rootfs
+    if ! find_container_rootfs; then
+        echo "===ERROR==="
+        echo "No container rootfs found on input disk"
+        echo "===END==="
+        umount /mnt/input 2>/dev/null || true
+        return
+    fi
+
+    # Parse OCI config for entrypoint/env/workdir
+    parse_oci_config
+    setup_container_env
+
+    # Determine command: user-supplied takes priority, then OCI config
+    if [ -n "$user_cmd" ]; then
+        RUNTIME_CMD="$user_cmd"
+    else
+        RUNTIME_CMD=""
+    fi
+    local exec_cmd
+    exec_cmd=$(determine_exec_command)
+
+    log "Executing container: $exec_cmd"
+
+    # Execute in container rootfs (blocking)
+    local rootfs="$CONTAINER_ROOT"
+    local workdir="${OCI_WORKDIR:-/}"
+    local exit_code=0
+
+    # Mount essential filesystems inside container
+    mkdir -p "$rootfs/proc" "$rootfs/sys" "$rootfs/dev" "$rootfs/tmp" 2>/dev/null || true
+    mount -t proc proc "$rootfs/proc" 2>/dev/null || true
+    mount -t sysfs sysfs "$rootfs/sys" 2>/dev/null || true
+    mount --bind /dev "$rootfs/dev" 2>/dev/null || true
+    [ -f /etc/resolv.conf ] && {
+        mkdir -p "$rootfs/etc" 2>/dev/null || true
+        cp /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+    }
+
+    local output_file="/tmp/container_run_output.txt"
+    if [ -x "$rootfs/bin/sh" ]; then
+        chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $exec_cmd" \
+            > "$output_file" 2>&1 || exit_code=$?
+    else
+        chroot "$rootfs" $exec_cmd \
+            > "$output_file" 2>&1 || exit_code=$?
+    fi
+
+    echo "===OUTPUT_START==="
+    cat "$output_file"
+    echo "===OUTPUT_END==="
+    echo "===EXIT_CODE=$exit_code==="
+
+    # Clean up container mounts
+    umount "$rootfs/proc" 2>/dev/null || true
+    umount "$rootfs/sys" 2>/dev/null || true
+    umount "$rootfs/dev" 2>/dev/null || true
+    umount /mnt/input 2>/dev/null || true
+    rm -f "$output_file"
+
+    # Reset container state for next run
+    CONTAINER_ROOT=""
+    OCI_ENTRYPOINT=""
+    OCI_CMD=""
+    OCI_ENV=""
+    OCI_WORKDIR=""
+    RUNTIME_CMD=""
+    # Clean up extracted OCI rootfs (if any)
+    rm -rf /mnt/container 2>/dev/null || true
+
+    echo "===END==="
+    log "Container finished (exit code: $exit_code)"
+}
+
 # ============================================================================
 # Daemon Mode (vxn-specific)
 # ============================================================================
 
-# In daemon mode, commands come via the hvc1 console channel
-# and are executed in the container rootfs via chroot.
+# Daemon mode: command loop on hvc0 (stdin/stdout).
+# The host bridges the domain's console PTY to a Unix socket via socat.
+# Commands arrive as base64-encoded lines on stdin, responses go to stdout.
+# This is the same model runx used (serial='pty' + serial_start).
 run_vxn_daemon_mode() {
     log "=== vxn Daemon Mode ==="
     log "Container rootfs: ${CONTAINER_ROOT:-(none)}"
     log "Idle timeout: ${RUNTIME_IDLE_TIMEOUT}s"
-
-    # Find the command channel (prefer hvc1 for Xen)
-    DAEMON_PORT=""
-    for port in /dev/hvc1 /dev/vport0p1 /dev/vport1p1 /dev/virtio-ports/vxn; do
-        if [ -c "$port" ]; then
-            DAEMON_PORT="$port"
-            log "Found command channel: $port"
-            break
-        fi
-    done
-
-    if [ -z "$DAEMON_PORT" ]; then
-        log "ERROR: No command channel for daemon mode"
-        ls -la /dev/hvc* /dev/vport* /dev/virtio-ports/ 2>/dev/null || true
-        sleep 5
-        reboot -f
-    fi
-
-    # Open bidirectional FD
-    exec 3<>"$DAEMON_PORT"
-
-    log "Daemon ready, waiting for commands..."
 
     ACTIVITY_FILE="/tmp/.daemon_activity"
     touch "$ACTIVITY_FILE"
@@ -415,10 +536,17 @@ run_vxn_daemon_mode() {
     trap 'log "Shutdown signal"; sync; reboot -f' TERM
     trap 'rm -f "$ACTIVITY_FILE"; exit' INT
 
-    # Command loop
+    log "Using hvc0 console for daemon IPC"
+    log "Daemon ready, waiting for commands..."
+
+    # Emit readiness marker so the host can detect daemon is ready
+    # without needing to send PING first (host reads PTY for this)
+    echo "===PONG==="
+
+    # Command loop: read from stdin (hvc0), write to stdout (hvc0)
     while true; do
         CMD_B64=""
-        read -r CMD_B64 <&3
+        read -r CMD_B64
         READ_EXIT=$?
 
         if [ $READ_EXIT -eq 0 ] && [ -n "$CMD_B64" ]; then
@@ -426,20 +554,41 @@ run_vxn_daemon_mode() {
 
             case "$CMD_B64" in
                 "===PING===")
-                    echo "===PONG===" | cat >&3
+                    echo "===PONG==="
+                    continue
+                    ;;
+                "===STATUS===")
+                    if [ -f /tmp/entrypoint.exit_code ]; then
+                        echo "===EXITED=$(cat /tmp/entrypoint.exit_code)==="
+                    else
+                        echo "===RUNNING==="
+                    fi
                     continue
                     ;;
                 "===SHUTDOWN===")
                     log "Received shutdown command"
-                    echo "===SHUTTING_DOWN===" | cat >&3
+                    echo "===SHUTTING_DOWN==="
                     break
+                    ;;
+                "===RUN_CONTAINER==="*)
+                    # Memres: run a container from a hot-plugged disk
+                    _rc_cmd_b64="${CMD_B64#===RUN_CONTAINER===}"
+                    _rc_cmd=""
+                    if [ -n "$_rc_cmd_b64" ]; then
+                        _rc_cmd=$(echo "$_rc_cmd_b64" | base64 -d 2>/dev/null)
+                    fi
+                    log "RUN_CONTAINER: cmd='$_rc_cmd'"
+                    run_container_from_disk "$_rc_cmd"
+                    continue
                     ;;
             esac
 
             # Decode command
             CMD=$(echo "$CMD_B64" | base64 -d 2>/dev/null)
             if [ -z "$CMD" ]; then
-                printf "===ERROR===\nFailed to decode command\n===END===\n" | cat >&3
+                echo "===ERROR==="
+                echo "Failed to decode command"
+                echo "===END==="
                 continue
             fi
 
@@ -455,13 +604,11 @@ run_vxn_daemon_mode() {
                 eval "$CMD" > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
             fi
 
-            {
-                echo "===OUTPUT_START==="
-                cat "$EXEC_OUTPUT"
-                echo "===OUTPUT_END==="
-                echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
-                echo "===END==="
-            } | cat >&3
+            echo "===OUTPUT_START==="
+            cat "$EXEC_OUTPUT"
+            echo "===OUTPUT_END==="
+            echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
+            echo "===END==="
 
             log "Command completed (exit code: $EXEC_EXIT_CODE)"
         else
@@ -469,7 +616,6 @@ run_vxn_daemon_mode() {
         fi
     done
 
-    exec 3>&-
     log "Daemon shutting down..."
 }
 
@@ -493,6 +639,15 @@ setup_cgroups
 
 # Parse kernel command line
 parse_cmdline
+
+# Parse vxn-specific kernel parameters
+ENTRYPOINT_GRACE_PERIOD="300"
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        docker_exit_grace=*) ENTRYPOINT_GRACE_PERIOD="${param#docker_exit_grace=}" ;;
+    esac
+done
+log "Entrypoint grace period: ${ENTRYPOINT_GRACE_PERIOD}s"
 
 # Detect and configure disks
 detect_disks
@@ -525,6 +680,33 @@ parse_oci_config
 setup_container_env
 
 if [ "$RUNTIME_DAEMON" = "1" ]; then
+    # If we also have a command, run it in background first (detached container)
+    if [ -n "$RUNTIME_CMD" ] && [ "$RUNTIME_CMD" != "1" ]; then
+        EXEC_CMD=$(determine_exec_command)
+        if [ -n "$EXEC_CMD" ] && [ -n "$CONTAINER_ROOT" ]; then
+            log "Starting entrypoint in background: $EXEC_CMD"
+            exec_in_container_background "$CONTAINER_ROOT" "$EXEC_CMD"
+
+            # Monitor entrypoint: when it exits, record exit code and
+            # schedule DomU shutdown after grace period.
+            # During the grace period, exec and logs still work.
+            if [ -n "$ENTRYPOINT_PID" ]; then
+                (
+                    wait $ENTRYPOINT_PID 2>/dev/null
+                    EP_EXIT=$?
+                    echo "$EP_EXIT" > /tmp/entrypoint.exit_code
+                    log "Entrypoint exited (code: $EP_EXIT), grace period: ${ENTRYPOINT_GRACE_PERIOD}s"
+                    if [ "$ENTRYPOINT_GRACE_PERIOD" -gt 0 ] 2>/dev/null; then
+                        sleep "$ENTRYPOINT_GRACE_PERIOD"
+                    fi
+                    log "Grace period expired, shutting down"
+                    reboot -f
+                ) &
+                ENTRYPOINT_MONITOR_PID=$!
+                log "Entrypoint monitor started (PID: $ENTRYPOINT_MONITOR_PID)"
+            fi
+        fi
+    fi
     run_vxn_daemon_mode
 else
     # Determine command to execute

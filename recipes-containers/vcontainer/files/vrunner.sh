@@ -323,6 +323,7 @@ BATCH_IMPORT="false"
 DAEMON_MODE=""          # start, send, stop, status
 DAEMON_SOCKET_DIR=""    # Directory for daemon socket/PID files
 IDLE_TIMEOUT="1800"     # Default: 30 minutes
+EXIT_GRACE_PERIOD=""    # Entrypoint exit grace period (vxn)
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -443,6 +444,10 @@ while [ $# -gt 0 ]; do
             DAEMON_MODE="interactive"
             shift
             ;;
+        --daemon-run)
+            DAEMON_MODE="run"
+            shift
+            ;;
         --daemon-stop)
             DAEMON_MODE="stop"
             shift
@@ -459,10 +464,19 @@ while [ $# -gt 0 ]; do
             IDLE_TIMEOUT="$2"
             shift 2
             ;;
+        --container-name)
+            CONTAINER_NAME="$2"
+            export CONTAINER_NAME
+            shift 2
+            ;;
         --no-daemon)
             # Placeholder for CLI wrapper - vrunner.sh itself doesn't use this
             # but we accept it so callers can pass it through
             shift
+            ;;
+        --exit-grace-period)
+            EXIT_GRACE_PERIOD="$2"
+            shift 2
             ;;
         --verbose|-v)
             VERBOSE="true"
@@ -597,6 +611,12 @@ daemon_send() {
         exit 1
     fi
 
+    # Use backend-specific send if available (e.g. Xen PTY-based IPC)
+    if type hv_daemon_send >/dev/null 2>&1; then
+        hv_daemon_send "$cmd"
+        return $?
+    fi
+
     if [ ! -S "$DAEMON_SOCKET" ]; then
         log "ERROR" "Daemon socket not found: $DAEMON_SOCKET"
         exit 1
@@ -701,6 +721,14 @@ daemon_interactive() {
 
     if ! daemon_is_running; then
         log "ERROR" "Daemon is not running"
+        return 1
+    fi
+
+    # PTY-based backends don't support interactive daemon mode
+    # (file-descriptor polling isn't practical for interactive I/O)
+    if type hv_daemon_send >/dev/null 2>&1; then
+        log "ERROR" "Interactive daemon mode not supported with ${VCONTAINER_HYPERVISOR} backend"
+        log "ERROR" "Use: ${TOOL_NAME} -it --no-daemon run ... for interactive mode"
         return 1
     fi
 
@@ -1032,6 +1060,25 @@ if [ -n "$INPUT_PATH" ] && [ "$INPUT_TYPE" != "none" ]; then
     log "DEBUG" "Input disk: $(ls -lh "$INPUT_IMG" | awk '{print $5}')"
 fi
 
+# Daemon run mode: try to use memres DomU, fall back to ephemeral
+# This runs after input disk creation so we have the container disk ready
+if [ "$DAEMON_MODE" = "run" ]; then
+    if type hv_daemon_ping >/dev/null 2>&1 && hv_daemon_ping; then
+        # Memres DomU is responsive — use it
+        log "INFO" "Memres DomU is idle, dispatching container..."
+        INPUT_IMG_PATH=""
+        if [ -n "$DISK_OPTS" ]; then
+            INPUT_IMG_PATH=$(echo "$DISK_OPTS" | sed -n 's/.*file=\([^,]*\).*/\1/p')
+        fi
+        hv_daemon_run_container "$DOCKER_CMD" "$INPUT_IMG_PATH"
+        exit $?
+    else
+        # Memres DomU is occupied or not responding — fall through to ephemeral
+        log "INFO" "Memres occupied or not responding, using ephemeral mode"
+        DAEMON_MODE=""
+    fi
+fi
+
 # Create state disk for persistent storage (--state-dir)
 # Xen backend skips this: DomU Docker storage lives in the guest's overlay
 # filesystem and persists as long as the domain is running (daemon mode).
@@ -1175,6 +1222,11 @@ if [ "$INTERACTIVE" = "true" ]; then
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_interactive=1"
 fi
 
+# Exit grace period for entrypoint death detection (vxn)
+if [ -n "${EXIT_GRACE_PERIOD:-}" ]; then
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_exit_grace=$EXIT_GRACE_PERIOD"
+fi
+
 # Build VM configuration via hypervisor backend
 # Drive ordering is important:
 #   rootfs.img (read-only), input disk (if any), state disk (if any)
@@ -1187,15 +1239,15 @@ if [ "$BATCH_IMPORT" = "true" ]; then
     BATCH_SHARE_DIR="$TEMP_DIR/share"
     mkdir -p "$BATCH_SHARE_DIR"
     SHARE_TAG="${TOOL_NAME}_share"
-    HV_OPTS="$HV_OPTS $(hv_build_9p_opts "$BATCH_SHARE_DIR" "$SHARE_TAG")"
+    hv_build_9p_opts "$BATCH_SHARE_DIR" "$SHARE_TAG"
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
     log "INFO" "Using 9p for fast storage output"
 fi
 
 # Daemon mode: add serial channel for command I/O
 if [ "$DAEMON_MODE" = "start" ]; then
-    # Check for required tools
-    if ! command -v socat >/dev/null 2>&1; then
+    # Check for required tools (socat needed unless backend provides PTY-based IPC)
+    if ! type hv_daemon_send >/dev/null 2>&1 && ! command -v socat >/dev/null 2>&1; then
         log "ERROR" "Daemon mode requires 'socat' but it is not installed."
         log "ERROR" "Install with: sudo apt install socat"
         exit 1
@@ -1209,15 +1261,6 @@ if [ "$DAEMON_MODE" = "start" ]; then
 
     # Create socket directory
     mkdir -p "$DAEMON_SOCKET_DIR"
-
-    # Create shared directory for file I/O (9p)
-    DAEMON_SHARE_DIR="$DAEMON_SOCKET_DIR/share"
-    mkdir -p "$DAEMON_SHARE_DIR"
-
-    # Add 9p for shared directory access
-    SHARE_TAG="${TOOL_NAME}_share"
-    HV_OPTS="$HV_OPTS $(hv_build_9p_opts "$DAEMON_SHARE_DIR" "$SHARE_TAG")"
-    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
 
     # Add daemon command channel (backend-specific: virtio-serial or PV console)
     hv_build_daemon_opts
@@ -1266,11 +1309,18 @@ if [ "$DAEMON_MODE" = "start" ]; then
 
     log "INFO" "VM started (PID: $HV_VM_PID)"
 
-    # Wait for socket to appear (container runtime starting)
+    # Wait for daemon to be ready (backend-specific or socket-based)
     log "INFO" "Waiting for daemon to be ready..."
     READY=false
     for i in $(seq 1 120); do
-        if [ -S "$DAEMON_SOCKET" ]; then
+        # Backend-specific readiness check (e.g. Xen PTY-based)
+        if type hv_daemon_ping >/dev/null 2>&1; then
+            if hv_daemon_ping; then
+                log "DEBUG" "Got PONG response (backend)"
+                READY=true
+                break
+            fi
+        elif [ -S "$DAEMON_SOCKET" ]; then
             RESPONSE=$( { echo "===PING==="; sleep 3; } | timeout 10 socat - "UNIX-CONNECT:$DAEMON_SOCKET" 2>/dev/null || true)
             if echo "$RESPONSE" | grep -q "===PONG==="; then
                 log "DEBUG" "Got PONG response"
@@ -1356,7 +1406,7 @@ if [ -n "$CA_CERT" ] && [ -f "$CA_CERT" ]; then
     cp "$CA_CERT" "$CA_SHARE_DIR/ca.crt"
 
     SHARE_TAG="${TOOL_NAME}_share"
-    HV_OPTS="$HV_OPTS $(hv_build_9p_opts "$CA_SHARE_DIR" "$SHARE_TAG" "readonly=on")"
+    hv_build_9p_opts "$CA_SHARE_DIR" "$SHARE_TAG" "readonly=on"
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
     log "DEBUG" "CA certificate available via 9p"
 fi
