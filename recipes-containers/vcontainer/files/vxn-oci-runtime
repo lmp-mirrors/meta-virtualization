@@ -1,0 +1,650 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (C) 2025 Bruce Ashfield
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# vxn-oci-runtime
+# OCI runtime for containerd integration via containerd-shim-runc-v2
+#
+# This implements the OCI runtime CLI spec so containerd can manage
+# Xen DomU containers through the built-in runc shim:
+#
+#   containerd -> containerd-shim-runc-v2 -> vxn-oci-runtime create/start/state/kill/delete
+#                                                   |
+#                                                   v
+#                                             xl create/unpause/list/shutdown/destroy
+#                                                   |
+#                                                   v
+#                                             Xen DomU (vxn-init.sh)
+#
+# This is a standalone script — it does not source vrunner.sh or
+# vcontainer-common.sh. The OCI runtime lifecycle (separate create/start/
+# state invocations) is fundamentally different from the all-in-one
+# vrunner flow.
+#
+# State directory: /run/vxn-oci-runtime/containers/<container-id>/
+
+set -e
+
+RUNTIME_ROOT="/run/vxn-oci-runtime"
+OCI_VERSION="1.0.2"
+BLOB_DIR="/usr/share/vxn"
+
+# ============================================================================
+# Logging
+# ============================================================================
+
+LOG_FILE="/var/log/vxn-oci-runtime.log"
+VXN_LOG="/var/log/vxn-oci-runtime.log"
+
+log() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "-")
+    # Always write to our own log (shim overrides LOG_FILE via --log)
+    echo "[$ts] $*" >> "$VXN_LOG" 2>/dev/null || true
+    if [ "$LOG_FILE" != "$VXN_LOG" ]; then
+        echo "[$ts] $*" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+die() {
+    log "FATAL: $*"
+    echo "vxn-oci-runtime: $*" >&2
+    exit 1
+}
+
+# ============================================================================
+# Architecture Detection
+# ============================================================================
+
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        aarch64)
+            VXN_ARCH="aarch64"
+            VXN_KERNEL="$BLOB_DIR/aarch64/Image"
+            VXN_INITRAMFS="$BLOB_DIR/aarch64/initramfs.cpio.gz"
+            VXN_ROOTFS="$BLOB_DIR/aarch64/rootfs.img"
+            VXN_TYPE="pvh"
+            ;;
+        x86_64)
+            VXN_ARCH="x86_64"
+            VXN_KERNEL="$BLOB_DIR/x86_64/bzImage"
+            VXN_INITRAMFS="$BLOB_DIR/x86_64/initramfs.cpio.gz"
+            VXN_ROOTFS="$BLOB_DIR/x86_64/rootfs.img"
+            VXN_TYPE="pv"
+            ;;
+        *)
+            die "Unsupported architecture: $arch"
+            ;;
+    esac
+}
+
+# ============================================================================
+# State Management
+# ============================================================================
+
+state_dir() {
+    echo "$RUNTIME_ROOT/containers/$1"
+}
+
+load_state() {
+    local id="$1"
+    local dir
+    dir=$(state_dir "$id")
+    [ -f "$dir/state.json" ] || die "container $id does not exist"
+}
+
+read_state_field() {
+    local id="$1"
+    local field="$2"
+    local dir
+    dir=$(state_dir "$id")
+    # Use grep/sed — jq may not be available in all environments
+    grep -o "\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$dir/state.json" 2>/dev/null | \
+        sed 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"//;s/"$//'
+}
+
+read_state_pid() {
+    local id="$1"
+    local dir
+    dir=$(state_dir "$id")
+    grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' "$dir/state.json" 2>/dev/null | \
+        grep -o '[0-9]*$'
+}
+
+write_state() {
+    local id="$1"
+    local status="$2"
+    local pid="$3"
+    local bundle="$4"
+    local created="$5"
+    local dir
+    dir=$(state_dir "$id")
+    cat > "$dir/state.json" <<EOF
+{
+  "ociVersion": "$OCI_VERSION",
+  "id": "$id",
+  "status": "$status",
+  "pid": $pid,
+  "bundle": "$bundle",
+  "created": "$created",
+  "annotations": {}
+}
+EOF
+}
+
+# ============================================================================
+# OCI Runtime Commands
+# ============================================================================
+
+cmd_create() {
+    local container_id=""
+    local bundle=""
+    local pid_file=""
+    local console_socket=""
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --bundle)       bundle="$2"; shift 2 ;;
+            --bundle=*)     bundle="${1#--bundle=}"; shift ;;
+            --pid-file)     pid_file="$2"; shift 2 ;;
+            --pid-file=*)   pid_file="${1#--pid-file=}"; shift ;;
+            --console-socket) console_socket="$2"; shift 2 ;;
+            --console-socket=*) console_socket="${1#--console-socket=}"; shift ;;
+            -*)             log "  DEBUG: unknown create flag: $1"; shift ;;
+            *)
+                if [ -z "$container_id" ]; then
+                    container_id="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [ -n "$container_id" ] || die "create: container ID required"
+    [ -n "$bundle" ] || die "create: --bundle required"
+    [ -f "$bundle/config.json" ] || die "create: $bundle/config.json not found"
+
+    log "CREATE: id=$container_id bundle=$bundle console_socket=$console_socket"
+    # Debug: log what the shim gives us
+    log "  DEBUG: fd0=$(readlink /proc/$$/fd/0 2>/dev/null) fd1=$(readlink /proc/$$/fd/1 2>/dev/null) fd2=$(readlink /proc/$$/fd/2 2>/dev/null)"
+    log "  DEBUG: bundle dir: $(ls -F $bundle/ 2>/dev/null | tr '\n' ' ')"
+    local _taskdir
+    _taskdir=$(dirname "$bundle")
+    log "  DEBUG: task dir ($bundle): $(ls -F $bundle/ 2>/dev/null | tr '\n' ' ')"
+    log "  DEBUG: parent dir ($_taskdir): $(ls -F $_taskdir/ 2>/dev/null | tr '\n' ' ')"
+    log "  DEBUG: all pipes: $(find /run -type p 2>/dev/null | tr '\n' ' ')"
+
+    detect_arch
+
+    local dir
+    dir=$(state_dir "$container_id")
+    mkdir -p "$dir"
+
+    # Read config.json — parse process.args, process.env, process.cwd, process.terminal
+    local config="$bundle/config.json"
+    local entrypoint="" env_vars="" cwd="/" terminal="false"
+
+    if command -v jq >/dev/null 2>&1; then
+        entrypoint=$(jq -r '(.process.args // []) | join(" ")' "$config" 2>/dev/null)
+        cwd=$(jq -r '.process.cwd // "/"' "$config" 2>/dev/null)
+        env_vars=$(jq -r '(.process.env // []) | join("\n")' "$config" 2>/dev/null)
+        terminal=$(jq -r '.process.terminal // false' "$config" 2>/dev/null)
+    else
+        # Fallback: grep/sed parsing
+        entrypoint=$(grep -o '"args"[[:space:]]*:[[:space:]]*\[[^]]*\]' "$config" 2>/dev/null | \
+            sed 's/"args"[[:space:]]*:[[:space:]]*\[//;s/\]$//' | \
+            tr ',' '\n' | sed 's/^ *"//;s/"$//' | tr '\n' ' ' | sed 's/ $//')
+        cwd=$(grep -o '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"' "$config" 2>/dev/null | \
+            sed 's/"cwd"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        [ -z "$cwd" ] && cwd="/"
+        if grep -q '"terminal"[[:space:]]*:[[:space:]]*true' "$config" 2>/dev/null; then
+            terminal="true"
+        fi
+    fi
+
+    log "  entrypoint='$entrypoint' cwd='$cwd' terminal=$terminal"
+
+    # Create ext4 disk image from bundle/rootfs/
+    local rootfs_dir="$bundle/rootfs"
+    local input_img="$dir/input.img"
+
+    if [ -d "$rootfs_dir" ] && [ -n "$(ls -A "$rootfs_dir" 2>/dev/null)" ]; then
+        # Calculate size: rootfs size + 50% headroom, minimum 64MB
+        local rootfs_size_kb
+        rootfs_size_kb=$(du -sk "$rootfs_dir" 2>/dev/null | awk '{print $1}')
+        local img_size_kb=$(( (rootfs_size_kb * 3 / 2) ))
+        [ "$img_size_kb" -lt 65536 ] && img_size_kb=65536
+
+        log "  Creating ext4 image: ${img_size_kb}KB from $rootfs_dir"
+        mke2fs -t ext4 -d "$rootfs_dir" -b 4096 "$input_img" "${img_size_kb}K" \
+            >> "$LOG_FILE" 2>&1 || die "create: failed to create ext4 image"
+    else
+        die "create: $rootfs_dir is empty or does not exist"
+    fi
+
+    # Encode entrypoint as base64 for kernel cmdline
+    local cmd_b64=""
+    if [ -n "$entrypoint" ]; then
+        cmd_b64=$(echo -n "$entrypoint" | base64 -w0)
+    fi
+
+    # Domain name: vxn-oci-<short-id>
+    local domname="vxn-oci-${container_id}"
+    # Xen domain names have a max length — truncate if needed
+    if [ ${#domname} -gt 64 ]; then
+        domname="vxn-oci-${container_id:0:55}"
+    fi
+    echo "$domname" > "$dir/domname"
+
+    # Memory and vCPUs — configurable via environment
+    local xen_memory="${VXN_OCI_MEMORY:-512}"
+    local xen_vcpus="${VXN_OCI_VCPUS:-2}"
+
+    # Generate Xen domain config
+    local config_cfg="$dir/config.cfg"
+    local kernel_extra="console=hvc0 quiet loglevel=0 init=/init vcontainer.blk=xvd vcontainer.init=/vxn-init.sh"
+    [ -n "$cmd_b64" ] && kernel_extra="$kernel_extra docker_cmd=$cmd_b64"
+    kernel_extra="$kernel_extra docker_input=oci"
+
+    # Terminal mode: suppress boot messages for raw console I/O
+    if [ "$terminal" = "true" ]; then
+        kernel_extra="$kernel_extra docker_interactive=1"
+    fi
+
+    cat > "$config_cfg" <<XENEOF
+# Auto-generated Xen domain config for vxn-oci-runtime
+name = "$domname"
+type = "$VXN_TYPE"
+memory = $xen_memory
+vcpus = $xen_vcpus
+
+kernel = "$VXN_KERNEL"
+ramdisk = "$VXN_INITRAMFS"
+extra = "$kernel_extra"
+
+disk = [ 'format=raw,vdev=xvda,access=ro,target=$VXN_ROOTFS', 'format=raw,vdev=xvdb,access=ro,target=$input_img' ]
+vif = []
+
+serial = 'pty'
+
+on_poweroff = "destroy"
+on_reboot = "destroy"
+on_crash = "destroy"
+XENEOF
+
+    log "  Xen config written to $config_cfg"
+
+    # Create domain in paused state (OCI spec: create does not start)
+    xl create -p "$config_cfg" >> "$LOG_FILE" 2>&1 || die "create: xl create -p failed"
+
+    log "  Domain $domname created (paused)"
+
+    # Get domid and read Xen console PTY from xenstore
+    local domid pty_path
+    domid=$(xl domid "$domname" 2>/dev/null) || die "create: failed to get domid for $domname"
+    pty_path=$(xenstore-read "/local/domain/$domid/console/tty" 2>/dev/null) || true
+    log "  domid=$domid pty=$pty_path"
+
+    if [ -n "$pty_path" ]; then
+        echo "$pty_path" > "$dir/pty"
+    fi
+
+    # Terminal mode: send PTY fd to shim via console-socket (SCM_RIGHTS)
+    if [ -n "$console_socket" ] && [ -n "$pty_path" ]; then
+        if command -v vxn-sendtty >/dev/null 2>&1; then
+            vxn-sendtty "$console_socket" "$pty_path" \
+                || log "  WARNING: vxn-sendtty failed (socket=$console_socket pty=$pty_path)"
+            log "  Sent PTY fd to console-socket"
+        else
+            log "  WARNING: vxn-sendtty not found, cannot send PTY to shim"
+        fi
+    fi
+
+    # Persistent log dir — survives container deletion by shim
+    local logdir="/var/log/vxn-oci-runtime/containers/$container_id"
+    mkdir -p "$logdir"
+
+    # Monitor process: tracks domain lifecycle and captures output.
+    #
+    # Non-terminal mode: xl console captures the domain's serial output.
+    # When the domain dies, xl console exits (PTY closes). We immediately
+    # extract content between OUTPUT_START/END markers and write to stdout.
+    # stdout is the shim's pipe → containerd copies to client FIFO → ctr.
+    #
+    # CRITICAL: We use "wait" on xl console instead of polling xl list.
+    # Polling with sleep 5 was too slow — the shim detected "stopped" and
+    # killed the monitor before it had a chance to output. Using wait gives
+    # us instant reaction when the domain dies.
+    #
+    # Terminal mode (console-socket): the shim owns the PTY exclusively.
+    # We just wait for the domain to exit without capturing console.
+    local _dn="$domname" _logdir="$logdir" _csock="$console_socket"
+    (
+        if [ -z "$_csock" ]; then
+            # Non-terminal: capture console to persistent log dir
+            xl console "$_dn" > "$_logdir/console.log" 2>&1 &
+            _cpid=$!
+
+            # Wait for xl console to exit — domain death closes the PTY,
+            # which causes xl console to exit immediately. No polling delay.
+            wait $_cpid 2>/dev/null
+
+            # Extract output between markers and write to stdout.
+            # stdout IS the shim's pipe (confirmed: fd1=pipe). The shim's
+            # io.Copy goroutine reads from this pipe and writes to the
+            # containerd client FIFO. ctr reads from the FIFO.
+            if [ -f "$_logdir/console.log" ]; then
+                _relay=false
+                while IFS= read -r _line; do
+                    _line="${_line%%$'\r'}"
+                    case "$_line" in
+                        *===OUTPUT_START===*) _relay=true; continue ;;
+                        *===OUTPUT_END===*)   _relay=false; continue ;;
+                        *) [ "$_relay" = "true" ] && printf '%s\n' "$_line" ;;
+                    esac
+                done < "$_logdir/console.log"
+            fi
+        else
+            # Terminal mode: shim owns PTY — just wait for domain death
+            while xl list "$_dn" >/dev/null 2>&1; do sleep 2; done
+        fi
+    ) &
+    local monitor_pid=$!
+
+    # Write monitor PID to --pid-file (runc shim monitors /proc/<pid>)
+    # Use printf — shim parses with strconv.Atoi which rejects trailing newlines
+    if [ -n "$pid_file" ]; then
+        printf '%s' "$monitor_pid" > "$pid_file"
+    fi
+    printf '%s' "$monitor_pid" > "$dir/monitor.pid"
+
+    log "  monitor PID=$monitor_pid"
+
+    # Write OCI state
+    local created
+    created=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "1970-01-01T00:00:00Z")
+    write_state "$container_id" "created" "$monitor_pid" "$bundle" "$created"
+
+    log "CREATE: done"
+}
+
+cmd_start() {
+    local container_id="$1"
+    [ -n "$container_id" ] || die "start: container ID required"
+
+    log "START: id=$container_id"
+    load_state "$container_id"
+
+    local dir
+    dir=$(state_dir "$container_id")
+    local domname
+    domname=$(cat "$dir/domname")
+
+    # Verify domain exists and is paused
+    xl list "$domname" >/dev/null 2>&1 || die "start: domain $domname not found"
+
+    # Unpause the domain
+    xl unpause "$domname" >> "$LOG_FILE" 2>&1 || die "start: xl unpause failed"
+
+    # Update state
+    local pid bundle created
+    pid=$(read_state_pid "$container_id")
+    bundle=$(read_state_field "$container_id" "bundle")
+    created=$(read_state_field "$container_id" "created")
+    write_state "$container_id" "running" "$pid" "$bundle" "$created"
+
+    log "START: done"
+}
+
+cmd_state() {
+    local container_id="$1"
+    [ -n "$container_id" ] || die "state: container ID required"
+
+    local dir
+    dir=$(state_dir "$container_id")
+    [ -f "$dir/state.json" ] || die "container $container_id does not exist"
+
+    # Read stored state
+    local status pid bundle created
+    status=$(read_state_field "$container_id" "status")
+    pid=$(read_state_pid "$container_id")
+    bundle=$(read_state_field "$container_id" "bundle")
+    created=$(read_state_field "$container_id" "created")
+
+    # The monitor process (init PID) is the authority for task liveness.
+    # Even after the Xen domain exits, the monitor may still be extracting
+    # output from console.log and writing it to stdout (the shim's pipe).
+    # Only report "stopped" when the monitor PID is actually dead.
+    # This prevents the shim from triggering kill/delete while the monitor
+    # is still outputting — which was the root cause of the I/O race.
+    if [ "$status" = "running" ] || [ "$status" = "created" ]; then
+        local monitor_alive=false
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+            if kill -0 "$pid" 2>/dev/null; then
+                monitor_alive=true
+            fi
+        fi
+        if [ "$monitor_alive" = "false" ]; then
+            status="stopped"
+            write_state "$container_id" "stopped" "$pid" "$bundle" "$created"
+        fi
+    fi
+
+    # Output OCI state JSON to stdout
+    cat <<EOF
+{"ociVersion":"$OCI_VERSION","id":"$container_id","status":"$status","pid":${pid:-0},"bundle":"$bundle","created":"$created","annotations":{}}
+EOF
+}
+
+cmd_kill() {
+    local container_id="$1"
+    local signal="${2:-SIGTERM}"
+    [ -n "$container_id" ] || die "kill: container ID required"
+
+    log "KILL: id=$container_id signal=$signal"
+    load_state "$container_id"
+
+    local dir
+    dir=$(state_dir "$container_id")
+    local domname
+    domname=$(cat "$dir/domname")
+
+    # Normalize signal: accept both numeric and symbolic forms
+    case "$signal" in
+        9|SIGKILL|KILL)
+            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            ;;
+        2|SIGINT|INT)
+            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            ;;
+        15|SIGTERM|TERM|"")
+            xl shutdown "$domname" >> "$LOG_FILE" 2>&1 || true
+            # Wait briefly for graceful shutdown, then force destroy
+            local i
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                xl list "$domname" >/dev/null 2>&1 || break
+                sleep 1
+            done
+            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            ;;
+        *)
+            # Unknown signal — treat as SIGTERM
+            xl shutdown "$domname" >> "$LOG_FILE" 2>&1 || true
+            ;;
+    esac
+
+    # Update state
+    local pid bundle created
+    pid=$(read_state_pid "$container_id")
+    bundle=$(read_state_field "$container_id" "bundle")
+    created=$(read_state_field "$container_id" "created")
+    write_state "$container_id" "stopped" "$pid" "$bundle" "$created"
+
+    log "KILL: done"
+}
+
+cmd_delete() {
+    local container_id=""
+    local force=false
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f)  force=true; shift ;;
+            -*)          shift ;;
+            *)
+                if [ -z "$container_id" ]; then
+                    container_id="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [ -n "$container_id" ] || die "delete: container ID required"
+
+    log "DELETE: id=$container_id force=$force"
+
+    local dir
+    dir=$(state_dir "$container_id")
+    [ -d "$dir" ] || die "container $container_id does not exist"
+
+    # Clean up Xen domain if still present.
+    # The shim only calls delete after the init PID (monitor) has exited,
+    # meaning the task is complete. The domain may still be shutting down —
+    # always destroy it as part of cleanup.
+    if [ -f "$dir/domname" ]; then
+        local domname
+        domname=$(cat "$dir/domname")
+        if xl list "$domname" >/dev/null 2>&1; then
+            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+
+    # Kill monitor process (also kills console capture child)
+    if [ -f "$dir/monitor.pid" ]; then
+        local mpid
+        mpid=$(cat "$dir/monitor.pid")
+        kill "$mpid" 2>/dev/null || true
+    fi
+
+    # Remove state directory (includes disk images)
+    rm -rf "$dir"
+
+    log "DELETE: done"
+}
+
+cmd_features() {
+    cat <<EOF
+{
+  "ociVersionMin": "1.0.0",
+  "ociVersionMax": "$OCI_VERSION",
+  "hooks": [],
+  "mountOptions": [],
+  "linux": {
+    "namespaces": [],
+    "capabilities": [],
+    "cgroup": {
+      "v1": false,
+      "v2": false
+    },
+    "seccomp": {
+      "enabled": false
+    },
+    "apparmor": {
+      "enabled": false
+    },
+    "selinux": {
+      "enabled": false
+    }
+  },
+  "annotations": {
+    "io.containerd.runc.v2.runtime_type": "vm"
+  }
+}
+EOF
+}
+
+cmd_logs() {
+    local container_id="$1"
+    [ -n "$container_id" ] || die "logs: container ID required"
+
+    # Check persistent log dir first, then state dir
+    local logfile=""
+    local logdir="/var/log/vxn-oci-runtime/containers/$container_id"
+    local dir
+    dir=$(state_dir "$container_id")
+
+    if [ -f "$logdir/console.log" ]; then
+        logfile="$logdir/console.log"
+    elif [ -f "$dir/console.log" ]; then
+        logfile="$dir/console.log"
+    else
+        die "no logs for $container_id"
+    fi
+
+    # Extract content between OUTPUT_START/END markers (non-terminal mode)
+    local relay=false
+    while IFS= read -r line; do
+        line="${line%%$'\r'}"
+        case "$line" in
+            *===OUTPUT_START===*) relay=true; continue ;;
+            *===OUTPUT_END===*)   relay=false; continue ;;
+            *)
+                if [ "$relay" = "true" ]; then
+                    printf '%s\n' "$line"
+                fi
+                ;;
+        esac
+    done < "$logfile"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+mkdir -p "$RUNTIME_ROOT/containers" 2>/dev/null || true
+
+# Parse global options before command
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)        RUNTIME_ROOT="$2"; shift 2 ;;
+        --root=*)      RUNTIME_ROOT="${1#--root=}"; shift ;;
+        --log)         LOG_FILE="$2"; shift 2 ;;
+        --log=*)       LOG_FILE="${1#--log=}"; shift ;;
+        --log-format)  shift 2 ;;  # accepted but ignored
+        --log-format=*) shift ;;
+        --systemd-cgroup) shift ;;  # accepted but ignored
+        -*)            shift ;;     # skip other global flags
+        *)             break ;;     # first non-flag is the command
+    esac
+done
+
+command="${1:-}"
+shift || true
+
+case "$command" in
+    create)  cmd_create "$@" ;;
+    start)   cmd_start "$@" ;;
+    state)   cmd_state "$@" ;;
+    kill)    cmd_kill "$@" ;;
+    delete)  cmd_delete "$@" ;;
+    features) cmd_features "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    --version|version)
+        echo "vxn-oci-runtime version 1.0.0"
+        echo "spec: $OCI_VERSION"
+        ;;
+    *)
+        if [ -n "$command" ]; then
+            log "Unknown command: $command (args: $*)"
+        fi
+        echo "Usage: vxn-oci-runtime <command> [args...]" >&2
+        echo "Commands: create, start, state, kill, delete, logs" >&2
+        exit 1
+        ;;
+esac
