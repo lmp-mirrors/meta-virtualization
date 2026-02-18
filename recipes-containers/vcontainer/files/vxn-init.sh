@@ -341,14 +341,16 @@ exec_in_container() {
     fi
 
     if [ "$RUNTIME_INTERACTIVE" = "1" ]; then
-        # Interactive mode: connect stdin/stdout directly
+        # Interactive mode: establish a controlling terminal for job control.
+        # PID 1 is already a session leader, so setsid() would fork — run in
+        # a subshell (not session leader) where setsid() succeeds directly.
+        # The -c flag does ioctl(TIOCSCTTY) on stdin to set the controlling tty.
         export TERM=linux
         dmesg -n 1 2>/dev/null || true
-        echo "[vxn] chroot: $rootfs $cmd" > /dev/console 2>/dev/null
         if [ "$use_sh" = "true" ]; then
-            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd"
+            (exec setsid -c chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd")
         else
-            chroot "$rootfs" $cmd
+            (exec setsid -c chroot "$rootfs" $cmd)
         fi
         EXEC_EXIT_CODE=$?
     else
@@ -435,7 +437,7 @@ run_container_from_disk() {
 
     # Mount input disk
     mkdir -p /mnt/input
-    if ! mount /dev/xvdb /mnt/input 2>/dev/null; then
+    if ! mount /dev/xvdb /mnt/input >/dev/null 2>&1; then
         echo "===ERROR==="
         echo "Failed to mount /dev/xvdb"
         echo "===END==="
@@ -631,11 +633,9 @@ mount_base_filesystems
 # Check for quiet boot mode
 check_quiet_boot
 
-# Interactive mode: suppress kernel console messages early (before mounts
-# that trigger loop device messages) and emit markers visible through PTY
+# Interactive mode: suppress guest kernel console messages early
 if [ "$QUIET_BOOT" = "1" ]; then
     dmesg -n 1 2>/dev/null || true
-    echo "[vxn] init" > /dev/console 2>/dev/null
 fi
 
 log "=== vxn Init ==="
@@ -728,7 +728,6 @@ else
     fi
 
     # Execute in container rootfs
-    [ "$QUIET_BOOT" = "1" ] && echo "[vxn] exec: $EXEC_CMD" > /dev/console 2>/dev/null
     exec_in_container "$CONTAINER_ROOT" "$EXEC_CMD"
 fi
 
