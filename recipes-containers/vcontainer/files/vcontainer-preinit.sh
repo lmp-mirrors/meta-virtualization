@@ -35,6 +35,10 @@ log() {
     [ "$QUIET" = "0" ] && echo "$@"
 }
 
+# Suppress kernel console messages in interactive mode so they don't
+# pollute the terminal (loop device messages bypass loglevel=0)
+[ "$QUIET" = "1" ] && { dmesg -n 1 2>/dev/null || true; }
+
 log "=== vcontainer preinit (squashfs) ==="
 
 # Wait for block devices to appear

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <termios.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -42,6 +43,18 @@ int main(int argc, char *argv[])
 	if (pty_fd < 0) {
 		perror("open pty");
 		return 1;
+	}
+
+	/* Set PTY to raw mode for direct terminal I/O.
+	 * Without this, the PTY slave's line discipline (echo, canonical mode)
+	 * buffers input and echoes characters, preventing the shim from
+	 * bridging the terminal correctly. */
+	{
+		struct termios tio;
+		if (tcgetattr(pty_fd, &tio) == 0) {
+			cfmakeraw(&tio);
+			tcsetattr(pty_fd, TCSANOW, &tio);
+		}
 	}
 
 	sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);

@@ -169,14 +169,6 @@ cmd_create() {
     [ -f "$bundle/config.json" ] || die "create: $bundle/config.json not found"
 
     log "CREATE: id=$container_id bundle=$bundle console_socket=$console_socket"
-    # Debug: log what the shim gives us
-    log "  DEBUG: fd0=$(readlink /proc/$$/fd/0 2>/dev/null) fd1=$(readlink /proc/$$/fd/1 2>/dev/null) fd2=$(readlink /proc/$$/fd/2 2>/dev/null)"
-    log "  DEBUG: bundle dir: $(ls -F $bundle/ 2>/dev/null | tr '\n' ' ')"
-    local _taskdir
-    _taskdir=$(dirname "$bundle")
-    log "  DEBUG: task dir ($bundle): $(ls -F $bundle/ 2>/dev/null | tr '\n' ' ')"
-    log "  DEBUG: parent dir ($_taskdir): $(ls -F $_taskdir/ 2>/dev/null | tr '\n' ' ')"
-    log "  DEBUG: all pipes: $(find /run -type p 2>/dev/null | tr '\n' ' ')"
 
     detect_arch
 
@@ -283,10 +275,17 @@ XENEOF
 
     log "  Domain $domname created (paused)"
 
-    # Get domid and read Xen console PTY from xenstore
+    # Get domid and read Xen console PTY from xenstore.
+    # xenconsoled may not have created the PTY yet — wait for it.
     local domid pty_path
     domid=$(xl domid "$domname" 2>/dev/null) || die "create: failed to get domid for $domname"
-    pty_path=$(xenstore-read "/local/domain/$domid/console/tty" 2>/dev/null) || true
+    pty_path=""
+    local _try
+    for _try in 1 2 3 4 5 6 7 8 9 10; do
+        pty_path=$(xenstore-read "/local/domain/$domid/console/tty" 2>/dev/null) || true
+        [ -n "$pty_path" ] && break
+        sleep 0.5
+    done
     log "  domid=$domid pty=$pty_path"
 
     if [ -n "$pty_path" ]; then
@@ -294,14 +293,32 @@ XENEOF
     fi
 
     # Terminal mode: send PTY fd to shim via console-socket (SCM_RIGHTS)
+    local sendtty_rc="-"
     if [ -n "$console_socket" ] && [ -n "$pty_path" ]; then
         if command -v vxn-sendtty >/dev/null 2>&1; then
-            vxn-sendtty "$console_socket" "$pty_path" \
-                || log "  WARNING: vxn-sendtty failed (socket=$console_socket pty=$pty_path)"
-            log "  Sent PTY fd to console-socket"
+            vxn-sendtty "$console_socket" "$pty_path"
+            sendtty_rc=$?
+            [ "$sendtty_rc" -ne 0 ] && log "  WARNING: vxn-sendtty failed (rc=$sendtty_rc)"
+            log "  Sent PTY fd to console-socket (rc=$sendtty_rc)"
         else
+            sendtty_rc="missing"
             log "  WARNING: vxn-sendtty not found, cannot send PTY to shim"
         fi
+    elif [ -n "$console_socket" ] && [ -z "$pty_path" ]; then
+        sendtty_rc="no-pty"
+        log "  WARNING: no PTY path from xenstore, cannot send to shim"
+    fi
+
+    # Write terminal debug to persistent storage (survives reboot)
+    if [ -n "$console_socket" ]; then
+        cat > /root/vxn-tty-debug 2>/dev/null <<DBGEOF
+domid=$domid
+pty=$pty_path
+console_socket=$console_socket
+sendtty_rc=$sendtty_rc
+terminal=$terminal
+domname=$domname
+DBGEOF
     fi
 
     # Persistent log dir — survives container deletion by shim
@@ -349,8 +366,12 @@ XENEOF
                 done < "$_logdir/console.log"
             fi
         else
-            # Terminal mode: shim owns PTY — just wait for domain death
-            while xl list "$_dn" >/dev/null 2>&1; do sleep 2; done
+            # Terminal mode: shim owns PTY — just wait for domain death.
+            # Close inherited stdout/stderr: go-runc captures runtime stdout
+            # via a pipe and cmd.Wait() blocks until EOF. If we hold the
+            # pipe's write end open, Create never returns to the shim.
+            exec >/dev/null 2>/dev/null
+            while xl list "$_dn" >/dev/null 2>&1; do sleep 0.5; done
         fi
     ) &
     local monitor_pid=$!
@@ -626,6 +647,9 @@ done
 
 command="${1:-}"
 shift || true
+
+# Log every invocation for debugging (before command dispatch)
+log "INVOKE: cmd=$command args=$* root=$RUNTIME_ROOT"
 
 case "$command" in
     create)  cmd_create "$@" ;;

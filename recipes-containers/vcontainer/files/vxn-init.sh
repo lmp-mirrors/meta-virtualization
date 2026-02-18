@@ -343,9 +343,10 @@ exec_in_container() {
     if [ "$RUNTIME_INTERACTIVE" = "1" ]; then
         # Interactive mode: connect stdin/stdout directly
         export TERM=linux
-        printf '\r\033[K'
+        dmesg -n 1 2>/dev/null || true
+        echo "[vxn] chroot: $rootfs $cmd" > /dev/console 2>/dev/null
         if [ "$use_sh" = "true" ]; then
-            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd"
+            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd"
         else
             chroot "$rootfs" $cmd
         fi
@@ -630,6 +631,13 @@ mount_base_filesystems
 # Check for quiet boot mode
 check_quiet_boot
 
+# Interactive mode: suppress kernel console messages early (before mounts
+# that trigger loop device messages) and emit markers visible through PTY
+if [ "$QUIET_BOOT" = "1" ]; then
+    dmesg -n 1 2>/dev/null || true
+    echo "[vxn] init" > /dev/console 2>/dev/null
+fi
+
 log "=== vxn Init ==="
 log "Version: $VCONTAINER_VERSION"
 
@@ -720,6 +728,7 @@ else
     fi
 
     # Execute in container rootfs
+    [ "$QUIET_BOOT" = "1" ] && echo "[vxn] exec: $EXEC_CMD" > /dev/console 2>/dev/null
     exec_in_container "$CONTAINER_ROOT" "$EXEC_CMD"
 fi
 
