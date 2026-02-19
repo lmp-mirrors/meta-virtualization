@@ -34,6 +34,8 @@ TOOLCHAIN_SHAR_EXT_TMPL = "${THISDIR}/files/toolchain-shar-extract.sh"
 # Declare script sources so BitBake tracks changes and rebuilds when they change
 SRC_URI = "\
     file://vrunner.sh \
+    file://vrunner-backend-qemu.sh \
+    file://vrunner-backend-xen.sh \
     file://vcontainer-common.sh \
     file://vdkr.sh \
     file://vpdmn.sh \
@@ -236,7 +238,7 @@ create_sdk_files:append () {
     FILES_DIR="${THISDIR}/files"
 
     # Copy shared scripts
-    for script in vrunner.sh vcontainer-common.sh; do
+    for script in vrunner.sh vrunner-backend-qemu.sh vrunner-backend-xen.sh vcontainer-common.sh; do
         if [ -f "${FILES_DIR}/${script}" ]; then
             cp "${FILES_DIR}/${script}" "${SDK_OUT}/"
             chmod 755 "${SDK_OUT}/${script}"
