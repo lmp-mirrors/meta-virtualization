@@ -92,8 +92,14 @@ WKS_FILE:x86-64 = "directdisk-xen.wks"
 WKS_FILE_DEPENDS_DEFAULT:x86-64 = "syslinux-native"
 WKS_FILE:qemux86-64 = "qemuboot-xen-x86-64.wks"
 WKS_FILE_DEPENDS_DEFAULT:qemux86-64 = "syslinux-native"
-# Dom0 needs enough memory for containerd + vxn DomU management
-QB_MEM ?= "-m 1024"
+# Xen Dom0 needs the full host CPU feature set (AVX, AVX2, etc.) since
+# the machine default Skylake-Client model can lose features through Xen's
+# nested CPUID filtering, causing illegal instruction crashes with x86-64-v3.
+QB_CPU_KVM:qemux86-64 = "-cpu host -machine q35,i8042=off"
+# Dom0 needs enough memory for containerd + vxn DomU management.
+# QB_MEM_VALUE overrides the ??= default in qemuboot-xen-defaults;
+# QB_MEM itself is a hard assign in the class so ?= here won't work.
+QB_MEM_VALUE = "1024"
 QB_XEN_CMDLINE_EXTRA = "dom0_mem=512M"
 QB_DEFAULT_KERNEL ?= "none"
 QB_DEFAULT_FSTYPE ?= "wic"

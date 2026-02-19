@@ -23,12 +23,15 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 inherit xen-guest-bundle
 
+S = "${UNPACKDIR}"
+
 ALPINE_VERSION = "3.23.3"
 ALPINE_ARCH = "aarch64"
 ALPINE_ARCH:x86-64 = "x86_64"
 
-SRC_URI = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/${ALPINE_ARCH}/alpine-minirootfs-${ALPINE_VERSION}-${ALPINE_ARCH}.tar.gz;subdir=alpine-rootfs"
-SRC_URI[sha256sum] = "f219bb9d65febed9046951b19f2b893b331315740af32c47e39b38fcca4be543"
+SRC_URI = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/${ALPINE_ARCH}/alpine-minirootfs-${ALPINE_VERSION}-${ALPINE_ARCH}.tar.gz;subdir=alpine-rootfs;name=${ALPINE_ARCH}"
+SRC_URI[aarch64.sha256sum] = "f219bb9d65febed9046951b19f2b893b331315740af32c47e39b38fcca4be543"
+SRC_URI[x86_64.sha256sum] = "42d0e6d8de5521e7bf92e075e032b5690c1d948fa9775efa32a51a38b25460fb"
 
 # Guest definition: name is "alpine", autostart, external (no Yocto image dep)
 XEN_GUEST_BUNDLES = "alpine:autostart:external"
