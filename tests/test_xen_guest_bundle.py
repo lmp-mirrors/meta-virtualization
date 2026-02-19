@@ -281,14 +281,32 @@ class TestAlpineRecipe:
         assert "alpine-minirootfs" in alpine_recipe_content
         assert "subdir=alpine-rootfs" in alpine_recipe_content
 
-    def test_sha256sum(self, alpine_recipe_content):
-        """Test sha256sum is set (not placeholder)."""
-        match = re.search(r'SRC_URI\[sha256sum\]\s*=\s*"([^"]*)"',
-                          alpine_recipe_content)
-        assert match, "sha256sum not found"
-        sha = match.group(1)
-        assert len(sha) == 64, f"sha256sum wrong length: {len(sha)}"
-        assert sha != "x" * 64, "sha256sum is still placeholder"
+    def test_per_arch_checksums(self, alpine_recipe_content):
+        """Test per-architecture sha256sums are set."""
+        aarch64_match = re.search(
+            r'SRC_URI\[aarch64\.sha256sum\]\s*=\s*"([^"]*)"',
+            alpine_recipe_content)
+        x86_64_match = re.search(
+            r'SRC_URI\[x86_64\.sha256sum\]\s*=\s*"([^"]*)"',
+            alpine_recipe_content)
+        assert aarch64_match, "aarch64 sha256sum not found"
+        assert x86_64_match, "x86_64 sha256sum not found"
+        for name, match in [("aarch64", aarch64_match), ("x86_64", x86_64_match)]:
+            sha = match.group(1)
+            assert len(sha) == 64, f"{name} sha256sum wrong length: {len(sha)}"
+            assert sha != "x" * 64, f"{name} sha256sum is still placeholder"
+        # Checksums must differ (different arch tarballs)
+        assert aarch64_match.group(1) != x86_64_match.group(1), \
+            "aarch64 and x86_64 checksums should differ"
+
+    def test_src_uri_per_arch_name(self, alpine_recipe_content):
+        """Test SRC_URI uses name= for per-arch checksum matching."""
+        assert "name=${ALPINE_ARCH}" in alpine_recipe_content, \
+            "SRC_URI should use name=${ALPINE_ARCH} for per-arch checksums"
+
+    def test_s_variable(self, alpine_recipe_content):
+        """Test S variable is set to avoid UNPACKDIR warning."""
+        assert 'S = "${UNPACKDIR}"' in alpine_recipe_content
 
     def test_guest_bundles(self, alpine_recipe_content):
         """Test XEN_GUEST_BUNDLES is set."""
@@ -359,3 +377,98 @@ class TestReadme:
         """Test custom handler instructions."""
         assert "xen_guest_import_" in readme_content
         assert "XEN_GUEST_IMPORT_DEPENDS_" in readme_content
+
+
+# ============================================================================
+# x86-64 configuration tests
+# ============================================================================
+
+class TestXenImageMinimalX86Config:
+    """Test xen-image-minimal.bb x86-64 configuration.
+
+    These verify the fixes needed for Xen on qemux86-64:
+    - CPU passthrough to avoid AVX stripping by Xen CPUID filtering
+    - Memory configuration using QB_MEM_VALUE (not QB_MEM)
+    - dom0_mem in QB_XEN_CMDLINE_EXTRA for runqemu
+    - dom0_mem in static WKS syslinux config for guest autostart
+    - vgabios using reliable download mirror
+    """
+
+    @pytest.fixture(scope="class")
+    def image_recipe_content(self, meta_virt_dir):
+        path = meta_virt_dir / "recipes-extended" / "images" / "xen-image-minimal.bb"
+        if not path.exists():
+            pytest.skip("xen-image-minimal.bb not found")
+        return path.read_text()
+
+    @pytest.fixture(scope="class")
+    def wks_cfg_content(self, meta_virt_dir):
+        path = meta_virt_dir / "wic" / "qemuboot-xen-x86-64.cfg"
+        if not path.exists():
+            pytest.skip("qemuboot-xen-x86-64.cfg not found")
+        return path.read_text()
+
+    @pytest.fixture(scope="class")
+    def vgabios_recipe_content(self, meta_virt_dir):
+        recipes = list((meta_virt_dir / "recipes-extended" / "vgabios").glob(
+            "vgabios_*.bb"))
+        if not recipes:
+            pytest.skip("vgabios recipe not found")
+        return recipes[0].read_text()
+
+    def test_cpu_kvm_host_passthrough(self, image_recipe_content):
+        """Test QB_CPU_KVM uses -cpu host for qemux86-64.
+
+        Xen's CPUID filtering strips AVX/AVX2 when using fixed CPU models
+        (e.g. Skylake-Client), causing illegal instruction crashes with
+        x86-64-v3 tune. -cpu host passes real features through KVM.
+        """
+        assert 'QB_CPU_KVM:qemux86-64 = "-cpu host' in image_recipe_content
+
+    def test_qb_mem_value_not_qb_mem(self, image_recipe_content):
+        """Test memory uses QB_MEM_VALUE, not QB_MEM.
+
+        qemuboot-xen-defaults.bbclass uses a hard assign:
+          QB_MEM = "-m ${QB_MEM_VALUE}"
+        A recipe-level QB_MEM ?= cannot override it. QB_MEM_VALUE ??=
+        in the class is the intended override point.
+        """
+        assert 'QB_MEM_VALUE' in image_recipe_content
+        # Should NOT have QB_MEM ?= (common mistake)
+        assert 'QB_MEM ?=' not in image_recipe_content
+
+    def test_dom0_mem_in_xen_cmdline(self, image_recipe_content):
+        """Test dom0_mem is in QB_XEN_CMDLINE_EXTRA for runqemu."""
+        match = re.search(
+            r'QB_XEN_CMDLINE_EXTRA\s*=\s*"([^"]*)"', image_recipe_content)
+        assert match, "QB_XEN_CMDLINE_EXTRA not found"
+        assert "dom0_mem=" in match.group(1), \
+            "dom0_mem= must be in QB_XEN_CMDLINE_EXTRA"
+
+    def test_dom0_mem_in_wks_syslinux(self, wks_cfg_content):
+        """Test dom0_mem is in static WKS syslinux config.
+
+        Without dom0_mem in the syslinux config, Xen gives ALL memory
+        to Dom0 and guest autostart fails with 'failed to free memory'.
+        QB_XEN_CMDLINE_EXTRA only affects runqemu's dynamic command line.
+        """
+        assert "dom0_mem=" in wks_cfg_content, \
+            "dom0_mem= must be in qemuboot-xen-x86-64.cfg for guest autostart"
+
+    def test_wks_xen_kernel_cmdline(self, wks_cfg_content):
+        """Test WKS config has correct Xen and kernel boot params."""
+        assert "mboot.c32" in wks_cfg_content
+        assert "/xen.gz" in wks_cfg_content
+        assert "console=hvc0" in wks_cfg_content
+
+    def test_vgabios_savannah_mirror(self, vgabios_recipe_content):
+        """Test vgabios uses ${SAVANNAH_GNU_MIRROR} for reliable downloads.
+
+        The old http://savannah.gnu.org/download/ URL can redirect to
+        broken mirrors that return HTML instead of the tarball.
+        """
+        assert "${SAVANNAH_GNU_MIRROR}" in vgabios_recipe_content, \
+            "vgabios should use ${SAVANNAH_GNU_MIRROR} variable"
+        # Should NOT use raw savannah.gnu.org URL
+        assert "http://savannah.gnu.org/download" not in vgabios_recipe_content, \
+            "Should not use raw savannah.gnu.org URL (broken redirects)"

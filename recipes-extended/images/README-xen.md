@@ -165,6 +165,8 @@ Guests can be launched after boot with: xl create -c /etc/xen/<guest>.cfg
 Build and boot
 --------------
 
+### qemuarm64
+
 Using a reference qemuarm64 MACHINE, the following are the commands
 to build and boot a guest.
 
@@ -205,3 +207,36 @@ Name                                        ID   Mem VCPUs      State   Time(s)
 Domain-0                                     0   192     4     r-----     696.2
 xen-guest-image-minimal                      1   512     1     -b----     153.0
 root@qemuarm64:~# xl destroy xen-guest-image-minimal
+
+### qemux86-64
+
+The xen-image-minimal recipe includes x86-64 specific configuration:
+
+  - QB_CPU_KVM uses -cpu host to avoid AVX stripping by Xen's CPUID
+    filtering (required for x86-64-v3 tune)
+  - QB_MEM_VALUE = "1024" for 1GB Dom0 memory
+  - dom0_mem=512M reserves memory for DomU guests
+
+ % MACHINE=qemux86-64 bitbake xen-guest-image-minimal
+ % MACHINE=qemux86-64 bitbake xen-image-minimal
+
+ % runqemu qemux86-64 nographic slirp kvm
+
+qemux86-64 login: root
+
+root@qemux86-64:~# xl list
+Name                                        ID   Mem VCPUs      State   Time(s)
+Domain-0                                     0   512     4     r-----      12.3
+alpine                                       1   256     1     -b----       0.8
+xen-guest-image-minimal                      2   256     1     -b----       3.1
+
+vxn standalone test:
+
+root@qemux86-64:~# vxn run --rm alpine echo hello
+hello
+
+containerd test:
+
+root@qemux86-64:~# ctr image pull docker.io/library/alpine:latest
+root@qemux86-64:~# vctr run --rm docker.io/library/alpine:latest test1 echo hello
+hello
