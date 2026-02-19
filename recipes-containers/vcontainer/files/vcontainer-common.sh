@@ -539,6 +539,7 @@ ${BOLD}${RUNTIME_UPPER}-COMPATIBLE COMMANDS:${NC}
 ${BOLD}EXTENDED COMMANDS (${VCONTAINER_RUNTIME_NAME}-specific):${NC}
     ${CYAN}vimport${NC} <path> [name:tag]    Import from OCI dir, tarball, or directory (auto-detect)
                                  Multi-arch OCI Image Index supported (auto-selects platform)
+    ${CYAN}bundle${NC} <image> <dir> [-- cmd]  Create OCI bundle from image (for vxn-oci-runtime)
     ${CYAN}vrun${NC} [opts] <image> [cmd]    Run command, clearing entrypoint (see RUN vs VRUN below)
     ${CYAN}vstorage${NC}                     List all storage directories (alias: vstorage list)
     ${CYAN}vstorage list${NC}                List all storage directories with details
@@ -3081,6 +3082,123 @@ case "$COMMAND" in
                 exit 1
                 ;;
         esac
+        ;;
+
+    bundle)
+        # Create an OCI runtime bundle from a container image.
+        # Usage: <tool> bundle <image> <output-dir> [-- <cmd> ...]
+        #
+        # Pulls the image via skopeo, extracts layers into rootfs/,
+        # and generates config.json from the OCI image config.
+        # Optional command after -- overrides the image's default entrypoint.
+        # The resulting bundle can be passed to vxn-oci-runtime create --bundle.
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] || {
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} bundle is only supported for Xen (vxn)" >&2
+            exit 1
+        }
+
+        if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
+            echo "Usage: $VCONTAINER_RUNTIME_NAME bundle <image> <output-dir> [-- <cmd> ...]" >&2
+            echo "" >&2
+            echo "Creates an OCI runtime bundle from a container image." >&2
+            echo "The bundle can then be used with vxn-oci-runtime:" >&2
+            echo "" >&2
+            echo "  $VCONTAINER_RUNTIME_NAME bundle alpine /tmp/test-bundle -- /bin/echo hello" >&2
+            echo "  vxn-oci-runtime create --bundle /tmp/test-bundle --pid-file /tmp/t.pid test1" >&2
+            echo "  vxn-oci-runtime start test1" >&2
+            echo "  vxn-oci-runtime state test1" >&2
+            echo "  vxn-oci-runtime delete test1" >&2
+            exit 1
+        fi
+
+        BUNDLE_IMAGE="${COMMAND_ARGS[0]}"
+        BUNDLE_DIR="${COMMAND_ARGS[1]}"
+
+        # Parse optional command override after --
+        BUNDLE_CMD_OVERRIDE=()
+        _bundle_found_sep=false
+        for _ba in "${COMMAND_ARGS[@]:2}"; do
+            if [ "$_bundle_found_sep" = "true" ]; then
+                BUNDLE_CMD_OVERRIDE+=("$_ba")
+            elif [ "$_ba" = "--" ]; then
+                _bundle_found_sep=true
+            fi
+        done
+
+        # Check prerequisites
+        command -v skopeo >/dev/null 2>&1 || {
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} skopeo not found (needed for image pull)" >&2
+            exit 1
+        }
+        command -v jq >/dev/null 2>&1 || {
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} jq not found (needed for OCI config parsing)" >&2
+            exit 1
+        }
+
+        # Pull image via skopeo
+        BUNDLE_TMP=$(mktemp -d)
+        trap 'rm -rf "$BUNDLE_TMP"' EXIT
+        BUNDLE_OCI="$BUNDLE_TMP/oci"
+
+        echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Pulling $BUNDLE_IMAGE..."
+        if ! skopeo copy "docker://$BUNDLE_IMAGE" "oci:$BUNDLE_OCI:latest" 2>&1; then
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to pull image: $BUNDLE_IMAGE" >&2
+            exit 1
+        fi
+
+        # Extract layers into rootfs/
+        mkdir -p "$BUNDLE_DIR/rootfs"
+
+        BUNDLE_MANIFEST_DIGEST=$(jq -r '.manifests[0].digest' "$BUNDLE_OCI/index.json")
+        BUNDLE_MANIFEST="$BUNDLE_OCI/blobs/${BUNDLE_MANIFEST_DIGEST/://}"
+        BUNDLE_CONFIG_DIGEST=$(jq -r '.config.digest' "$BUNDLE_MANIFEST")
+        BUNDLE_CONFIG="$BUNDLE_OCI/blobs/${BUNDLE_CONFIG_DIGEST/://}"
+
+        echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Extracting layers..."
+        for layer_digest in $(jq -r '.layers[].digest' "$BUNDLE_MANIFEST"); do
+            layer_file="$BUNDLE_OCI/blobs/${layer_digest/://}"
+            [ -f "$layer_file" ] && tar -xf "$layer_file" -C "$BUNDLE_DIR/rootfs" 2>/dev/null || true
+        done
+
+        # Parse OCI config
+        BUNDLE_ENTRYPOINT=$(jq -r '(.config.Entrypoint // [])' "$BUNDLE_CONFIG")
+        BUNDLE_CMD=$(jq -r '(.config.Cmd // [])' "$BUNDLE_CONFIG")
+        BUNDLE_ENV=$(jq -r '(.config.Env // [])' "$BUNDLE_CONFIG")
+        BUNDLE_CWD=$(jq -r '.config.WorkingDir // "/"' "$BUNDLE_CONFIG")
+        [ -z "$BUNDLE_CWD" ] && BUNDLE_CWD="/"
+
+        # Merge Entrypoint + Cmd into process.args (or use override)
+        if [ ${#BUNDLE_CMD_OVERRIDE[@]} -gt 0 ]; then
+            BUNDLE_ARGS=$(printf '%s\n' "${BUNDLE_CMD_OVERRIDE[@]}" | jq -R . | jq -s .)
+        else
+            BUNDLE_ARGS=$(jq -n \
+                --argjson ep "$BUNDLE_ENTRYPOINT" \
+                --argjson cmd "$BUNDLE_CMD" \
+                '$ep + $cmd')
+        fi
+
+        # Generate config.json
+        jq -n \
+            --argjson args "$BUNDLE_ARGS" \
+            --argjson env "$BUNDLE_ENV" \
+            --arg cwd "$BUNDLE_CWD" \
+        '{
+            ociVersion: "1.0.2",
+            process: {
+                args: $args,
+                env: $env,
+                cwd: $cwd
+            },
+            root: { path: "rootfs" }
+        }' > "$BUNDLE_DIR/config.json"
+
+        rm -rf "$BUNDLE_TMP"
+        trap - EXIT
+
+        BUNDLE_ARGS_DISPLAY=$(jq -r 'join(" ")' <<< "$BUNDLE_ARGS")
+        echo -e "${GREEN}[$VCONTAINER_RUNTIME_NAME]${NC} Bundle created: $BUNDLE_DIR"
+        echo -e "  entrypoint: $BUNDLE_ARGS_DISPLAY"
+        echo -e "  cwd: $BUNDLE_CWD"
         ;;
 
     *)
