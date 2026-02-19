@@ -37,18 +37,32 @@ BLOB_DIR="/usr/share/vxn"
 LOG_FILE="/var/log/vxn-oci-runtime.log"
 VXN_LOG="/var/log/vxn-oci-runtime.log"
 
+# Write a JSON log entry to the shim's --log file (runc-compatible format).
+# containerd-shim-runc-v2 parses this to extract error messages on failure.
+_log_json() {
+    local level="$1" msg="$2" dest="$3"
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "1970-01-01T00:00:00Z")
+    printf '{"level":"%s","msg":"%s","time":"%s"}\n' "$level" "$msg" "$ts" >> "$dest" 2>/dev/null || true
+}
+
 log() {
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "-")
-    # Always write to our own log (shim overrides LOG_FILE via --log)
+    # Always write plain text to our own log for human debugging
     echo "[$ts] $*" >> "$VXN_LOG" 2>/dev/null || true
+    # Write JSON to shim's log file (if different from our log)
     if [ "$LOG_FILE" != "$VXN_LOG" ]; then
-        echo "[$ts] $*" >> "$LOG_FILE" 2>/dev/null || true
+        _log_json "info" "$*" "$LOG_FILE"
     fi
 }
 
 die() {
     log "FATAL: $*"
+    # Write JSON error to shim log so Docker can extract the message
+    if [ "$LOG_FILE" != "$VXN_LOG" ]; then
+        _log_json "error" "$*" "$LOG_FILE"
+    fi
     echo "vxn-oci-runtime: $*" >&2
     exit 1
 }
@@ -200,9 +214,25 @@ cmd_create() {
 
     log "  entrypoint='$entrypoint' cwd='$cwd' terminal=$terminal"
 
-    # Create ext4 disk image from bundle/rootfs/
-    local rootfs_dir="$bundle/rootfs"
+    # Read rootfs path from config.json (OCI spec: root.path)
+    local rootfs_path=""
+    if command -v jq >/dev/null 2>&1; then
+        rootfs_path=$(jq -r '.root.path // "rootfs"' "$config" 2>/dev/null)
+    else
+        rootfs_path=$(grep -o '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$config" 2>/dev/null | \
+            head -1 | sed 's/.*"path"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        [ -z "$rootfs_path" ] && rootfs_path="rootfs"
+    fi
+    # Resolve relative paths against bundle directory
+    case "$rootfs_path" in
+        /*) ;;
+        *)  rootfs_path="$bundle/$rootfs_path" ;;
+    esac
+
+    local rootfs_dir="$rootfs_path"
     local input_img="$dir/input.img"
+
+    log "  rootfs_dir=$rootfs_dir"
 
     if [ -d "$rootfs_dir" ] && [ -n "$(ls -A "$rootfs_dir" 2>/dev/null)" ]; then
         # Calculate size: rootfs size + 50% headroom, minimum 64MB
@@ -213,8 +243,14 @@ cmd_create() {
 
         log "  Creating ext4 image: ${img_size_kb}KB from $rootfs_dir"
         mke2fs -t ext4 -d "$rootfs_dir" -b 4096 "$input_img" "${img_size_kb}K" \
-            >> "$LOG_FILE" 2>&1 || die "create: failed to create ext4 image"
+            >> "$VXN_LOG" 2>&1 || die "create: failed to create ext4 image"
     else
+        # Diagnostics: log what we actually see
+        log "  DIAG: bundle contents: $(ls -la "$bundle/" 2>&1)"
+        log "  DIAG: rootfs_dir exists=$([ -d "$rootfs_dir" ] && echo yes || echo no)"
+        log "  DIAG: rootfs_dir contents: $(ls -la "$rootfs_dir" 2>&1)"
+        log "  DIAG: mounts at bundle: $(mount 2>/dev/null | grep "$(dirname "$bundle")" || echo none)"
+        log "  DIAG: config.json root: $(grep -o '"root"[^}]*}' "$config" 2>/dev/null)"
         die "create: $rootfs_dir is empty or does not exist"
     fi
 
@@ -271,7 +307,7 @@ XENEOF
     log "  Xen config written to $config_cfg"
 
     # Create domain in paused state (OCI spec: create does not start)
-    xl create -p "$config_cfg" >> "$LOG_FILE" 2>&1 || die "create: xl create -p failed"
+    xl create -p "$config_cfg" >> "$VXN_LOG" 2>&1 || die "create: xl create -p failed"
 
     log "  Domain $domname created (paused)"
 
@@ -327,33 +363,54 @@ DBGEOF
 
     # Monitor process: tracks domain lifecycle and captures output.
     #
-    # Non-terminal mode: xl console captures the domain's serial output.
-    # When the domain dies, xl console exits (PTY closes). We immediately
-    # extract content between OUTPUT_START/END markers and write to stdout.
-    # stdout is the shim's pipe → containerd copies to client FIFO → ctr.
+    # The shim monitors the PID written to --pid-file. The monitor MUST stay
+    # alive through the full create→start→run→exit lifecycle. If the monitor
+    # dies before start is called, the shim skips start and goes to cleanup.
     #
-    # CRITICAL: We use "wait" on xl console instead of polling xl list.
-    # Polling with sleep 5 was too slow — the shim detected "stopped" and
-    # killed the monitor before it had a chance to output. Using wait gives
-    # us instant reaction when the domain dies.
+    # Non-terminal mode: we poll xl list to wait for the domain to be
+    # unpaused and to run to completion. Once the domain dies, we attach
+    # xl console to read the console ring buffer, extract OUTPUT_START/END
+    # markers, and relay the output to stdout (the shim's pipe).
+    #
+    # IMPORTANT: We cannot run xl console on a paused domain — it exits
+    # immediately with no output. Instead we wait for the domain to finish,
+    # then read the console ring buffer post-mortem via xl console -r (dmesg).
+    # However, xl console on a destroyed domain also fails. So we use a
+    # two-phase approach: poll for domain to start running, then attach
+    # xl console which will block until the domain dies.
     #
     # Terminal mode (console-socket): the shim owns the PTY exclusively.
     # We just wait for the domain to exit without capturing console.
     local _dn="$domname" _logdir="$logdir" _csock="$console_socket"
     (
         if [ -z "$_csock" ]; then
-            # Non-terminal: capture console to persistent log dir
-            xl console "$_dn" > "$_logdir/console.log" 2>&1 &
-            _cpid=$!
+            # Non-terminal: stay alive until domain finishes, then capture output.
+            #
+            # Phase 1: Wait for domain to exist and be unpaused (start called).
+            # The domain is created paused — xl console would exit immediately.
+            # Poll until it transitions from 'p' (paused) to running, or dies.
+            while xl list "$_dn" >/dev/null 2>&1; do
+                # Check if domain is still paused
+                local _state
+                _state=$(xl list "$_dn" 2>/dev/null | awk -v dn="$_dn" '$1 == dn {print $5}')
+                # States: r=running, b=blocked, p=paused, s=shutdown, c=crashed, d=dying
+                case "$_state" in
+                    p) sleep 0.2; continue ;;  # Still paused, keep waiting
+                    *)  break ;;               # Running/blocked/other — proceed
+                esac
+            done
 
-            # Wait for xl console to exit — domain death closes the PTY,
-            # which causes xl console to exit immediately. No polling delay.
-            wait $_cpid 2>/dev/null
+            # Phase 2: Domain is running (or already dead). Attach xl console
+            # to capture serial output. xl console blocks until PTY closes
+            # (domain death), then exits.
+            if xl list "$_dn" >/dev/null 2>&1; then
+                xl console "$_dn" > "$_logdir/console.log" 2>&1 || true
+            fi
 
-            # Extract output between markers and write to stdout.
-            # stdout IS the shim's pipe (confirmed: fd1=pipe). The shim's
-            # io.Copy goroutine reads from this pipe and writes to the
-            # containerd client FIFO. ctr reads from the FIFO.
+            # Phase 3: Extract output between markers and write to stdout.
+            # stdout IS the shim's pipe (fd1=pipe). The shim's io.Copy
+            # goroutine reads from this pipe and writes to the containerd
+            # client FIFO. ctr reads from the FIFO.
             if [ -f "$_logdir/console.log" ]; then
                 _relay=false
                 while IFS= read -r _line; do
@@ -409,7 +466,7 @@ cmd_start() {
     xl list "$domname" >/dev/null 2>&1 || die "start: domain $domname not found"
 
     # Unpause the domain
-    xl unpause "$domname" >> "$LOG_FILE" 2>&1 || die "start: xl unpause failed"
+    xl unpause "$domname" >> "$VXN_LOG" 2>&1 || die "start: xl unpause failed"
 
     # Update state
     local pid bundle created
@@ -462,11 +519,30 @@ EOF
 }
 
 cmd_kill() {
-    local container_id="$1"
-    local signal="${2:-SIGTERM}"
+    local container_id=""
+    local signal="SIGTERM"
+    local kill_all=false
+
+    # Parse arguments: runc accepts `kill [flags] <container-id> [signal]`
+    # Docker sends: kill --all <container-id> <signal>
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all|-a)    kill_all=true; shift ;;
+            -*)          shift ;;  # skip unknown flags
+            *)
+                if [ -z "$container_id" ]; then
+                    container_id="$1"
+                else
+                    signal="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
     [ -n "$container_id" ] || die "kill: container ID required"
 
-    log "KILL: id=$container_id signal=$signal"
+    log "KILL: id=$container_id signal=$signal all=$kill_all"
     load_state "$container_id"
 
     local dir
@@ -477,24 +553,24 @@ cmd_kill() {
     # Normalize signal: accept both numeric and symbolic forms
     case "$signal" in
         9|SIGKILL|KILL)
-            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            xl destroy "$domname" >> "$VXN_LOG" 2>&1 || true
             ;;
         2|SIGINT|INT)
-            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            xl destroy "$domname" >> "$VXN_LOG" 2>&1 || true
             ;;
         15|SIGTERM|TERM|"")
-            xl shutdown "$domname" >> "$LOG_FILE" 2>&1 || true
+            xl shutdown "$domname" >> "$VXN_LOG" 2>&1 || true
             # Wait briefly for graceful shutdown, then force destroy
             local i
             for i in 1 2 3 4 5 6 7 8 9 10; do
                 xl list "$domname" >/dev/null 2>&1 || break
                 sleep 1
             done
-            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            xl destroy "$domname" >> "$VXN_LOG" 2>&1 || true
             ;;
         *)
             # Unknown signal — treat as SIGTERM
-            xl shutdown "$domname" >> "$LOG_FILE" 2>&1 || true
+            xl shutdown "$domname" >> "$VXN_LOG" 2>&1 || true
             ;;
     esac
 
@@ -542,7 +618,7 @@ cmd_delete() {
         local domname
         domname=$(cat "$dir/domname")
         if xl list "$domname" >/dev/null 2>&1; then
-            xl destroy "$domname" >> "$LOG_FILE" 2>&1 || true
+            xl destroy "$domname" >> "$VXN_LOG" 2>&1 || true
         fi
     fi
 

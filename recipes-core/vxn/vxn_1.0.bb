@@ -67,6 +67,8 @@ SRC_URI = "\
     file://containerd-config-vxn.toml \
     file://containerd-shim-vxn-v2 \
     file://vctr \
+    file://vdkr.sh \
+    file://vpdmn.sh \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -221,6 +223,24 @@ do_install() {
     # Install vctr convenience wrapper
     install -m 0755 ${S}/vctr ${D}${bindir}/vctr
 
+    # Docker/Podman CLI frontends (sub-packages)
+    install -m 0755 ${S}/vdkr.sh ${D}${bindir}/vdkr
+    install -m 0755 ${S}/vpdmn.sh ${D}${bindir}/vpdmn
+
+    # Docker daemon config: register vxn-oci-runtime (vxn-docker-config sub-package)
+    # no-new-privileges=false is needed because vxn ignores Linux security features.
+    # Users must use --network=none or --network=host with vxn containers since
+    # Xen DomUs have their own kernel network stack and Docker's veth/namespace
+    # setup is incompatible with VM-based runtimes.
+    install -d ${D}${sysconfdir}/docker
+    printf '{\n  "runtimes": {\n    "vxn": {\n      "path": "/usr/bin/vxn-oci-runtime"\n    }\n  },\n  "default-runtime": "vxn"\n}\n' \
+        > ${D}${sysconfdir}/docker/daemon.json
+
+    # Podman config: register vxn-oci-runtime (vxn-podman-config sub-package)
+    install -d ${D}${sysconfdir}/containers/containers.conf.d
+    printf '[engine]\nruntime = "vxn"\n\n[engine.runtimes]\nvxn = ["/usr/bin/vxn-oci-runtime"]\n' \
+        > ${D}${sysconfdir}/containers/containers.conf.d/50-vxn-runtime.conf
+
     # Install shared scripts into libdir
     install -d ${D}${libdir}/vxn
     install -m 0755 ${S}/vrunner.sh ${D}${libdir}/vxn/
@@ -252,6 +272,22 @@ do_install() {
         bbwarn "Rootfs blob not found in build dir"
     fi
 }
+
+# Sub-packages for CLI frontends and native runtime config
+PACKAGES =+ "${PN}-vdkr ${PN}-vpdmn ${PN}-docker-config ${PN}-podman-config"
+
+FILES:${PN}-vdkr = "${bindir}/vdkr"
+FILES:${PN}-vpdmn = "${bindir}/vpdmn"
+FILES:${PN}-docker-config = "${sysconfdir}/docker/daemon.json"
+FILES:${PN}-podman-config = "${sysconfdir}/containers/containers.conf.d/50-vxn-runtime.conf"
+
+RDEPENDS:${PN}-vdkr = "${PN} bash"
+RDEPENDS:${PN}-vpdmn = "${PN} bash"
+RDEPENDS:${PN}-docker-config = "${PN} docker"
+RDEPENDS:${PN}-podman-config = "${PN} podman"
+
+# daemon.json conflicts with docker-registry-config (only one provider)
+RCONFLICTS:${PN}-docker-config = "docker-registry-config"
 
 FILES:${PN} = "\
     ${bindir}/vxn \

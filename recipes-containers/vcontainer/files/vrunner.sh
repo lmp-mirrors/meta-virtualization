@@ -515,6 +515,13 @@ if [ ! -f "$HV_BACKEND" ]; then
 fi
 source "$HV_BACKEND"
 
+# Xen backend uses vxn-init.sh which is a unified init (no Docker/Podman
+# daemon in guest). It always parses docker_* kernel parameters regardless
+# of which frontend (vdkr/vpdmn) invoked us.
+if [ "$VCONTAINER_HYPERVISOR" = "xen" ]; then
+    CMDLINE_PREFIX="docker"
+fi
+
 # Daemon mode handling
 # Set default socket directory based on architecture
 # If --state-dir was provided, use it for daemon files too
