@@ -486,6 +486,105 @@ EOF
     return 0
 }
 
+# ============================================================================
+# Host-side OCI Image Cache (Xen standalone path)
+# ============================================================================
+# Cache layout:
+#   ~/.vxn/images/refs/     - Symlinks from normalized image names to store dirs
+#   ~/.vxn/images/store/    - Content-addressed OCI layout dirs by manifest digest
+
+VXN_IMAGE_CACHE="${VXN_IMAGE_CACHE:-$HOME/.vxn/images}"
+
+vxn_normalize_image_name() {
+    # alpine → docker.io/library/alpine:latest
+    # nginx:1.25 → docker.io/library/nginx:1.25
+    # ghcr.io/foo/bar → ghcr.io/foo/bar:latest
+    local name="$1"
+    # Add default registry
+    case "$name" in
+        *.*/*) ;;                             # has registry (contains . before /)
+        */*) name="docker.io/$name" ;;        # has namespace, no registry
+        *)   name="docker.io/library/$name" ;; # bare name
+    esac
+    # Add default tag
+    case "$name" in
+        *:*) ;;                               # already has tag/digest
+        *)   name="$name:latest" ;;
+    esac
+    echo "$name"
+}
+
+vxn_image_ref_key() {
+    # docker.io/library/alpine:latest → docker.io_library_alpine:latest
+    local name="$1"
+    echo "$name" | tr '/' '_'
+}
+
+vxn_image_cache_lookup() {
+    # Returns OCI dir path if cached, empty if not
+    local image="$1"
+    local normalized ref_key ref_link
+    normalized=$(vxn_normalize_image_name "$image")
+    ref_key=$(vxn_image_ref_key "$normalized")
+    ref_link="$VXN_IMAGE_CACHE/refs/$ref_key"
+    if [ -L "$ref_link" ] && [ -d "$ref_link" ]; then
+        readlink -f "$ref_link"
+    fi
+}
+
+vxn_image_cache_store() {
+    # Store OCI dir in cache, create ref symlink
+    # $1 = image name, $2 = source OCI dir
+    local image="$1" oci_dir="$2"
+    local normalized ref_key manifest_digest store_dir
+    normalized=$(vxn_normalize_image_name "$image")
+    ref_key=$(vxn_image_ref_key "$normalized")
+
+    mkdir -p "$VXN_IMAGE_CACHE/refs" "$VXN_IMAGE_CACHE/store/sha256"
+
+    # Get manifest digest for content-addressed storage
+    manifest_digest=$(grep -o '"sha256:[a-f0-9]*"' "$oci_dir/index.json" 2>/dev/null | head -1 | tr -d '"')
+    manifest_digest="${manifest_digest#sha256:}"
+    if [ -z "$manifest_digest" ]; then
+        # Fallback: hash the index.json itself
+        manifest_digest=$(sha256sum "$oci_dir/index.json" | cut -d' ' -f1)
+    fi
+
+    store_dir="$VXN_IMAGE_CACHE/store/sha256/$manifest_digest"
+    if [ ! -d "$store_dir" ]; then
+        cp -a "$oci_dir" "$store_dir"
+    fi
+
+    # Create/update ref symlink (relative path)
+    ln -sfn "../store/sha256/$manifest_digest" "$VXN_IMAGE_CACHE/refs/$ref_key"
+}
+
+vxn_image_cache_inspect() {
+    # Print OCI config info (Entrypoint, Cmd, Env, WorkingDir)
+    local oci_dir="$1"
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq not found, cannot inspect image" >&2
+        return 1
+    fi
+    local manifest_digest config_digest manifest_file config_file
+    manifest_digest=$(jq -r '.manifests[0].digest' "$oci_dir/index.json" 2>/dev/null)
+    manifest_file="$oci_dir/blobs/${manifest_digest/://}"
+    [ -f "$manifest_file" ] || { echo "Manifest not found" >&2; return 1; }
+    config_digest=$(jq -r '.config.digest' "$manifest_file" 2>/dev/null)
+    config_file="$oci_dir/blobs/${config_digest/://}"
+    [ -f "$config_file" ] || { echo "Config not found" >&2; return 1; }
+    jq '{
+        Entrypoint: .config.Entrypoint,
+        Cmd: .config.Cmd,
+        Env: .config.Env,
+        WorkingDir: .config.WorkingDir,
+        ExposedPorts: .config.ExposedPorts,
+        Labels: .config.Labels,
+        Architecture: .architecture,
+        Os: .os
+    }' "$config_file"
+}
+
 show_usage() {
     local PROG_NAME=$(basename "$0")
     local RUNTIME_UPPER=$(echo "$VCONTAINER_RUNTIME_CMD" | sed 's/./\U&/')
@@ -1470,13 +1569,102 @@ case "$COMMAND" in
         # docker image rm → docker rmi
         # docker image pull → docker pull
         # etc.
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "image"
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} image requires a subcommand (ls, rm, pull, inspect, tag, push, prune)" >&2
             exit 1
         fi
         SUBCMD="${COMMAND_ARGS[0]}"
         SUBCMD_ARGS=("${COMMAND_ARGS[@]:1}")
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            # Xen: delegate to cache-based image subcommands
+            case "$SUBCMD" in
+                ls|list)
+                    printf "%-40s %-15s %-12s\n" "REPOSITORY:TAG" "SIZE" "CACHED"
+                    if [ -d "$VXN_IMAGE_CACHE/refs" ]; then
+                        for ref in "$VXN_IMAGE_CACHE/refs"/*; do
+                            [ -L "$ref" ] || continue
+                            _vxn_ref_name=$(basename "$ref" | tr '_' '/')
+                            _vxn_store_dir=$(readlink -f "$ref")
+                            _vxn_size="unknown"
+                            [ -d "$_vxn_store_dir" ] && _vxn_size=$(du -sh "$_vxn_store_dir" 2>/dev/null | cut -f1)
+                            printf "%-40s %-15s %-12s\n" "$_vxn_ref_name" "$_vxn_size" "yes"
+                        done
+                    fi
+                    exit 0
+                    ;;
+                rm|remove)
+                    [ ${#SUBCMD_ARGS[@]} -lt 1 ] && { echo "rmi requires <image>" >&2; exit 1; }
+                    _vxn_normalized=$(vxn_normalize_image_name "${SUBCMD_ARGS[0]}")
+                    _vxn_ref_key=$(vxn_image_ref_key "$_vxn_normalized")
+                    _vxn_ref_link="$VXN_IMAGE_CACHE/refs/$_vxn_ref_key"
+                    if [ -L "$_vxn_ref_link" ]; then
+                        _vxn_store_dir=$(readlink -f "$_vxn_ref_link")
+                        rm -f "$_vxn_ref_link"
+                        _vxn_other_refs=$(find "$VXN_IMAGE_CACHE/refs" -lname "*/$(basename "$_vxn_store_dir")" 2>/dev/null | wc -l)
+                        [ "$_vxn_other_refs" -eq 0 ] && rm -rf "$_vxn_store_dir"
+                        echo "Removed: $_vxn_normalized"
+                    else
+                        echo "Image not found: $_vxn_normalized" >&2; exit 1
+                    fi
+                    exit 0
+                    ;;
+                pull)
+                    [ ${#SUBCMD_ARGS[@]} -lt 1 ] && { echo "pull requires <image>" >&2; exit 1; }
+                    IMAGE_NAME="${SUBCMD_ARGS[0]}"
+                    command -v skopeo >/dev/null 2>&1 || { echo "skopeo not found" >&2; exit 1; }
+                    _vxn_normalized=$(vxn_normalize_image_name "$IMAGE_NAME")
+                    echo "Pulling $_vxn_normalized..."
+                    _vxn_tmpoci="$(mktemp -d)/oci-image"
+                    if skopeo copy "docker://$_vxn_normalized" "oci:$_vxn_tmpoci:latest" 2>&1; then
+                        vxn_image_cache_store "$IMAGE_NAME" "$_vxn_tmpoci"
+                        rm -rf "$(dirname "$_vxn_tmpoci")"
+                        echo "Pulled: $_vxn_normalized"
+                    else
+                        rm -rf "$(dirname "$_vxn_tmpoci")"
+                        echo "Failed to pull $_vxn_normalized" >&2; exit 1
+                    fi
+                    exit 0
+                    ;;
+                inspect)
+                    [ ${#SUBCMD_ARGS[@]} -lt 1 ] && { echo "inspect requires <image>" >&2; exit 1; }
+                    _vxn_cached_oci=$(vxn_image_cache_lookup "${SUBCMD_ARGS[0]}")
+                    if [ -n "$_vxn_cached_oci" ]; then
+                        vxn_image_cache_inspect "$_vxn_cached_oci"
+                    else
+                        echo "Image not found: ${SUBCMD_ARGS[0]}" >&2; exit 1
+                    fi
+                    exit 0
+                    ;;
+                tag)
+                    [ ${#SUBCMD_ARGS[@]} -lt 2 ] && { echo "tag requires <source> <target>" >&2; exit 1; }
+                    _vxn_src_oci=$(vxn_image_cache_lookup "${SUBCMD_ARGS[0]}")
+                    if [ -z "$_vxn_src_oci" ]; then
+                        echo "Image not found: ${SUBCMD_ARGS[0]}" >&2; exit 1
+                    fi
+                    _vxn_target_normalized=$(vxn_normalize_image_name "${SUBCMD_ARGS[1]}")
+                    _vxn_target_ref_key=$(vxn_image_ref_key "$_vxn_target_normalized")
+                    mkdir -p "$VXN_IMAGE_CACHE/refs"
+                    # Point new ref to same store dir
+                    _vxn_store_base=$(basename "$_vxn_src_oci")
+                    ln -sfn "../store/sha256/$_vxn_store_base" "$VXN_IMAGE_CACHE/refs/$_vxn_target_ref_key"
+                    echo "Tagged: $_vxn_target_normalized"
+                    exit 0
+                    ;;
+                push)
+                    vxn_not_yet "image push"
+                    ;;
+                prune)
+                    vxn_not_yet "image prune"
+                    ;;
+                history)
+                    vxn_not_yet "image history"
+                    ;;
+                *)
+                    echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Unknown image subcommand: $SUBCMD" >&2
+                    exit 1
+                    ;;
+            esac
+        fi
         case "$SUBCMD" in
             ls|list)
                 run_runtime_command "$VCONTAINER_RUNTIME_CMD images ${SUBCMD_ARGS[*]}"
@@ -1525,15 +1713,26 @@ case "$COMMAND" in
         ;;
 
     images)
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "images"
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            printf "%-40s %-15s %-12s\n" "REPOSITORY:TAG" "SIZE" "CACHED"
+            if [ -d "$VXN_IMAGE_CACHE/refs" ]; then
+                for ref in "$VXN_IMAGE_CACHE/refs"/*; do
+                    [ -L "$ref" ] || continue
+                    _vxn_ref_name=$(basename "$ref" | tr '_' '/')
+                    _vxn_store_dir=$(readlink -f "$ref")
+                    _vxn_size="unknown"
+                    [ -d "$_vxn_store_dir" ] && _vxn_size=$(du -sh "$_vxn_store_dir" 2>/dev/null | cut -f1)
+                    printf "%-40s %-15s %-12s\n" "$_vxn_ref_name" "$_vxn_size" "yes"
+                done
+            fi
+            exit 0
+        fi
         # runtime images
         run_runtime_command "$VCONTAINER_RUNTIME_CMD images ${COMMAND_ARGS[*]}"
         ;;
 
     pull)
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "pull"
         # runtime pull <image>
-        # Daemon mode already has networking enabled, so this works via daemon
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} pull requires <image>" >&2
             exit 1
@@ -1541,6 +1740,24 @@ case "$COMMAND" in
 
         IMAGE_NAME="${COMMAND_ARGS[0]}"
 
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            # Host-side pull via skopeo → cache
+            command -v skopeo >/dev/null 2>&1 || { echo "skopeo not found" >&2; exit 1; }
+            _vxn_normalized=$(vxn_normalize_image_name "$IMAGE_NAME")
+            echo "Pulling $_vxn_normalized..."
+            _vxn_tmpoci="$(mktemp -d)/oci-image"
+            if skopeo copy "docker://$_vxn_normalized" "oci:$_vxn_tmpoci:latest" 2>&1; then
+                vxn_image_cache_store "$IMAGE_NAME" "$_vxn_tmpoci"
+                rm -rf "$(dirname "$_vxn_tmpoci")"
+                echo "Pulled: $_vxn_normalized"
+            else
+                rm -rf "$(dirname "$_vxn_tmpoci")"
+                echo "Failed to pull $_vxn_normalized" >&2; exit 1
+            fi
+            exit 0
+        fi
+
+        # Daemon mode already has networking enabled, so this works via daemon
         if daemon_is_running; then
             # Use daemon mode (already has networking)
             run_runtime_command "$VCONTAINER_RUNTIME_CMD pull $IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
@@ -1768,7 +1985,42 @@ case "$COMMAND" in
         ;;
 
     tag|rmi)
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "$COMMAND"
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            case "$COMMAND" in
+                rmi)
+                    [ ${#COMMAND_ARGS[@]} -lt 1 ] && { echo "rmi requires <image>" >&2; exit 1; }
+                    IMAGE_NAME="${COMMAND_ARGS[0]}"
+                    _vxn_normalized=$(vxn_normalize_image_name "$IMAGE_NAME")
+                    _vxn_ref_key=$(vxn_image_ref_key "$_vxn_normalized")
+                    _vxn_ref_link="$VXN_IMAGE_CACHE/refs/$_vxn_ref_key"
+                    if [ -L "$_vxn_ref_link" ]; then
+                        _vxn_store_dir=$(readlink -f "$_vxn_ref_link")
+                        rm -f "$_vxn_ref_link"
+                        # Remove store dir if no other refs point to it
+                        _vxn_other_refs=$(find "$VXN_IMAGE_CACHE/refs" -lname "*/$(basename "$_vxn_store_dir")" 2>/dev/null | wc -l)
+                        [ "$_vxn_other_refs" -eq 0 ] && rm -rf "$_vxn_store_dir"
+                        echo "Removed: $_vxn_normalized"
+                    else
+                        echo "Image not found: $_vxn_normalized" >&2; exit 1
+                    fi
+                    exit 0
+                    ;;
+                tag)
+                    [ ${#COMMAND_ARGS[@]} -lt 2 ] && { echo "tag requires <source> <target>" >&2; exit 1; }
+                    _vxn_src_oci=$(vxn_image_cache_lookup "${COMMAND_ARGS[0]}")
+                    if [ -z "$_vxn_src_oci" ]; then
+                        echo "Image not found: ${COMMAND_ARGS[0]}" >&2; exit 1
+                    fi
+                    _vxn_target_normalized=$(vxn_normalize_image_name "${COMMAND_ARGS[1]}")
+                    _vxn_target_ref_key=$(vxn_image_ref_key "$_vxn_target_normalized")
+                    mkdir -p "$VXN_IMAGE_CACHE/refs"
+                    _vxn_store_base=$(basename "$_vxn_src_oci")
+                    ln -sfn "../store/sha256/$_vxn_store_base" "$VXN_IMAGE_CACHE/refs/$_vxn_target_ref_key"
+                    echo "Tagged: $_vxn_target_normalized"
+                    exit 0
+                    ;;
+            esac
+        fi
         # Commands that work with existing images
         run_runtime_command "$VCONTAINER_RUNTIME_CMD $COMMAND ${COMMAND_ARGS[*]}"
         ;;
@@ -1872,7 +2124,17 @@ case "$COMMAND" in
         ;;
 
     inspect)
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_not_yet "inspect"
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            [ ${#COMMAND_ARGS[@]} -lt 1 ] && { echo "inspect requires <image>" >&2; exit 1; }
+            _vxn_cached_oci=$(vxn_image_cache_lookup "${COMMAND_ARGS[0]}")
+            if [ -n "$_vxn_cached_oci" ]; then
+                vxn_image_cache_inspect "$_vxn_cached_oci"
+                exit 0
+            fi
+            # Not in image cache — could be a container name on Xen
+            echo "Not found: ${COMMAND_ARGS[0]}" >&2
+            exit 1
+        fi
         # Inspect container or image
         run_runtime_command "$VCONTAINER_RUNTIME_CMD inspect ${COMMAND_ARGS[*]}"
         ;;

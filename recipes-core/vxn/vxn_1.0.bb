@@ -228,12 +228,14 @@ do_install() {
     install -m 0755 ${S}/vpdmn.sh ${D}${bindir}/vpdmn
 
     # Docker daemon config: register vxn-oci-runtime (vxn-docker-config sub-package)
-    # no-new-privileges=false is needed because vxn ignores Linux security features.
-    # Users must use --network=none or --network=host with vxn containers since
-    # Xen DomUs have their own kernel network stack and Docker's veth/namespace
-    # setup is incompatible with VM-based runtimes.
+    # iptables=false: Docker's default FORWARD DROP policy blocks DHCP and
+    # bridged traffic for Xen DomU vifs on xenbr0. Since vxn containers are
+    # full VMs with their own network stack, Docker's iptables rules are
+    # unnecessary and harmful. Note: bridge networking is left enabled so
+    # that 'docker pull' works (needs bridge for DNS). Users must pass
+    # --network=none for 'docker run' (veth/netns incompatible with VMs).
     install -d ${D}${sysconfdir}/docker
-    printf '{\n  "runtimes": {\n    "vxn": {\n      "path": "/usr/bin/vxn-oci-runtime"\n    }\n  },\n  "default-runtime": "vxn"\n}\n' \
+    printf '{\n  "runtimes": {\n    "vxn": {\n      "path": "/usr/bin/vxn-oci-runtime"\n    }\n  },\n  "default-runtime": "vxn",\n  "iptables": false\n}\n' \
         > ${D}${sysconfdir}/docker/daemon.json
 
     # Podman config: register vxn-oci-runtime (vxn-podman-config sub-package)
