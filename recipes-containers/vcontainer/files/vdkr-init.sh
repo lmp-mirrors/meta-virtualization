@@ -652,13 +652,13 @@ setup_cgroups
 # Parse kernel command line
 parse_cmdline
 
-# Mount virtio-9p share if available (for fast storage output in batch-import mode)
+# Mount 9p share if available (for fast storage output in batch-import mode)
 if [ "$RUNTIME_9P" = "1" ]; then
     mkdir -p /mnt/share
-    if mount -t 9p -o trans=virtio,version=9p2000.L,cache=none ${VCONTAINER_SHARE_NAME} /mnt/share 2>/dev/null; then
-        log "Mounted virtio-9p share at /mnt/share (fast I/O enabled)"
+    if mount -t 9p -o trans=${NINE_P_TRANSPORT},version=9p2000.L,cache=none ${VCONTAINER_SHARE_NAME} /mnt/share 2>/dev/null; then
+        log "Mounted 9p share at /mnt/share (transport: ${NINE_P_TRANSPORT})"
     else
-        log "WARNING: Could not mount virtio-9p share, falling back to console output"
+        log "WARNING: Could not mount 9p share, falling back to console output"
         RUNTIME_9P="0"
     fi
 fi
