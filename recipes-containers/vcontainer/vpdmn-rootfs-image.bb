@@ -23,6 +23,7 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 # This adds the file content hash to the task signature
 do_rootfs[file-checksums] += "${THISDIR}/files/vpdmn-init.sh:True"
 do_rootfs[file-checksums] += "${THISDIR}/files/vcontainer-init-common.sh:True"
+do_rootfs[file-checksums] += "${THISDIR}/files/vxn-init.sh:True"
 
 # Force rebuild control:
 # Set VCONTAINER_FORCE_BUILD = "1" in local.conf to disable stamp caching
@@ -74,6 +75,9 @@ install_vpdmn_init() {
     # Install vpdmn-init.sh as /init and vcontainer-init-common.sh alongside it
     install -m 0755 ${THISDIR}/files/vpdmn-init.sh ${IMAGE_ROOTFS}/init
     install -m 0755 ${THISDIR}/files/vcontainer-init-common.sh ${IMAGE_ROOTFS}/vcontainer-init-common.sh
+
+    # Install vxn-init.sh for Xen backend (selected via vcontainer.init=/vxn-init.sh)
+    install -m 0755 ${THISDIR}/files/vxn-init.sh ${IMAGE_ROOTFS}/vxn-init.sh
 
     # Create required directories
     install -d ${IMAGE_ROOTFS}/mnt/input
