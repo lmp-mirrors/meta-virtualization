@@ -586,6 +586,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "secure: marks tests that require secure registry mode (TLS/auth)"
     )
+    config.addinivalue_line(
+        "markers", "boot: marks tests that boot a QEMU image (requires built image)"
+    )
 
 
 @pytest.fixture
