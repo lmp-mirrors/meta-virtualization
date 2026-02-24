@@ -1266,8 +1266,13 @@ if [ "$DAEMON_MODE" = "start" ]; then
         exit 1
     fi
 
-    # Create socket directory
+    # Create socket directory and shared folder for daemon 9p
     mkdir -p "$DAEMON_SOCKET_DIR"
+    DAEMON_SHARE_DIR="$DAEMON_SOCKET_DIR/share"
+    mkdir -p "$DAEMON_SHARE_DIR"
+    SHARE_TAG="${TOOL_NAME}_share"
+    hv_build_9p_opts "$DAEMON_SHARE_DIR" "$SHARE_TAG"
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_9p=1"
 
     # Add daemon command channel (backend-specific: virtio-serial or PV console)
     hv_build_daemon_opts
