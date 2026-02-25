@@ -139,6 +139,32 @@ VM isolation.
 - `vctr`/`ctr` (containerd) — CNI is separate and opt-in
 - `vdkr`/`vpdmn` — Handle networking independently via xenbr0
 
+## Testing
+
+Automated runtime tests boot xen-image-minimal and verify vxn end-to-end:
+
+```bash
+pip install pytest pexpect
+
+# All Xen runtime tests (requires built image + KVM)
+cd meta-virtualization
+pytest tests/test_xen_runtime.py -v --machine qemux86-64
+
+# vxn/containerd tests only
+pytest tests/test_xen_runtime.py -v -k "Vxn or Containerd"
+
+# Skip network-dependent tests
+pytest tests/test_xen_runtime.py -v -m "boot and not network"
+```
+
+The tests boot the image with `qemuparams="-m 4096"` to provide enough
+memory for Dom0 + bundled guests + vxn/vctr guests. Tests detect
+available features inside Dom0 and skip gracefully when components are
+not installed.
+
+See `tests/README.md` for full test documentation and `recipes-extended/images/README-xen.md`
+for build prerequisites at each test tier.
+
 ## Debugging
 
 ```bash

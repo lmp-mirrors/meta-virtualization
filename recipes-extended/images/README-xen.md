@@ -220,7 +220,7 @@ The xen-image-minimal recipe includes x86-64 specific configuration:
  % MACHINE=qemux86-64 bitbake xen-guest-image-minimal
  % MACHINE=qemux86-64 bitbake xen-image-minimal
 
- % runqemu qemux86-64 nographic slirp kvm
+ % runqemu qemux86-64 nographic slirp kvm qemuparams="-m 4096"
 
 qemux86-64 login: root
 
@@ -240,3 +240,94 @@ containerd test:
 root@qemux86-64:~# ctr image pull docker.io/library/alpine:latest
 root@qemux86-64:~# vctr run --rm docker.io/library/alpine:latest test1 echo hello
 hello
+
+vxn and containerd integration
+------------------------------
+
+vxn runs OCI containers as Xen DomU guests. The VM IS the container —
+no Docker daemon runs inside the guest. The guest boots a minimal Linux,
+mounts the container's filesystem, and directly executes the entrypoint.
+
+There are multiple execution paths, all coexisting on the same Dom0:
+
+| Path | CLI | How it works |
+|------|-----|-------------|
+| containerd | `vctr run`, `ctr run` | containerd → shim → vxn-oci-runtime → xl create |
+| vxn standalone | `vxn run` | OCI pull on host → xl create → guest exec |
+| vdkr/vpdmn | `vdkr run`, `vpdmn run` | Docker/Podman-like CLI, no daemon, auto-detects Xen |
+| Native Docker | `docker run --network=none` | dockerd → containerd → vxn-oci-runtime |
+| Native Podman | `podman run --network=none` | conmon → vxn-oci-runtime |
+
+To enable vxn and containerd on a Dom0 image, add to local.conf:
+
+  DISTRO_FEATURES:append = " virtualization vcontainer vxn"
+  IMAGE_INSTALL:append:pn-xen-image-minimal = " vxn"
+  BBMULTICONFIG = "vruntime-aarch64 vruntime-x86-64"
+
+See recipes-core/vxn/README.md for full package and build details.
+
+Memory requirements
+-------------------
+
+The recipe sets QB_MEM_VALUE = "1024" (1 GB total QEMU memory). This is
+sufficient for Dom0 + one bundled guest, but not enough for vxn/vctr
+which need to create additional Xen domains at runtime.
+
+For vxn/containerd testing, pass extra memory via qemuparams:
+
+  % runqemu qemux86-64 nographic slirp kvm qemuparams="-m 4096"
+
+Memory budget at 4 GB total:
+
+  | Component | Memory |
+  |-----------|--------|
+  | Domain-0  | 512 MB (dom0_mem=512M) |
+  | Alpine guest (bundled) | 256 MB |
+  | vxn/vctr guest | 256 MB |
+  | Free for additional guests | ~3 GB |
+
+Runtime tests
+-------------
+
+The pytest suite in tests/test_xen_runtime.py boots xen-image-minimal
+via runqemu and verifies the Xen environment end-to-end:
+
+  | Test Class | What It Checks |
+  |------------|---------------|
+  | TestXenDom0Boot | xl list shows Domain-0, dmesg has Xen messages, memory cap |
+  | TestXenGuestBundleRuntime | Bundled guests visible in xl list, xendomains service |
+  | TestXenVxnStandalone | vxn binary present, vxn run --rm alpine echo hello |
+  | TestXenContainerd | containerd active, ctr pull + vctr run |
+
+Build prerequisites (cumulative — each tier adds to the previous):
+
+  # Tier 1: Dom0 boot tests
+  DISTRO_FEATURES:append = " xen systemd"
+  bitbake xen-image-minimal
+
+  # Tier 2: Guest bundling tests
+  IMAGE_INSTALL:append:pn-xen-image-minimal = " alpine-xen-guest-bundle"
+
+  # Tier 3: vxn/containerd tests
+  DISTRO_FEATURES:append = " virtualization vcontainer vxn"
+  IMAGE_INSTALL:append:pn-xen-image-minimal = " vxn"
+  BBMULTICONFIG = "vruntime-aarch64 vruntime-x86-64"
+
+Running the tests:
+
+  % cd meta-virtualization
+  % pip install pytest pexpect
+
+  # All tests (requires KVM and built image)
+  % pytest tests/test_xen_runtime.py -v --machine qemux86-64
+
+  # Core hypervisor tests only (skip network-dependent vxn/containerd)
+  % pytest tests/test_xen_runtime.py -v -m "boot and not network"
+
+  # With custom timeout or no KVM
+  % pytest tests/test_xen_runtime.py -v --boot-timeout 180 --no-kvm
+
+Tests detect available features inside Dom0 and skip gracefully when
+optional components (vxn, containerd, bundled guests) are not installed.
+The vxn/vctr tests also check Xen free memory and skip if insufficient
+for creating new domains.
