@@ -21,7 +21,7 @@ SRC_URI = "git://github.com/containers/crun.git;branch=main;name=crun;protocol=h
 
 PV = "v1.24.0+git"
 
-inherit autotools-brokensep pkgconfig
+inherit autotools-brokensep pkgconfig features_check
 
 # if this is true, we'll symlink crun to runc for easier integration
 # with container stacks
