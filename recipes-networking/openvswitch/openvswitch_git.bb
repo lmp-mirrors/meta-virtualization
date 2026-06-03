@@ -13,12 +13,12 @@ RDEPENDS:${PN}-ptest += "\
 	python3-resource findutils which diffutils \
 	"
 
-PV = "3.7.0"
+PV = "3.7.1"
 CVE_VERSION = "3.5.0"
 
 FILESEXTRAPATHS:append := "${THISDIR}/${PN}-git:"
 
-SRCREV = "0d4c78e153d2b22ab1b173cd4a4dfff89002666d"
+SRCREV = "04b05b31ade4d903589a90a14861730562285be7"
 SRC_URI += "git://github.com/openvswitch/ovs.git;protocol=https;branch=branch-3.7 \
             file://openvswitch-add-ptest-71d553b995d0bd527d3ab1e9fbaf5a2ae34de2f3.patch \
             file://run-ptest \
