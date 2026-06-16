@@ -139,6 +139,11 @@ PACKAGECONFIG:remove:mipsarchn32 = "qemu"
 PACKAGECONFIG:remove:mipsarchn64 = "qemu"
 PACKAGECONFIG:remove:powerpc = "qemu"
 PACKAGECONFIG:remove:riscv32 = "qemu"
+# QEMU 11.0.0+ requires 64-bit host architecture
+PACKAGECONFIG:remove:arm = "qemu"
+PACKAGECONFIG:remove:armeb = "qemu"
+PACKAGECONFIG:remove:mipsarch = "qemu"
+PACKAGECONFIG:remove:x86 = "qemu"
 
 # numactl is NOT compatible with arm
 PACKAGECONFIG:remove:arm = "numactl"
