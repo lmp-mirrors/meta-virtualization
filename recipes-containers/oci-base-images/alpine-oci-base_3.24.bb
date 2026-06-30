@@ -21,11 +21,11 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 inherit container-bundle
 
 # Remote container from Docker Hub
-CONTAINER_BUNDLES = "docker.io/library/alpine:3.23"
+CONTAINER_BUNDLES = "docker.io/library/alpine:3.24"
 
 # REQUIRED: Pinned digest for reproducible builds
-# Get with: skopeo inspect docker://docker.io/library/alpine:3.23 | jq -r '.Digest'
-CONTAINER_DIGESTS[docker.io_library_alpine_3.23] = "sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"
+# Get with: skopeo inspect docker://docker.io/library/alpine:3.24 | jq -r '.Digest'
+CONTAINER_DIGESTS[docker.io_library_alpine_3.24] = "sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
 
 # Enable deployment to DEPLOY_DIR_IMAGE for use as OCI base layer
 CONTAINER_BUNDLE_DEPLOY = "1"
