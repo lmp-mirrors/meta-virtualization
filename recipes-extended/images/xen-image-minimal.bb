@@ -88,10 +88,15 @@ build_syslinux_cfg () {
 }
 
 # Enable runqemu. eg: runqemu xen-image-minimal nographic slirp
-WKS_FILE:x86-64 = "directdisk-xen.wks"
-WKS_FILE_DEPENDS_DEFAULT:x86-64 = "syslinux-native"
-WKS_FILE:qemux86-64 = "qemuboot-xen-x86-64.wks"
-WKS_FILE_DEPENDS_DEFAULT:qemux86-64 = "syslinux-native"
+#
+# EFI boot (Hyper-V Gen 2, OVMF): set XEN_EFI_BOOT = "1" in local.conf
+# to switch from BIOS/syslinux to direct xen.efi EFI boot.
+# Test: runqemu xen-image-minimal wic nographic slirp kvm ovmf qemuparams="-m 4096"
+XEN_EFI_BOOT ?= ""
+WKS_FILE:x86-64 = "${@'efi-xen-x86-64.wks' if d.getVar('XEN_EFI_BOOT') == '1' else 'directdisk-xen.wks'}"
+WKS_FILE_DEPENDS_DEFAULT:x86-64 = "${@'' if d.getVar('XEN_EFI_BOOT') == '1' else 'syslinux-native'}"
+WKS_FILE:qemux86-64 = "${@'efi-xen-x86-64.wks' if d.getVar('XEN_EFI_BOOT') == '1' else 'qemuboot-xen-x86-64.wks'}"
+WKS_FILE_DEPENDS_DEFAULT:qemux86-64 = "${@'' if d.getVar('XEN_EFI_BOOT') == '1' else 'syslinux-native'}"
 # Xen Dom0 needs the full host CPU feature set (AVX, AVX2, etc.) since
 # the machine default Skylake-Client model can lose features through Xen's
 # nested CPUID filtering, causing illegal instruction crashes with x86-64-v3.
@@ -110,6 +115,7 @@ QB_SERIAL_OPT = "-serial mon:stdio"
 # to boot this image, so add it here:
 IMAGE_FSTYPES:qemux86-64 += "wic"
 do_image_wic[depends] += "xen:do_deploy"
+do_image_wic[depends] += "${@'ovmf:do_deploy' if d.getVar('XEN_EFI_BOOT') == '1' else ''}"
 # Networking: the qemuboot.bbclass default virtio network device works ok
 # and so does the emulated e1000 -- choose according to the network device
 # drivers that are present in your dom0 Linux kernel. To switch to e1000:
