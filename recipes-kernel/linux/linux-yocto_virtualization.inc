@@ -14,6 +14,10 @@ SRC_URI += "file://extra-configs.cfg"
 # LXC 7.0 requires CONFIG_SCHED_CORE for core scheduling
 SRC_URI += "file://lxc-extra.cfg"
 
+# Legacy emulated PC hardware (IDE, DEC 21140 NIC) for Xen PV dom0 on
+# Hyper-V Generation 1 VMs and QEMU pcbios. See XEN_BOOT_MODE=hyperv-gen1.
+SRC_URI += "file://hyperv-legacy-hw.cfg"
+
 # Inject the kcfg sysroot into the scc search path so compound .scc
 # files (like container.scc) can resolve their include directives.
 # Only needed for kernels that do NOT have a type=kmeta SRC_URI entry
