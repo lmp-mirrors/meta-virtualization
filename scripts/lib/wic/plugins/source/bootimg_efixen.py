@@ -6,10 +6,11 @@
 # DESCRIPTION
 # This implements the 'bootimg_efixen' source plugin class for 'wic'.
 #
-# Creates an EFI System Partition that boots Xen directly via the native
-# xen.efi EFI application.  No GRUB or other intermediate bootloader is
-# needed -- the UEFI firmware loads xen.efi, which reads its own config
-# file and chain-loads the dom0 kernel.
+# Creates an EFI System Partition that boots Xen via GRUB chainloading
+# xen.efi.  GRUB is installed as the default EFI boot application
+# (bootx64.efi) for broad firmware compatibility (OVMF, Hyper-V, bare
+# metal), and its grub.cfg chainloads xen.efi which handles the actual
+# Xen/dom0 boot using native EFI boot services.
 #
 # Bootloader arguments use the --- separator convention (same as the
 # bootimg_biosxen plugin) to split Xen hypervisor options from Linux
@@ -23,6 +24,9 @@
 
 import logging
 import os
+import shutil
+
+from glob import glob
 
 from wic import WicError
 from wic.pluginbase import SourcePlugin
@@ -34,7 +38,7 @@ logger = logging.getLogger('wic')
 
 class BootimgEfiXenPlugin(SourcePlugin):
     """
-    Create an EFI System Partition for direct Xen EFI boot.
+    Create an EFI System Partition for Xen boot via GRUB chainloading xen.efi.
     """
 
     name = 'bootimg_efixen'
@@ -67,7 +71,24 @@ class BootimgEfiXenPlugin(SourcePlugin):
                     (get_bitbake_var("KERNEL_IMAGETYPE"),
                      get_bitbake_var("INITRAMFS_LINK_NAME"))
 
-        # Xen EFI config: kernel= takes filename followed by kernel cmdline
+        # GRUB config: chainload xen.efi from the same directory
+        grubefi_conf = ""
+        grubefi_conf += "serial --unit=0 --speed=115200 --word=8 "
+        grubefi_conf += "--parity=no --stop=1\n"
+        grubefi_conf += "terminal_output console serial\n"
+        grubefi_conf += "default=0\n"
+        grubefi_conf += "timeout=%s\n\n" % bootloader.timeout
+        grubefi_conf += "menuentry 'Xen' {\n"
+        grubefi_conf += "    chainloader /EFI/BOOT/xen.efi\n"
+        grubefi_conf += "}\n"
+
+        cfg_path = "%s/EFI/BOOT/grub.cfg" % hdddir
+        logger.debug("Writing GRUB chainloader config %s", cfg_path)
+        with open(cfg_path, "w") as cfg:
+            cfg.write(grubefi_conf)
+
+        # Xen EFI config: xen.efi looks for xen.cfg in its own directory.
+        # kernel= takes filename followed by kernel cmdline.
         kernel_line = "%s %s" % (kernel, kernel_options)
 
         xen_cfg = "[global]\n"
@@ -81,10 +102,9 @@ class BootimgEfiXenPlugin(SourcePlugin):
             initrds = initrd.split(';')
             xen_cfg += "ramdisk=%s\n" % initrds[0]
 
-        # xen.efi looks for <binary-basename>.cfg in the same directory
-        cfg_path = "%s/EFI/BOOT/bootx64.cfg" % hdddir
-        logger.debug("Writing Xen EFI config %s", cfg_path)
-        with open(cfg_path, "w") as cfg:
+        xen_cfg_path = "%s/EFI/BOOT/xen.cfg" % hdddir
+        logger.debug("Writing Xen EFI config %s", xen_cfg_path)
+        with open(xen_cfg_path, "w") as cfg:
             cfg.write(xen_cfg)
 
     @classmethod
@@ -98,19 +118,41 @@ class BootimgEfiXenPlugin(SourcePlugin):
 
         hdddir = "%s/hdd/boot" % cr_workdir
 
-        # Install xen.efi as the default EFI boot application
+        # Install GRUB EFI binary as the default boot application.
+        # Save grub.cfg before the copy (grub-efi deploy overwrites EFI/BOOT/)
+        shutil.copyfile("%s/hdd/boot/EFI/BOOT/grub.cfg" % cr_workdir,
+                        "%s/grub.cfg" % cr_workdir)
+        xen_cfg_bak = "%s/xen.cfg" % cr_workdir
+        shutil.copyfile("%s/hdd/boot/EFI/BOOT/xen.cfg" % cr_workdir,
+                        xen_cfg_bak)
+        for mod in [x for x in os.listdir(kernel_dir)
+                    if x.startswith("grub-efi-")]:
+            cp_cmd = "cp -v -p %s/%s %s/EFI/BOOT/%s" % \
+                (kernel_dir, mod, hdddir, mod[9:])
+            exec_cmd(cp_cmd, True)
+        shutil.move("%s/grub.cfg" % cr_workdir,
+                    "%s/hdd/boot/EFI/BOOT/grub.cfg" % cr_workdir)
+        shutil.move(xen_cfg_bak,
+                    "%s/hdd/boot/EFI/BOOT/xen.cfg" % cr_workdir)
+
+        out = glob(os.path.join(hdddir, 'EFI', 'BOOT', 'boot*.efi'))
+        if not out:
+            raise WicError("No GRUB EFI binary found. "
+                           "Check that grub-efi is built.")
+
+        # Install xen.efi alongside GRUB — chainloaded by grub.cfg
         machine = get_bitbake_var("MACHINE")
         xen_efi = "xen-%s.efi" % machine
         xen_src = os.path.join(kernel_dir, xen_efi)
         if not os.path.exists(xen_src):
             raise WicError("Xen EFI binary not found: %s" % xen_src)
 
-        install_cmd = "install -m 0644 %s %s/EFI/BOOT/bootx64.efi" % \
+        install_cmd = "install -m 0644 %s %s/EFI/BOOT/xen.efi" % \
             (xen_src, hdddir)
         exec_cmd(install_cmd)
 
-        # Install dom0 kernel alongside xen.efi — xen.efi resolves paths
-        # in bootx64.cfg relative to its own directory (EFI/BOOT/)
+        # Install dom0 kernel — xen.efi resolves paths in xen.cfg
+        # relative to its own directory (EFI/BOOT/)
         kernel = get_bitbake_var("KERNEL_IMAGETYPE")
         if get_bitbake_var("INITRAMFS_IMAGE_BUNDLE") == "1":
             if get_bitbake_var("INITRAMFS_IMAGE"):

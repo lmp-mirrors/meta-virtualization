@@ -89,14 +89,23 @@ build_syslinux_cfg () {
 
 # Enable runqemu. eg: runqemu xen-image-minimal nographic slirp
 #
-# EFI boot (Hyper-V Gen 2, OVMF): set XEN_EFI_BOOT = "1" in local.conf
-# to switch from BIOS/syslinux to direct xen.efi EFI boot.
-# Test: runqemu xen-image-minimal wic nographic slirp kvm ovmf qemuparams="-m 4096"
+# Boot flavor selector: XEN_BOOT_MODE (set in local.conf)
+#   bios        - legacy BIOS / syslinux + Xen multiboot (QEMU, generic). Default.
+#   efi         - GRUB EFI chainloading xen.efi (Hyper-V Gen 2, OVMF, UEFI targets).
+#                 Test: runqemu xen-image-minimal wic nographic slirp kvm ovmf qemuparams="-m 4096"
+#   hyperv-gen1 - legacy BIOS tuned for Hyper-V Generation 1 VMs. Gen 1 emulates
+#                 real PC hardware -- an IDE disk and (with a "Legacy Network
+#                 Adapter") a DEC 21140 NIC -- which Xen's PV dom0 drives with
+#                 in-tree drivers. PV vxn guests need no nested virtualisation,
+#                 which Gen 1 does not provide. See files/wic/bios-xen-hyperv-x86-64.wks.
+#
+# Back-compat: XEN_EFI_BOOT = "1" is treated as XEN_BOOT_MODE = "efi".
 XEN_EFI_BOOT ?= ""
-WKS_FILE:x86-64 = "${@'efi-xen-x86-64.wks' if d.getVar('XEN_EFI_BOOT') == '1' else 'directdisk-xen.wks'}"
-WKS_FILE_DEPENDS_DEFAULT:x86-64 = "${@'' if d.getVar('XEN_EFI_BOOT') == '1' else 'syslinux-native'}"
-WKS_FILE:qemux86-64 = "${@'efi-xen-x86-64.wks' if d.getVar('XEN_EFI_BOOT') == '1' else 'qemuboot-xen-x86-64.wks'}"
-WKS_FILE_DEPENDS_DEFAULT:qemux86-64 = "${@'' if d.getVar('XEN_EFI_BOOT') == '1' else 'syslinux-native'}"
+XEN_BOOT_MODE ?= "${@'efi' if d.getVar('XEN_EFI_BOOT') == '1' else 'bios'}"
+WKS_FILE:x86-64 = "${@'efi-xen-x86-64.wks' if d.getVar('XEN_BOOT_MODE') == 'efi' else ('bios-xen-hyperv-x86-64.wks' if d.getVar('XEN_BOOT_MODE') == 'hyperv-gen1' else 'directdisk-xen.wks')}"
+WKS_FILE_DEPENDS_DEFAULT:x86-64 = "${@'' if d.getVar('XEN_BOOT_MODE') == 'efi' else 'syslinux-native'}"
+WKS_FILE:qemux86-64 = "${@'efi-xen-x86-64.wks' if d.getVar('XEN_BOOT_MODE') == 'efi' else ('bios-xen-hyperv-x86-64.wks' if d.getVar('XEN_BOOT_MODE') == 'hyperv-gen1' else 'qemuboot-xen-x86-64.wks')}"
+WKS_FILE_DEPENDS_DEFAULT:qemux86-64 = "${@'' if d.getVar('XEN_BOOT_MODE') == 'efi' else 'syslinux-native'}"
 # Xen Dom0 needs the full host CPU feature set (AVX, AVX2, etc.) since
 # the machine default Skylake-Client model can lose features through Xen's
 # nested CPUID filtering, causing illegal instruction crashes with x86-64-v3.
@@ -115,7 +124,7 @@ QB_SERIAL_OPT = "-serial mon:stdio"
 # to boot this image, so add it here:
 IMAGE_FSTYPES:qemux86-64 += "wic"
 do_image_wic[depends] += "xen:do_deploy"
-do_image_wic[depends] += "${@'ovmf:do_deploy' if d.getVar('XEN_EFI_BOOT') == '1' else ''}"
+do_image_wic[depends] += "${@'ovmf:do_deploy grub-efi:do_deploy' if d.getVar('XEN_BOOT_MODE') == 'efi' else ''}"
 # Networking: the qemuboot.bbclass default virtio network device works ok
 # and so does the emulated e1000 -- choose according to the network device
 # drivers that are present in your dom0 Linux kernel. To switch to e1000:

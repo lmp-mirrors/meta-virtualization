@@ -1,11 +1,11 @@
 # short-description: Create an EFI disk image with Xen hypervisor
 # long-description: Creates a GPT partitioned UEFI disk image that boots Xen
-# directly via the native xen.efi EFI application.  For use with OVMF (QEMU),
-# Hyper-V Gen 2 VMs, and any other UEFI firmware.
+# via GRUB chainloading xen.efi.  For use with OVMF (QEMU), Hyper-V Gen 2
+# VMs, and any other UEFI firmware.
 #
-# The xen.efi binary is installed as bootx64.efi with a generated bootx64.cfg
-# that chain-loads the dom0 kernel.  No intermediate bootloader (GRUB, etc.)
-# is needed.
+# GRUB is installed as the default EFI boot application (bootx64.efi) for
+# broad firmware compatibility.  Its grub.cfg chainloads xen.efi, which
+# handles Xen/dom0 boot using native EFI boot services.
 #
 # Test with OVMF:
 #   runqemu xen-image-minimal wic nographic slirp kvm ovmf qemuparams="-m 4096"
@@ -13,9 +13,9 @@
 # Convert to VHDX for Hyper-V:
 #   qemu-img convert -f raw -O vhdx xen-image-minimal-*.wic xen-image-minimal.vhdx
 
-part /boot --source bootimg-efixen --ondisk sda --label boot --active --align 1024
+part /boot --source bootimg-efixen --ondisk sda --label boot --active --align 1024 --part-type C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 
 # Rootfs partition -- add --size 10G or larger for VM storage
 part / --source rootfs --ondisk sda --use-uuid --fstype=ext4 --label root --align 1024
 
-bootloader --ptable gpt --timeout=5 --append="dom0_mem=512M console=com1,vga com1=115200,8n1 loglvl=all guest_loglvl=all --- console=hvc0 earlyprintk=xen root=/dev/sda2 rootwait pmtmr=0"
+bootloader --ptable gpt --timeout=5 --append="dom0_mem=512M noreboot console=com1,vga com1=115200,8n1 loglvl=all guest_loglvl=all --- console=hvc0 earlyprintk=xen root=/dev/sda2 rootwait"
