@@ -64,8 +64,22 @@ set_runtime_config() {
             STATE_DIR_BASE="${VPDMN_STATE_DIR:-$HOME/.${TOOL_NAME}}"
             STATE_FILE="podman-state.img"
             ;;
+        vxn)
+            # qemu-xen mode: the host relays commands to dom0's own vxn front
+            # end (skopeo + xl), so the dispatched command word is "vxn", and
+            # that same value arrives here as --runtime. CMDLINE_PREFIX/state
+            # mirror docker (vxn is docker-compatible); note CMDLINE_PREFIX is
+            # not actually applied for qemu-xen since the wic boot ignores the
+            # kernel -append. State lives under ~/.vxn (matches VXN_* paths).
+            TOOL_NAME="${VCONTAINER_RUNTIME_NAME:-vxn}"
+            BLOB_SUBDIR="vxn-blobs"
+            BLOB_SUBDIR_ALT="blobs"
+            CMDLINE_PREFIX="docker"
+            STATE_DIR_BASE="${VXN_STATE_DIR:-$HOME/.${TOOL_NAME}}"
+            STATE_FILE="docker-state.img"
+            ;;
         *)
-            echo "ERROR: Unknown runtime: $RUNTIME (use docker or podman)" >&2
+            echo "ERROR: Unknown runtime: $RUNTIME (use docker, podman, or vxn)" >&2
             exit 1
             ;;
     esac
@@ -1197,29 +1211,36 @@ hv_setup_arch
 hv_check_accel
 hv_find_command
 
-# Check for kernel
-if [ ! -f "$KERNEL_IMAGE" ]; then
-    log "ERROR" "Kernel not found: $KERNEL_IMAGE"
-    log "ERROR" "Set --blob-dir to location of blobs"
-    log "ERROR" "Build with: bitbake ${TOOL_NAME}-initramfs-create"
-    exit 1
-fi
+# Kernel/initramfs/rootfs validation applies only to backends that boot a
+# Linux kernel directly (qemu, xen DomU) -- their hv_setup_arch sets
+# KERNEL_IMAGE. The qemu-xen backend boots a self-contained Xen dom0 wic
+# instead (no kernel/initramfs blob) and validates that wic in its own
+# hv_setup_arch, so skip these checks when no KERNEL_IMAGE was set.
+if [ -n "${KERNEL_IMAGE:-}" ]; then
+    # Check for kernel
+    if [ ! -f "$KERNEL_IMAGE" ]; then
+        log "ERROR" "Kernel not found: $KERNEL_IMAGE"
+        log "ERROR" "Set --blob-dir to location of blobs"
+        log "ERROR" "Build with: bitbake ${TOOL_NAME}-initramfs-create"
+        exit 1
+    fi
 
-# Check for initramfs
-if [ ! -f "$INITRAMFS" ]; then
-    log "ERROR" "Initramfs not found: $INITRAMFS"
-    log "ERROR" "Build with: MACHINE=qemuarm64 bitbake vdkr-initramfs-build"
-    exit 1
-fi
+    # Check for initramfs
+    if [ ! -f "$INITRAMFS" ]; then
+        log "ERROR" "Initramfs not found: $INITRAMFS"
+        log "ERROR" "Build with: MACHINE=qemuarm64 bitbake vdkr-initramfs-build"
+        exit 1
+    fi
 
-# Check for rootfs image
-if [ ! -f "$ROOTFS_IMG" ]; then
-    log "ERROR" "Rootfs image not found: $ROOTFS_IMG"
-    log "ERROR" "Build with: MACHINE=qemuarm64 bitbake vdkr-initramfs-create"
-    exit 1
-fi
+    # Check for rootfs image
+    if [ ! -f "$ROOTFS_IMG" ]; then
+        log "ERROR" "Rootfs image not found: $ROOTFS_IMG"
+        log "ERROR" "Build with: MACHINE=qemuarm64 bitbake vdkr-initramfs-create"
+        exit 1
+    fi
 
-log "DEBUG" "Using initramfs: $INITRAMFS"
+    log "DEBUG" "Using initramfs: $INITRAMFS"
+fi
 
 # Let backend prepare container image if needed (e.g., Xen pulls OCI via skopeo)
 if type hv_prepare_container >/dev/null 2>&1; then
