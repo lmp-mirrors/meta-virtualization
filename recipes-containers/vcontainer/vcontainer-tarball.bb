@@ -43,6 +43,8 @@ SRC_URI = "\
     file://vdkr.sh \
     file://vpdmn.sh \
     file://boot-xen.sh \
+    file://vxn.sh \
+    file://vrunner-backend-qemu-xen.sh \
     file://toolchain-shar-extract.sh \
 "
 
@@ -353,10 +355,38 @@ Build it first with:
   bitbake mc:${VXN_MC}:xen-image-minimal"
             fi
         done
-        if [ "${VXN_INCLUDED}" = "1" ] && [ -f "${FILES_DIR}/boot-xen.sh" ]; then
-            cp "${FILES_DIR}/boot-xen.sh" "${SDK_OUT}/boot-xen.sh"
-            chmod 755 "${SDK_OUT}/boot-xen.sh"
-            bbnote "Installed boot-xen.sh (vxn launcher)"
+        if [ "${VXN_INCLUDED}" = "1" ]; then
+            # mode 1 (transparent host-side, the vdkr/vpdmn UX): the qemu-xen
+            # backend boots the dom0 wic under QEMU and proxies commands into
+            # dom0. Ships the backend + the vxn frontend with per-arch symlinks
+            # (vxn-x86_64 -> vxn); arch is inferred from the invoked name, and
+            # vxn.sh auto-selects qemu-xen when it finds a dom0 *.wic blob.
+            if [ -f "${FILES_DIR}/vrunner-backend-qemu-xen.sh" ]; then
+                cp "${FILES_DIR}/vrunner-backend-qemu-xen.sh" "${SDK_OUT}/"
+                chmod 755 "${SDK_OUT}/vrunner-backend-qemu-xen.sh"
+            else
+                bbfatal "vrunner-backend-qemu-xen.sh not found in ${FILES_DIR}"
+            fi
+            if [ -f "${FILES_DIR}/vxn.sh" ]; then
+                cp "${FILES_DIR}/vxn.sh" "${SDK_OUT}/vxn"
+                chmod 755 "${SDK_OUT}/vxn"
+                for ARCH in ${ARCHITECTURES}; do
+                    if [ -d "${SDK_OUT}/vxn-blobs/${ARCH}" ]; then
+                        ln -sf vxn "${SDK_OUT}/vxn-${ARCH}"
+                        bbnote "Created symlink vxn-${ARCH}"
+                    fi
+                done
+                bbnote "Installed vxn host CLI (qemu-xen backend)"
+            else
+                bbfatal "vxn.sh not found in ${FILES_DIR}"
+            fi
+
+            # mode 2 (interactive): boot-xen.sh drops you into the dom0 shell.
+            if [ -f "${FILES_DIR}/boot-xen.sh" ]; then
+                cp "${FILES_DIR}/boot-xen.sh" "${SDK_OUT}/boot-xen.sh"
+                chmod 755 "${SDK_OUT}/boot-xen.sh"
+                bbnote "Installed boot-xen.sh (vxn mode-2 launcher)"
+            fi
         fi
     fi
 
@@ -411,18 +441,28 @@ For more information:
 EOF
 
     # vxn (opt-in) works differently from vdkr/vpdmn -- document it only when included
-    if [ -f "${SDK_OUT}/boot-xen.sh" ]; then
+    if [ -f "${SDK_OUT}/vxn" ]; then
         cat >> "${SDK_OUT}/README.txt" <<EOF
 
 vxn (Docker for Xen)
 ====================
-Unlike the vdkr/vpdmn host CLIs, vxn boots a Xen dom0 VM under QEMU and runs
-inside that dom0:
-  ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X to quit
-  (in dom0) vxn run --rm alpine echo hi
-  ssh -p 2222 root@localhost           # reach the booted dom0
-Tunables: VXN_VCPUS, VXN_MEM, VXN_SSH_PORT (env vars before ./boot-xen.sh)
-Contents: boot-xen.sh, vxn-blobs/ (per-arch Xen dom0 image)
+vxn runs containers as Xen PV DomU guests. A Xen dom0 image is bundled and run
+under QEMU (KVM-accelerated); works on a Linux host or WSL2 with /dev/kvm. Two
+ways to use it:
+
+  Mode 1 -- transparent host CLI (the vdkr/vpdmn UX):
+    vxn-x86_64 run --rm alpine echo hi
+  The dom0 boots once under QEMU and stays resident (memres); later commands
+  reuse it. vxn auto-selects the qemu-xen backend from the bundled dom0 .wic.
+
+  Mode 2 -- interactive dom0 shell:
+    ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X to quit
+    (in dom0) vxn run --rm alpine echo hi
+    ssh -p 2222 root@localhost           # reach the booted dom0
+
+Tunables (env vars): VXN_VCPUS, VXN_MEM, VXN_SSH_PORT (mode 2), VXN_IMAGE.
+Contents: vxn, vxn-<arch>, vrunner-backend-qemu-xen.sh, boot-xen.sh,
+          vxn-blobs/ (per-arch Xen dom0 image)
 EOF
         bbnote "Documented vxn in README"
     fi
@@ -480,12 +520,11 @@ echo "  vpdmn vimport ./oci/ app # Import OCI directory"
 ENVEOF
     fi
 
-    if [ -f "${SDK_OUT}/boot-xen.sh" ]; then
+    if [ -f "${SDK_OUT}/vxn" ]; then
         cat >> $script <<'ENVEOF'
-echo "vxn (Docker for Xen) -- boots a Xen dom0 VM; run vxn inside it:"
-echo "  ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X quits"
-echo "  (in dom0) vxn run --rm alpine echo hi"
-echo "  ssh -p 2222 root@localhost           # reach the booted dom0"
+echo "vxn (Docker for Xen) -- containers as Xen DomU guests:"
+echo "  vxn-x86_64 run --rm alpine echo hi   # transparent: boots dom0 under QEMU"
+echo "  ./boot-xen.sh                        # or interactive dom0 shell (Ctrl-A X quits)"
 ENVEOF
     fi
 
