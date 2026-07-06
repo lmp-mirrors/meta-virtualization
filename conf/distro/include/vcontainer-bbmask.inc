@@ -93,6 +93,7 @@ BBMASK += "meta-networking/recipes-(?!filter|support|connectivity/mosquitto)"
 BBMASK += "meta-openstack/recipes-dbs/postgresql/"
 BBMASK += "meta-oe/dynamic-layers/networking-layer/recipes-core/"
 BBMASK += "meta-openstack/recipes-extended/libvirt/"
+BBMASK += "meta-webserver/recipes-(?!httpd/nginx)"
 
 # ---------------------------------------------------------------------------
 # Entire layers with 0 recipes in the container image dependency graph.
@@ -101,7 +102,6 @@ BBMASK += "meta-openstack/recipes-extended/libvirt/"
 # ---------------------------------------------------------------------------
 BBMASK += "meta-filesystems/"
 BBMASK += "meta-python/"
-BBMASK += "meta-webserver/"
 # Warning suppression for these fully-masked layers is in meta-virt-host.conf
 # (BBFILE_PATTERN_IGNORE_EMPTY) because BitBake checks the base datastore,
 # not per-multiconfig datastores.
