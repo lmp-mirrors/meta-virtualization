@@ -94,7 +94,8 @@ OCI_IMAGE_AUTHOR ?= "${PATCH_GIT_USER_NAME}"
 OCI_IMAGE_AUTHOR_EMAIL ?= "${PATCH_GIT_USER_EMAIL}"
 
 OCI_IMAGE_TAG ?= "latest"
-OCI_IMAGE_RUNTIME_UID ?= ""
+# Allow other classes e.g. container-nonroot-user to set with ?=
+OCI_IMAGE_RUNTIME_UID ??= ""
 
 OCI_IMAGE_ARCH ?= "${@oe.go.map_arch(d.getVar('TARGET_ARCH'))}"
 OCI_IMAGE_SUBARCH ?= "${@oci_map_subarch(d.getVar('TARGET_ARCH'), d.getVar('TUNE_FEATURES'), d)}"
