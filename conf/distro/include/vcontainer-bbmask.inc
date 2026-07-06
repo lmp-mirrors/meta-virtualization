@@ -88,8 +88,8 @@ BBMASK += "meta-virtualization/recipes-networking/passt/"
 # ---------------------------------------------------------------------------
 # meta-oe / meta-networking: mask heavyweight categories
 # ---------------------------------------------------------------------------
-BBMASK += "meta-oe/recipes-(?!devtools|extended|support)"
-BBMASK += "meta-networking/recipes-(?!filter|support)"
+BBMASK += "meta-oe/recipes-(?!devtools|extended|support|connectivity/libwebsockets)"
+BBMASK += "meta-networking/recipes-(?!filter|support|connectivity/mosquitto)"
 BBMASK += "meta-openstack/recipes-dbs/postgresql/"
 BBMASK += "meta-oe/dynamic-layers/networking-layer/recipes-core/"
 BBMASK += "meta-openstack/recipes-extended/libvirt/"
