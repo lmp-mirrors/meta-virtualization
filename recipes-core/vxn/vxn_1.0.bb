@@ -50,7 +50,7 @@ HOMEPAGE = "https://git.yoctoproject.org/meta-virtualization/"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-inherit features_check
+inherit features_check systemd
 REQUIRED_DISTRO_FEATURES = "xen"
 
 # Host scripts + guest init scripts (all from the vcontainer files dir)
@@ -69,6 +69,8 @@ SRC_URI = "\
     file://vctr \
     file://vdkr.sh \
     file://vpdmn.sh \
+    file://vxn-command-channel.sh \
+    file://vxn-command-channel.service \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -231,6 +233,14 @@ do_install() {
     # Install vctr convenience wrapper
     install -m 0755 ${S}/vctr ${D}${bindir}/vctr
 
+    # dom0 command-channel responder + its systemd unit (transparent host-side
+    # vxn, mode 1). The responder binds to the virtio-serial port the qemu-xen
+    # backend attaches; the unit is ConditionPathExists-gated so it stays
+    # inactive on plain boots where no channel is present.
+    install -m 0755 ${S}/vxn-command-channel.sh ${D}${bindir}/vxn-command-channel.sh
+    install -d ${D}${systemd_system_unitdir}
+    install -m 0644 ${S}/vxn-command-channel.service ${D}${systemd_system_unitdir}/vxn-command-channel.service
+
     # Docker/Podman CLI frontends (sub-packages)
     install -m 0755 ${S}/vdkr.sh ${D}${bindir}/vdkr
     install -m 0755 ${S}/vpdmn.sh ${D}${bindir}/vpdmn
@@ -305,11 +315,17 @@ FILES:${PN} = "\
     ${bindir}/vxn-sendtty \
     ${bindir}/containerd-shim-vxn-v2 \
     ${bindir}/vctr \
+    ${bindir}/vxn-command-channel.sh \
     ${libexecdir}/vxn/ \
     ${sysconfdir}/containerd/config.toml \
     ${libdir}/vxn/ \
     ${datadir}/vxn/ \
+    ${systemd_system_unitdir}/vxn-command-channel.service \
 "
+
+# Command-channel responder is enabled by default but ConditionPathExists-gated
+# (inactive unless the qemu-xen backend attaches the vdkr virtio-serial port).
+SYSTEMD_SERVICE:${PN} = "vxn-command-channel.service"
 
 # Blobs are large binary files
 INSANE_SKIP:${PN} += "already-stripped"
