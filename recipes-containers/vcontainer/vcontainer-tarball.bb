@@ -42,6 +42,7 @@ SRC_URI = "\
     file://vcontainer-common.sh \
     file://vdkr.sh \
     file://vpdmn.sh \
+    file://boot-xen.sh \
     file://toolchain-shar-extract.sh \
 "
 
@@ -138,6 +139,13 @@ def get_available_architectures(d):
 #   VCONTAINER_ARCHITECTURES = "aarch64"
 VCONTAINER_ARCHITECTURES ?= "x86_64 aarch64"
 
+# vxn (Xen dom0 image) is opt-in -- it is more niche than vdkr/vpdmn, so it is
+# NOT packaged into the tarball unless explicitly enabled. To include it:
+#   VCONTAINER_INCLUDE_VXN = "1"
+# and add the vxn-<arch> multiconfig to BBMULTICONFIG (currently x86_64 only;
+# aarch64 Xen boots via a different mechanism and is a follow-up).
+VCONTAINER_INCLUDE_VXN ?= "0"
+
 # Conditionally set mcdepends based on available multiconfigs
 # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
 #
@@ -168,6 +176,15 @@ python () {
             mcdeps.append('mc::%s:vpdmn-initramfs-create:do_deploy' % mc)
             mcdeps.append('mc::%s:vdkr-rootfs-image:do_image_complete' % mc)
             mcdeps.append('mc::%s:vpdmn-rootfs-image:do_image_complete' % mc)
+
+    # vxn (opt-in): depend on the Xen dom0 image built in the vxn-<arch> MC.
+    # Guarded by VCONTAINER_INCLUDE_VXN and MC presence so the tarball never
+    # pulls in the vxn image (or errors on a missing MC) when vxn is off.
+    if d.getVar('VCONTAINER_INCLUDE_VXN') == '1':
+        for mc in ['vxn-x86-64', 'vxn-aarch64']:
+            if mc in bbmulticonfig:
+                mcdeps.append('mc::%s:xen-image-minimal:do_image_complete' % mc)
+
     if mcdeps:
         d.setVarFlag('do_populate_sdk', 'mcdepends', ' '.join(mcdeps))
 
@@ -309,6 +326,40 @@ create_sdk_files:append () {
         bbnote "Installed vpdmn"
     fi
 
+    # -----------------------------------------------------------------------
+    # vxn (opt-in): Xen dom0 image blob + boot-xen.sh launcher
+    # -----------------------------------------------------------------------
+    INCLUDE_VXN="${VCONTAINER_INCLUDE_VXN}"
+    if [ "${INCLUDE_VXN}" = "1" ]; then
+        VXN_INCLUDED=0
+        for ARCH in ${ARCHITECTURES}; do
+            case "${ARCH}" in
+                x86_64) VXN_MC="vxn-x86-64"; VXN_MACHINE="qemux86-64" ;;
+                *)
+                    bbwarn "vxn: no multiconfig for ${ARCH} yet (x86_64 only); skipping"
+                    continue
+                    ;;
+            esac
+            VXN_WIC="${TOPDIR}/tmp-${VXN_MC}/deploy/images/${VXN_MACHINE}/xen-image-minimal-${VXN_MACHINE}.rootfs.wic"
+            if [ -f "${VXN_WIC}" ]; then
+                mkdir -p "${SDK_OUT}/vxn-blobs/${ARCH}"
+                cp -L "${VXN_WIC}" "${SDK_OUT}/vxn-blobs/${ARCH}/xen-dom0.wic"
+                VXN_INCLUDED=1
+                bbnote "Copied vxn blob: ${ARCH}/xen-dom0.wic"
+            else
+                bbfatal "VCONTAINER_INCLUDE_VXN=1 but Xen image not found:
+  ${VXN_WIC}
+Build it first with:
+  bitbake mc:${VXN_MC}:xen-image-minimal"
+            fi
+        done
+        if [ "${VXN_INCLUDED}" = "1" ] && [ -f "${FILES_DIR}/boot-xen.sh" ]; then
+            cp "${FILES_DIR}/boot-xen.sh" "${SDK_OUT}/boot-xen.sh"
+            chmod 755 "${SDK_OUT}/boot-xen.sh"
+            bbnote "Installed boot-xen.sh (vxn launcher)"
+        fi
+    fi
+
     # Copy CA certificate for secure registry mode (if available)
     SECURE_MODE="${CONTAINER_REGISTRY_SECURE}"
     CA_CERT="${CONTAINER_REGISTRY_CA_CERT}"
@@ -358,6 +409,23 @@ Requirements:
 For more information:
   https://git.yoctoproject.org/meta-virtualization/
 EOF
+
+    # vxn (opt-in) works differently from vdkr/vpdmn -- document it only when included
+    if [ -f "${SDK_OUT}/boot-xen.sh" ]; then
+        cat >> "${SDK_OUT}/README.txt" <<EOF
+
+vxn (Docker for Xen)
+====================
+Unlike the vdkr/vpdmn host CLIs, vxn boots a Xen dom0 VM under QEMU and runs
+inside that dom0:
+  ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X to quit
+  (in dom0) vxn run --rm alpine echo hi
+  ssh -p 2222 root@localhost           # reach the booted dom0
+Tunables: VXN_VCPUS, VXN_MEM, VXN_SSH_PORT (env vars before ./boot-xen.sh)
+Contents: boot-xen.sh, vxn-blobs/ (per-arch Xen dom0 image)
+EOF
+        bbnote "Documented vxn in README"
+    fi
 
     bbnote "vcontainer blobs and scripts added to SDK"
 
@@ -409,6 +477,15 @@ ENVEOF
 echo "vpdmn (Podman) commands:"
 echo "  vpdmn images             # List podman images"
 echo "  vpdmn vimport ./oci/ app # Import OCI directory"
+ENVEOF
+    fi
+
+    if [ -f "${SDK_OUT}/boot-xen.sh" ]; then
+        cat >> $script <<'ENVEOF'
+echo "vxn (Docker for Xen) -- boots a Xen dom0 VM; run vxn inside it:"
+echo "  ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X quits"
+echo "  (in dom0) vxn run --rm alpine echo hi"
+echo "  ssh -p 2222 root@localhost           # reach the booted dom0"
 ENVEOF
     fi
 
@@ -492,7 +569,7 @@ CISCRIPT
     bbnote "SDK size optimization complete"
 }
 
-create_sdk_files[vardeps] += "VCONTAINER_TARGET_ARCH VCONTAINER_KERNEL_NAME VCONTAINER_MC"
+create_sdk_files[vardeps] += "VCONTAINER_TARGET_ARCH VCONTAINER_KERNEL_NAME VCONTAINER_MC VCONTAINER_INCLUDE_VXN"
 
 # ===========================================================================
 # Substitute custom placeholders in installer script
@@ -531,6 +608,7 @@ python do_populate_sdk:append() {
     sdk_out = os.path.join(sdk_output, sdkpath.lstrip('/'))
     vdkr_included = os.path.exists(os.path.join(sdk_out, 'vdkr'))
     vpdmn_included = os.path.exists(os.path.join(sdk_out, 'vpdmn'))
+    vxn_included = os.path.exists(os.path.join(sdk_out, 'boot-xen.sh'))
 
     bb.plain("")
     bb.plain("=" * 70)
@@ -540,6 +618,7 @@ python do_populate_sdk:append() {
     bb.plain("  Architectures: %s" % " ".join(architectures))
     bb.plain("  vdkr (Docker): %s" % ("included" if vdkr_included else "NOT included"))
     bb.plain("  vpdmn (Podman): %s" % ("included" if vpdmn_included else "NOT included"))
+    bb.plain("  vxn (Docker/Xen): %s" % ("included" if vxn_included else "NOT included"))
     bb.plain("")
     bb.plain("To extract and use:")
     bb.plain("  %s -d /tmp/vcontainer -y" % installer)
@@ -550,5 +629,7 @@ python do_populate_sdk:append() {
             bb.plain("  vdkr-%s images      # Docker for %s" % (arch, arch))
         if vpdmn_included:
             bb.plain("  vpdmn-%s images     # Podman for %s" % (arch, arch))
+    if vxn_included:
+        bb.plain("  ./boot-xen.sh        # boot Xen dom0, then run vxn inside it")
     bb.plain("=" * 70)
 }
