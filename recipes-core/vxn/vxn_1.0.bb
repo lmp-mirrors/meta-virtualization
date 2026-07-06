@@ -191,11 +191,18 @@ do_compile() {
     rm -rf "${UNSQUASH_DIR}"
 
     # --- Kernel ---
-    KERNEL_FILE="${DEPLOY_DIR_IMAGE}/${KERNEL_IMAGETYPE_VXN}"
+    # The DomU guest kernel comes from the vruntime MC (same as the initramfs
+    # and rootfs above); it carries Xen PV guest support via vxn.cfg. Sourcing
+    # from DEPLOY_DIR_IMAGE only happened to work when vxn was built in the main
+    # config, where the current deploy dir held a compatible kernel; in an
+    # isolated multiconfig (e.g. vxn-x86-64) it does not, and vxn would package
+    # without a kernel. bbfatal (not bbwarn) so a missing kernel fails the build
+    # instead of silently producing an unbootable vxn.
+    KERNEL_FILE="${MC_DEPLOY}/${KERNEL_IMAGETYPE_VXN}"
     if [ -f "${KERNEL_FILE}" ]; then
         cp "${KERNEL_FILE}" ${B}/kernel
     else
-        bbwarn "Kernel not found at ${KERNEL_FILE}"
+        bbfatal "Kernel not found at ${KERNEL_FILE}. Build with: bitbake mc:${VXN_MULTICONFIG}:virtual/kernel"
     fi
 }
 
