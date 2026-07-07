@@ -157,6 +157,30 @@ hv_prepare_container() {
         return 0
     fi
 
+    # Local rootfs directory: when the "image" is an absolute path to a
+    # directory that looks like a root filesystem (has bin/ or usr/), use it
+    # directly as the container rootfs instead of pulling from a registry. Lets
+    # `vxn run <dir>` run any local rootfs/bundle (e.g. a `vxn bundle` output).
+    # The input disk builder (vrunner.sh) turns a dir into an ext4 image via
+    # `mke2fs -d`, and the guest direct-mounts it.
+    case "$image" in
+        /*)
+            if [ -d "$image" ] && { [ -d "$image/bin" ] || [ -d "$image/usr" ]; }; then
+                INPUT_PATH="$image"
+                INPUT_TYPE="dir"
+                log "INFO" "Using local rootfs directly: $image"
+                # DomU still inherits dom0's corporate CA(s) (same as the pull
+                # path) so the container trusts a TLS-intercepting proxy.
+                if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
+                    mkdir -p "$image/.vxn-ca"
+                    cp /usr/local/share/ca-certificates/*.crt "$image/.vxn-ca/" 2>/dev/null || true
+                    log "INFO" "Staged dom0 CA cert(s) for the container trust store"
+                fi
+                return 0
+            fi
+            ;;
+    esac
+
     log "INFO" "Pulling OCI image: $image"
 
     local oci_dir="$TEMP_DIR/oci-image"
