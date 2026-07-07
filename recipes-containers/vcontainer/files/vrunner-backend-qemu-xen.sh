@@ -142,8 +142,8 @@ hv_build_network_opts() {
 
         # SSH access to the running dom0 (localhost:${VXN_SSH_PORT}), for
         # debugging the mode-1 daemon and general dom0 introspection. Mirrors
-        # boot-xen.sh's :2222->:22 forward.
-        NETDEV_OPTS="$NETDEV_OPTS,hostfwd=tcp:127.0.0.1:${VXN_SSH_PORT:-2222}-:22"
+        # boot-xen.sh's :18022->:22 forward.
+        NETDEV_OPTS="$NETDEV_OPTS,hostfwd=tcp:127.0.0.1:${VXN_SSH_PORT:-18022}-:22"
 
         # Container-engine API forward: dom0's podman (or docker) serves its
         # Docker-compatible API on tcp:2375; forward it to the HOST's

@@ -467,7 +467,7 @@ ways to use it:
   Mode 3 -- interactive dom0 shell:
     ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X to quit
     (in dom0) vxn run --rm alpine echo hi
-    ssh -p 2222 root@localhost           # reach the booted dom0
+    ssh -p 18022 root@localhost           # reach the booted dom0
 
 Tunables (env vars): VXN_VCPUS, VXN_MEM, VXN_SSH_PORT, VXN_API_PORT, VXN_IMAGE.
 Contents: vxn, vxn-<arch>, vrunner-backend-qemu-xen.sh, boot-xen.sh,

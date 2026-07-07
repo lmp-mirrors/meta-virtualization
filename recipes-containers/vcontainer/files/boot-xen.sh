@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCH="${VXN_ARCH:-x86_64}"
 VCPUS="${VXN_VCPUS:-4}"
 MEM="${VXN_MEM:-4096}"
-SSH_PORT="${VXN_SSH_PORT:-2222}"
+SSH_PORT="${VXN_SSH_PORT:-18022}"
 EXTRA_QEMU="${VXN_QEMU_EXTRA:-}"
 
 # --- pick the QEMU binary: prefer the SDK's nativesdk qemu, else host -------
