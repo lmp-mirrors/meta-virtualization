@@ -157,6 +157,7 @@ parse_cmdline() {
     RUNTIME_DAEMON="0"
     RUNTIME_9P="0"  # virtio-9p available for fast I/O
     RUNTIME_AUTH="0"  # registry auth config (config.json / auth.json) available on dedicated 9p share
+    RUNTIME_CA="0"    # host CA certificate(s) available on a dedicated 9p share (corporate proxy roots)
     RUNTIME_IDLE_TIMEOUT="1800"  # Default: 30 minutes
 
     for param in $(cat /proc/cmdline); do
@@ -190,6 +191,9 @@ parse_cmdline() {
                 ;;
             ${VCONTAINER_RUNTIME_PREFIX}_auth=*)
                 RUNTIME_AUTH="${param#${VCONTAINER_RUNTIME_PREFIX}_auth=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_ca=*)
+                RUNTIME_CA="${param#${VCONTAINER_RUNTIME_PREFIX}_ca=}"
                 ;;
         esac
     done
@@ -314,6 +318,42 @@ unmount_auth_share() {
             umount -l "$AUTH_SHARE_MOUNT" 2>/dev/null || true
     fi
     rmdir "$AUTH_SHARE_MOUNT" 2>/dev/null || true
+}
+
+# Install host-provided CA certificate(s) into the guest's SYSTEM trust store --
+# the native way an OS admin adds a corporate root CA (update-ca-certificates),
+# which docker/skopeo then honour automatically. Certs arrive on a dedicated
+# read-only 9p share staged by the host (setup_ca_share). MUST run before the
+# container engine starts. The guest is ephemeral, so this re-runs every boot.
+# Gated on the ${prefix}_ca=1 cmdline flag (RUNTIME_CA).
+CA_SHARE_MOUNT="/mnt/ca-certs"
+install_host_ca_certs() {
+    [ "${RUNTIME_CA:-0}" = "1" ] || return 0
+
+    local tag="${VCONTAINER_RUNTIME_NAME}_ca"
+    mkdir -p "$CA_SHARE_MOUNT"
+    if ! mount -t 9p \
+        -o trans=${NINE_P_TRANSPORT},version=9p2000.L,cache=none,ro,nosuid,nodev,noexec \
+        "$tag" "$CA_SHARE_MOUNT" 2>/dev/null; then
+        log "WARNING: could not mount CA 9p share ($tag)"
+        rmdir "$CA_SHARE_MOUNT" 2>/dev/null || true
+        return 1
+    fi
+
+    local n=0 f
+    mkdir -p /usr/local/share/ca-certificates
+    for f in "$CA_SHARE_MOUNT"/*.crt; do
+        [ -f "$f" ] || continue
+        cp "$f" "/usr/local/share/ca-certificates/$(basename "$f")" && n=$((n + 1))
+    done
+
+    if [ "$n" -gt 0 ]; then
+        update-ca-certificates >/dev/null 2>&1
+        log "Installed $n host CA certificate(s) into the system trust store"
+    fi
+
+    umount "$CA_SHARE_MOUNT" 2>/dev/null || umount -l "$CA_SHARE_MOUNT" 2>/dev/null || true
+    rmdir "$CA_SHARE_MOUNT" 2>/dev/null || true
 }
 
 # ============================================================================
