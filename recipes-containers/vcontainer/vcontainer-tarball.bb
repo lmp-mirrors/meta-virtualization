@@ -455,12 +455,21 @@ ways to use it:
   The dom0 boots once under QEMU and stays resident (memres); later commands
   reuse it. vxn auto-selects the qemu-xen backend from the bundled dom0 .wic.
 
-  Mode 2 -- interactive dom0 shell:
+  Mode 2 -- docker/podman UI (drive dom0's engine from the host):
+    vxn-x86_64 vmemres start
+    eval "\$(vxn-x86_64 vexpose env --export)"   # sets DOCKER_HOST + API version
+    docker run --network=none --rm alpine echo hi
+  Uses your host's docker/podman CLI against dom0's engine (which creates a
+  DomU via vxn-oci-runtime). Requires the vxn-podman-api package in the dom0
+  image. --network=none is required; the DomU still gets its own networking.
+  Run 'vxn-x86_64 vexpose' (no args) for the full explanation.
+
+  Mode 3 -- interactive dom0 shell:
     ./boot-xen.sh                        # boot Xen dom0 (KVM); Ctrl-A X to quit
     (in dom0) vxn run --rm alpine echo hi
     ssh -p 2222 root@localhost           # reach the booted dom0
 
-Tunables (env vars): VXN_VCPUS, VXN_MEM, VXN_SSH_PORT (mode 2), VXN_IMAGE.
+Tunables (env vars): VXN_VCPUS, VXN_MEM, VXN_SSH_PORT, VXN_API_PORT, VXN_IMAGE.
 Contents: vxn, vxn-<arch>, vrunner-backend-qemu-xen.sh, boot-xen.sh,
           vxn-blobs/ (per-arch Xen dom0 image)
 EOF
@@ -524,7 +533,10 @@ ENVEOF
         cat >> $script <<'ENVEOF'
 echo "vxn (Docker for Xen) -- containers as Xen DomU guests:"
 echo "  vxn-x86_64 run --rm alpine echo hi   # transparent: boots dom0 under QEMU"
+echo "  vxn-x86_64 vmemres start; eval \"\$(vxn-x86_64 vexpose env --export)\""
+echo "    then: docker run --network=none --rm alpine echo hi   # docker/podman UI"
 echo "  ./boot-xen.sh                        # or interactive dom0 shell (Ctrl-A X quits)"
+echo "  vxn-x86_64 vexpose                   # explains the docker/podman UI"
 ENVEOF
     fi
 
