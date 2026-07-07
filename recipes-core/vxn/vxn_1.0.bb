@@ -143,14 +143,21 @@ VXN_MC_DEPLOY = "${TOPDIR}/tmp-${VXN_MULTICONFIG}/deploy/images/${MACHINE}"
 # ===========================================================================
 
 python () {
-    mc = d.getVar('VXN_MULTICONFIG')
+    to_mc = d.getVar('VXN_MULTICONFIG')
+    from_mc = d.getVar('BB_CURRENT_MC') or ""
     runtime = d.getVar('VXN_RUNTIME')
     bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
-    if mc in bbmulticonfig:
+    if to_mc in bbmulticonfig:
+        # mcdepends form is 'mc:FROM:TO:pn:task'. FROM must equal the
+        # multiconfig vxn itself is built in (runqueue only applies the dep
+        # when mc == frommc), so it has to be BB_CURRENT_MC — not empty.
+        # Empty only matches a default-config 'bitbake vxn'; when vxn is pulled
+        # in as 'mc:vxn-x86-64:vxn' (vcontainer-tarball SDK path) the empty form
+        # never fires and the vruntime blobs never build first.
         mcdeps = ' '.join([
-            'mc::%s:%s-tiny-initramfs-image:do_image_complete' % (mc, runtime),
-            'mc::%s:%s-rootfs-image:do_image_complete' % (mc, runtime),
-            'mc::%s:virtual/kernel:do_deploy' % mc,
+            'mc:%s:%s:%s-tiny-initramfs-image:do_image_complete' % (from_mc, to_mc, runtime),
+            'mc:%s:%s:%s-rootfs-image:do_image_complete' % (from_mc, to_mc, runtime),
+            'mc:%s:%s:virtual/kernel:do_deploy' % (from_mc, to_mc),
         ])
         d.setVarFlag('do_compile', 'mcdepends', mcdeps)
 }
