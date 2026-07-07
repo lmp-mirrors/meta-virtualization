@@ -1085,16 +1085,33 @@ setup_auth_share() {
 CA_SHARE_DIR=""
 setup_ca_share() {
     local ca_dir="${VCONTAINER_CA_DIR:-$SCRIPT_DIR/certs}"
-    [ -d "$ca_dir" ] || return 0
+
+    # Cert source dirs, searched in order:
+    #   1. VCONTAINER_CA_DIR (explicit) or the SDK's certs/ drop dir.
+    #   2. The host's admin-added trust dir(s) -- ONLY when the user did not set
+    #      an explicit VCONTAINER_CA_DIR. This mirrors native docker, which
+    #      trusts whatever the OS admin installed: on Debian/Ubuntu/WSL the
+    #      locally-added certs (e.g. a corporate proxy root) live in
+    #      /usr/local/share/ca-certificates -- the delta, NOT the base bundle,
+    #      so we don't drag the whole distro CA set onto the share. It means a
+    #      machine already configured for its proxy Just Works with no manual
+    #      copy into certs/. Set VCONTAINER_CA_SYSTEM=0 to opt out.
+    local ca_dirs="$ca_dir"
+    if [ "${VCONTAINER_CA_SYSTEM:-1}" = "1" ] && [ -z "${VCONTAINER_CA_DIR:-}" ]; then
+        ca_dirs="$ca_dirs /usr/local/share/ca-certificates /etc/pki/ca-trust/source/anchors"
+    fi
 
     # Collect cert files via globbing, NOT `ls`. Under `set -e`, an assignment
     # from a failing command substitution (ls exits non-zero when no *.crt /
     # *.pem / *.cer match -- e.g. the drop dir holds only its README) aborts
     # the whole daemon start silently. A non-matching glob stays literal, so
     # the [ -e ] guard filters it out and the loop is set -e safe.
-    local certs="" f
-    for f in "$ca_dir"/*.crt "$ca_dir"/*.pem "$ca_dir"/*.cer; do
-        [ -e "$f" ] && certs="$certs $f"
+    local certs="" f d
+    for d in $ca_dirs; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.crt "$d"/*.pem "$d"/*.cer; do
+            [ -e "$f" ] && certs="$certs $f"
+        done
     done
     [ -z "$certs" ] && return 0
 
@@ -1118,7 +1135,7 @@ setup_ca_share() {
     # KERNEL_APPEND; its dom0 cert service mounts the tag unconditionally.
     KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_ca=1"
     log "INFO" "$n host CA certificate(s) staged on read-only 9p share (tag=$ca_tag)"
-    log "DEBUG" "CA source dir: $ca_dir"
+    log "DEBUG" "CA source dirs:$ca_dirs"
 }
 
 cleanup() {
