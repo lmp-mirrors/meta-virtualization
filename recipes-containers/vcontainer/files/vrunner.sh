@@ -694,6 +694,24 @@ daemon_stop() {
     log "INFO" "Daemon stopped"
 }
 
+# Directed hint when the guest reports a TLS trust failure -- typically a
+# corporate TLS-intercepting proxy (e.g. Zscaler) whose root CA the VM's trust
+# store doesn't have, so docker/skopeo pulls fail with x509.
+_vxn_cert_hint() {
+    local ca_dir="${VCONTAINER_CA_DIR:-$SCRIPT_DIR/certs}"
+    {
+        echo ""
+        echo "[${VCONTAINER_RUNTIME_NAME:-vcontainer}] TLS certificate not trusted by the VM (x509)."
+        echo "  This is typical behind a corporate TLS proxy (e.g. Zscaler): the VM does"
+        echo "  not trust the CA that signed the registry's certificate. To fix, install"
+        echo "  your corporate root CA into the VM's system trust store -- drop the"
+        echo "  PEM/.crt file into:"
+        echo "      $ca_dir/"
+        echo "  and re-run. It is installed via update-ca-certificates on boot."
+        echo "  (See $ca_dir/README.)"
+    } >&2
+}
+
 daemon_send() {
     local cmd="$1"
 
@@ -725,6 +743,7 @@ daemon_send() {
 
     local EXIT_CODE=0
     local in_output=false
+    local _cert_err=false
     local TIMEOUT=60
 
     # Send command to socat's stdin
@@ -749,6 +768,10 @@ daemon_send() {
             *)
                 if [ "$in_output" = "true" ]; then
                     echo "$line"
+                    case "$line" in
+                        *"certificate signed by unknown"*|*"x509: certificate"*|*"tls: failed to verify"*)
+                            _cert_err=true ;;
+                    esac
                 fi
                 ;;
         esac
@@ -758,6 +781,8 @@ daemon_send() {
     eval "exec ${SOCAT[0]}<&- ${SOCAT[1]}>&-"
     kill $SOCAT_PID 2>/dev/null || true
     wait $SOCAT_PID 2>/dev/null || true
+
+    [ "$_cert_err" = "true" ] && _vxn_cert_hint
 
     return ${EXIT_CODE:-0}
 }
@@ -1047,6 +1072,43 @@ setup_auth_share() {
     # --verbose mode only.
     log "INFO" "Registry auth config staged on read-only 9p share (tag=$auth_tag)"
     log "DEBUG" "Auth source: $AUTH_CONFIG"
+}
+
+# Stage host-provided CA certificate(s) into a dedicated read-only 9p share so
+# the guest/dom0 can install them into its SYSTEM trust store -- exactly how an
+# OS admin adds a corporate root CA (update-ca-certificates), which docker and
+# skopeo then honour automatically. Needed behind TLS-intercepting corporate
+# proxies (e.g. Zscaler): otherwise the guest's pull from docker.io fails with
+# "x509: certificate signed by unknown authority". Certs are read from
+# $VCONTAINER_CA_DIR, else the SDK's certs/ dir (next to this script). The guest
+# re-installs them every boot since it is ephemeral. Generic across runtimes.
+CA_SHARE_DIR=""
+setup_ca_share() {
+    local ca_dir="${VCONTAINER_CA_DIR:-$SCRIPT_DIR/certs}"
+    [ -d "$ca_dir" ] || return 0
+    local certs
+    certs=$(ls "$ca_dir"/*.crt "$ca_dir"/*.pem "$ca_dir"/*.cer 2>/dev/null)
+    [ -z "$certs" ] && return 0
+
+    CA_SHARE_DIR="$TEMP_DIR/ca_share"
+    mkdir -p "$CA_SHARE_DIR"
+    chmod 700 "$CA_SHARE_DIR"
+    local n=0 f
+    for f in $certs; do
+        # update-ca-certificates only picks up *.crt, so normalise the name.
+        cp "$f" "$CA_SHARE_DIR/$(basename "${f%.*}").crt" 2>/dev/null && n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+        rm -rf "$CA_SHARE_DIR"; CA_SHARE_DIR=""; return 0
+    fi
+
+    local ca_tag="${TOOL_NAME}_ca"
+    hv_build_9p_opts "$CA_SHARE_DIR" "$ca_tag" "readonly=on"
+    # Flag for kernel-boot guests (vdkr/vpdmn). qemu-xen (wic boot) ignores
+    # KERNEL_APPEND; its dom0 cert service mounts the tag unconditionally.
+    KERNEL_APPEND="$KERNEL_APPEND ${CMDLINE_PREFIX}_ca=1"
+    log "INFO" "$n host CA certificate(s) staged on read-only 9p share (tag=$ca_tag)"
+    log "DEBUG" "CA source dir: $ca_dir"
 }
 
 cleanup() {
@@ -1522,6 +1584,10 @@ if [ "$DAEMON_MODE" = "start" ]; then
     # Stage registry auth config (config.json / auth.json) on a dedicated
     # read-only 9p share. See setup_auth_share() for the security model.
     setup_auth_share
+
+    # Stage host-provided CA certs (corporate proxy roots) onto a read-only 9p
+    # share; the guest/dom0 installs them into its system trust store.
+    setup_ca_share
 
     log "INFO" "Starting daemon..."
     log "DEBUG" "PID file: $DAEMON_PID_FILE"
