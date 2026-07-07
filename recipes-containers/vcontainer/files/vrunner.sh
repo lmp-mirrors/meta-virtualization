@@ -1086,17 +1086,27 @@ CA_SHARE_DIR=""
 setup_ca_share() {
     local ca_dir="${VCONTAINER_CA_DIR:-$SCRIPT_DIR/certs}"
     [ -d "$ca_dir" ] || return 0
-    local certs
-    certs=$(ls "$ca_dir"/*.crt "$ca_dir"/*.pem "$ca_dir"/*.cer 2>/dev/null)
+
+    # Collect cert files via globbing, NOT `ls`. Under `set -e`, an assignment
+    # from a failing command substitution (ls exits non-zero when no *.crt /
+    # *.pem / *.cer match -- e.g. the drop dir holds only its README) aborts
+    # the whole daemon start silently. A non-matching glob stays literal, so
+    # the [ -e ] guard filters it out and the loop is set -e safe.
+    local certs="" f
+    for f in "$ca_dir"/*.crt "$ca_dir"/*.pem "$ca_dir"/*.cer; do
+        [ -e "$f" ] && certs="$certs $f"
+    done
     [ -z "$certs" ] && return 0
 
     CA_SHARE_DIR="$TEMP_DIR/ca_share"
     mkdir -p "$CA_SHARE_DIR"
     chmod 700 "$CA_SHARE_DIR"
-    local n=0 f
+    local n=0
     for f in $certs; do
         # update-ca-certificates only picks up *.crt, so normalise the name.
-        cp "$f" "$CA_SHARE_DIR/$(basename "${f%.*}").crt" 2>/dev/null && n=$((n + 1))
+        if cp "$f" "$CA_SHARE_DIR/$(basename "${f%.*}").crt" 2>/dev/null; then
+            n=$((n + 1))
+        fi
     done
     if [ "$n" -eq 0 ]; then
         rm -rf "$CA_SHARE_DIR"; CA_SHARE_DIR=""; return 0
