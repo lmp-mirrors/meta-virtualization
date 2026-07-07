@@ -235,11 +235,26 @@ def machine(request):
 
 @pytest.fixture(scope="module")
 def xen_image(build_dir):
-    """Build xen-image-minimal with required distro features."""
+    """Build xen-image-minimal with required distro features + docker engine.
+
+    Self-contained: the fixture installs the container engine + runtime config
+    itself (docker-moby + vxn-docker-config: daemon.json wiring vxn-oci-runtime
+    as Docker's default runtime, iptables=false), so TestXenDockerBackend
+    actually exercises the docker+vxn path instead of silently skipping when
+    docker happens not to be in the ambient image. Previously this relied on a
+    developer's local.conf pulling docker/podman in, which is not reproducible.
+
+    NB: assumes a clean local.conf -- do NOT also force podman in via
+    `IMAGE_INSTALL:append:pn-xen-image-minimal += "... vxn-podman-config"`,
+    since podman-docker and docker-moby both provide /usr/bin/docker and will
+    conflict at do_rootfs.
+    """
     result = _run_bitbake(
         build_dir, "xen-image-minimal",
         extra_vars={
             "DISTRO_FEATURES:append": " xen vxn",
+            "IMAGE_INSTALL:append:pn-xen-image-minimal":
+                " docker-moby vxn-docker-config",
         },
     )
     if result.returncode != 0:
@@ -768,7 +783,12 @@ class TestXenVxnImageCache:
 # ============================================================================
 
 def _docker_available(xen_session):
-    """Check Docker is installed and running, skip if not."""
+    """Check Docker is installed and running, skip if not.
+
+    With the self-contained xen_image fixture docker-moby is installed, so a
+    'not installed' skip now signals a real problem (engine config missing). If
+    the service merely has not started yet, start it before skipping.
+    """
     check = xen_session.run_command(
         'which docker 2>/dev/null || echo NOT_FOUND')
     if 'NOT_FOUND' in check:
@@ -776,7 +796,12 @@ def _docker_available(xen_session):
     svc = xen_session.run_command(
         'systemctl is-active docker 2>/dev/null || echo INACTIVE')
     if 'INACTIVE' in svc or 'inactive' in svc:
-        pytest.skip("docker service not running")
+        # installed but not up yet -- bring it up before giving up
+        xen_session.run_command('systemctl start docker 2>&1; sleep 2')
+        svc = xen_session.run_command(
+            'systemctl is-active docker 2>/dev/null || echo INACTIVE')
+        if 'INACTIVE' in svc or 'inactive' in svc:
+            pytest.skip("docker service present but failed to start")
 
 
 def _podman_available(xen_session):
