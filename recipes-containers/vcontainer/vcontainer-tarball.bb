@@ -402,6 +402,38 @@ Build it first with:
         bbwarn "Run: bitbake container-registry-index -c generate_registry_script"
     fi
 
+    # CA-cert drop dir: users place their corporate root CA (PEM/.crt) here and
+    # it is installed into the container VM's / dom0's system trust store at
+    # boot, so docker/skopeo pulls work behind a TLS-intercepting proxy.
+    mkdir -p "${SDK_OUT}/certs"
+    cat > "${SDK_OUT}/certs/README" <<'CERTEOF'
+vcontainer CA certificate drop dir
+==================================
+
+Behind a corporate TLS-intercepting proxy (e.g. Zscaler), the container VM
+(vdkr/vpdmn) or the Xen dom0 (vxn) does not trust the proxy's root CA, so image
+pulls from docker.io fail with:
+
+    x509: certificate signed by unknown authority
+
+FIX: copy your corporate root CA certificate(s) into THIS directory:
+
+    certs/your-corporate-root-ca.crt        (PEM format: .crt / .pem / .cer)
+
+Then re-run any vdkr / vpdmn / vxn command. The certificate(s) are transported
+into the VM/dom0 over a read-only 9p share and installed into its system trust
+store (update-ca-certificates) on every boot -- the same thing an OS admin does
+on a native machine. For vxn, the CA is also propagated into each container
+(DomU) so containers that make their own TLS calls trust it too.
+
+Getting the cert (AMD/Zscaler example): it is usually already in the host trust
+store, e.g.
+    cp /usr/local/share/ca-certificates/amd-corporate-root-ca.crt certs/
+
+Override the location with VCONTAINER_CA_DIR=/path/to/certs if you prefer.
+CERTEOF
+    bbnote "Created certs/ drop-dir + README"
+
     # Create README
     cat > "${SDK_OUT}/README.txt" <<EOF
 vcontainer Standalone SDK
@@ -435,6 +467,11 @@ Secure Registry Usage:
 Requirements:
   - Linux x86_64 host
   - KVM support recommended (for performance)
+
+Corporate TLS proxy (e.g. Zscaler):
+  If image pulls fail with "x509: certificate signed by unknown authority",
+  drop your corporate root CA (PEM/.crt) into certs/ and re-run. It is installed
+  into the VM/dom0 trust store on boot. See certs/README.
 
 For more information:
   https://git.yoctoproject.org/meta-virtualization/
@@ -541,6 +578,9 @@ ENVEOF
     fi
 
     cat >> $script <<ENVEOF
+echo ""
+echo "Behind a TLS proxy (x509 pull errors)? drop your corporate root CA into"
+echo "  \$VCONTAINER_DIR/certs/   (see certs/README)"
 echo ""
 echo "Architectures: ${VCONTAINER_ARCHITECTURES}"
 ENVEOF
