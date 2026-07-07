@@ -74,6 +74,8 @@ SRC_URI = "\
     file://vxn-podman-api.service \
     file://vxn-host-certs.sh \
     file://vxn-host-certs.service \
+    file://vxn-authorized-keys.sh \
+    file://vxn-authorized-keys.service \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -261,6 +263,12 @@ do_install() {
     install -m 0755 ${S}/vxn-host-certs.sh ${D}${bindir}/vxn-host-certs.sh
     install -m 0644 ${S}/vxn-host-certs.service ${D}${systemd_system_unitdir}/vxn-host-certs.service
 
+    # SSH authorized_keys installer: injects the SDK's public key (staged on the
+    # vxn_sshkey 9p share) into dom0 root's authorized_keys at boot, so the
+    # transparent SDK can `ssh -tt` into dom0 for interactive (-it) containers.
+    install -m 0755 ${S}/vxn-authorized-keys.sh ${D}${bindir}/vxn-authorized-keys.sh
+    install -m 0644 ${S}/vxn-authorized-keys.service ${D}${systemd_system_unitdir}/vxn-authorized-keys.service
+
     # Docker/Podman CLI frontends (sub-packages)
     install -m 0755 ${S}/vdkr.sh ${D}${bindir}/vdkr
     install -m 0755 ${S}/vpdmn.sh ${D}${bindir}/vpdmn
@@ -344,19 +352,21 @@ FILES:${PN} = "\
     ${bindir}/vctr \
     ${bindir}/vxn-command-channel.sh \
     ${bindir}/vxn-host-certs.sh \
+    ${bindir}/vxn-authorized-keys.sh \
     ${libexecdir}/vxn/ \
     ${sysconfdir}/containerd/config.toml \
     ${libdir}/vxn/ \
     ${datadir}/vxn/ \
     ${systemd_system_unitdir}/vxn-command-channel.service \
     ${systemd_system_unitdir}/vxn-host-certs.service \
+    ${systemd_system_unitdir}/vxn-authorized-keys.service \
 "
 
 # Command-channel responder is enabled by default but ConditionPathExists-gated
 # (inactive unless the qemu-xen backend attaches the vdkr virtio-serial port).
 # vxn-host-certs installs corporate CA(s) into the dom0 trust store at boot
 # (no-op when no CA share is attached).
-SYSTEMD_SERVICE:${PN} = "vxn-command-channel.service vxn-host-certs.service"
+SYSTEMD_SERVICE:${PN} = "vxn-command-channel.service vxn-host-certs.service vxn-authorized-keys.service"
 
 # Blobs are large binary files
 INSANE_SKIP:${PN} += "already-stripped"

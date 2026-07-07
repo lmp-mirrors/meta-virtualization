@@ -1271,6 +1271,60 @@ _vxn_args() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# ssh into the QEMU-hosted dom0 (qemu-xen backend only).
+#
+# The reliable interactive path: rather than tunnelling a PTY through the
+# marker command channel, ssh -tt to dom0 and let dom0's native vxn do the
+# interactive work (xl create -c). Reuses the SDK keypair that vrunner staged
+# and dom0 installed into authorized_keys. Ensures the dom0 daemon is up first.
+#
+# Usage: _vxn_ssh_dom0 [ssh opts ...] -- [remote command ...]
+#   No remote command -> interactive login shell in dom0.
+_vxn_ssh_dom0() {
+    # Must match vrunner.sh setup_ssh_key_share's default exactly (not
+    # DEFAULT_STATE_DIR, which a STATE_DIR override would move out from under
+    # the staging side). VXN_SSH_KEY overrides both.
+    local key="${VXN_SSH_KEY:-$HOME/.${VCONTAINER_RUNTIME_NAME}/id_${VCONTAINER_RUNTIME_NAME}}"
+    local port="${VXN_SSH_PORT:-18022}"
+
+    # dom0 holds the sshd we forward to; auto-start it if needed.
+    if ! daemon_is_running; then
+        echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Starting dom0..." >&2
+        if ! "$RUNNER" $(build_runner_args) --daemon-start; then
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to start dom0" >&2
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$key" ]; then
+        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} SDK ssh key not found ($key)." >&2
+        echo "  It is generated on dom0 start; restart the daemon so it is created and injected:" >&2
+        echo "    $VCONTAINER_RUNTIME_NAME vmemres stop && $VCONTAINER_RUNTIME_NAME vmemres start" >&2
+        return 1
+    fi
+
+    local ssh_opts=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --) shift; break ;;
+            *) ssh_opts="$ssh_opts $1"; shift ;;
+        esac
+    done
+
+    # StrictHostKeyChecking/UserKnownHostsFile off: dom0 is ephemeral, its host
+    # key changes every boot, and it's reached only over the local forward.
+    ssh $ssh_opts \
+        -i "$key" \
+        -p "$port" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o PasswordAuthentication=no \
+        -o IdentitiesOnly=yes \
+        root@127.0.0.1 "$@"
+}
+
 # Helper function to run command via daemon or regular mode
 run_runtime_command() {
     local runtime_cmd="$1"
@@ -2992,6 +3046,16 @@ case "$COMMAND" in
             RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run $RUN_NETWORK_OPTS $(_vxn_args "${COMMAND_ARGS[@]}")"
         fi
 
+        # qemu-xen (transparent SDK): -it can't ride the marker command channel
+        # (it isn't a PTY). Route interactive over `ssh -tt` to dom0's native
+        # vxn, which does interactive via `xl create -c` -- the same dom0 engine
+        # the non-interactive channel drives. RUNTIME_CMD is already
+        # `vxn run -it '<quoted args>'`, sized for a single remote shell parse.
+        if [ "$INTERACTIVE" = "true" ] && [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+            _vxn_ssh_dom0 -tt -- "$RUNTIME_CMD"
+            exit $?
+        fi
+
         if [ "$INTERACTIVE" = "true" ]; then
             # Interactive mode with volumes still needs to stop daemon (volumes use share dir)
             # Interactive mode without volumes can use daemon_interactive (faster)
@@ -3197,6 +3261,23 @@ case "$COMMAND" in
                 ;;
         esac
         exit 0
+        ;;
+
+    ssh)
+        # Open an interactive ssh session into the QEMU-hosted dom0 (or run a
+        # command there). This is the substrate the transparent interactive
+        # (-it) path uses; exposed directly for dom0 debugging/inspection.
+        # Only meaningful for qemu-xen (native-xen vxn already runs in dom0).
+        if [ "${VCONTAINER_HYPERVISOR:-}" != "qemu-xen" ]; then
+            echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} 'ssh' connects to the QEMU-hosted dom0; only valid with the qemu-xen backend" >&2
+            exit 1
+        fi
+        if [ ${#COMMAND_ARGS[@]} -gt 0 ]; then
+            _vxn_ssh_dom0 -tt -- "${COMMAND_ARGS[@]}"
+        else
+            _vxn_ssh_dom0 -tt --
+        fi
+        exit $?
         ;;
 
     memres|vmemres)

@@ -1138,6 +1138,53 @@ setup_ca_share() {
     log "DEBUG" "CA source dirs:$ca_dirs"
 }
 
+# ---------------------------------------------------------------------------
+# SSH key share (qemu-xen interactive support).
+#
+# Interactive containers (`vxn -it run ... sh`) can't ride the marker command
+# channel -- it isn't a PTY. The transparent SDK instead routes -it over
+# `ssh -tt` to dom0's native vxn, which does the interactive work via
+# `xl create -c`. For that ssh to be passwordless, the SDK's PUBLIC key must be
+# in dom0's authorized_keys. Generate an SDK keypair once and stage the pubkey
+# on a read-only 9p share (tag <tool>_sshkey); dom0 installs it at boot
+# (vxn-authorized-keys.service). Only meaningful for the qemu-xen backend
+# (native-xen vxn runs IN dom0; vdkr/vpdmn already do interactive via the
+# daemon PTY).
+# ---------------------------------------------------------------------------
+SSHKEY_SHARE_DIR=""
+setup_ssh_key_share() {
+    [ "$VCONTAINER_HYPERVISOR" = "qemu-xen" ] || return 0
+
+    local key="${VXN_SSH_KEY:-$HOME/.${TOOL_NAME}/id_${TOOL_NAME}}"
+    local keydir
+    keydir=$(dirname "$key")
+    mkdir -p "$keydir"
+    chmod 700 "$keydir" 2>/dev/null || true
+
+    # Generate the SDK keypair once (idempotent). ed25519: small, fast, no size
+    # prompt; no passphrase -- it is a local dom0-only credential.
+    if [ ! -f "$key" ]; then
+        if ! command -v ssh-keygen >/dev/null 2>&1; then
+            log "WARN" "ssh-keygen not found; interactive (-it) over ssh will be unavailable"
+            return 0
+        fi
+        if ! ssh-keygen -t ed25519 -N '' -C "${TOOL_NAME}-sdk" -f "$key" >/dev/null 2>&1; then
+            log "WARN" "ssh-keygen failed; interactive (-it) over ssh will be unavailable"
+            return 0
+        fi
+    fi
+    [ -f "$key.pub" ] || return 0
+
+    SSHKEY_SHARE_DIR="$TEMP_DIR/sshkey_share"
+    mkdir -p "$SSHKEY_SHARE_DIR"
+    chmod 700 "$SSHKEY_SHARE_DIR"
+    cp "$key.pub" "$SSHKEY_SHARE_DIR/authorized_keys"
+    chmod 644 "$SSHKEY_SHARE_DIR/authorized_keys"
+
+    hv_build_9p_opts "$SSHKEY_SHARE_DIR" "${TOOL_NAME}_sshkey" "readonly=on"
+    log "INFO" "SDK ssh public key staged for dom0 (tag=${TOOL_NAME}_sshkey)"
+}
+
 cleanup() {
     if [ "$KEEP_TEMP" = "true" ]; then
         log "DEBUG" "Keeping temp directory: $TEMP_DIR"
@@ -1615,6 +1662,10 @@ if [ "$DAEMON_MODE" = "start" ]; then
     # Stage host-provided CA certs (corporate proxy roots) onto a read-only 9p
     # share; the guest/dom0 installs them into its system trust store.
     setup_ca_share
+
+    # Stage the SDK ssh public key so dom0 accepts passwordless `ssh -tt` for
+    # transparent interactive (-it) containers. No-op unless qemu-xen backend.
+    setup_ssh_key_share
 
     log "INFO" "Starting daemon..."
     log "DEBUG" "PID file: $DAEMON_PID_FILE"
