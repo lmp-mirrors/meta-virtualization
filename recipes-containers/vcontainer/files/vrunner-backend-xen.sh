@@ -327,6 +327,22 @@ _write_xen_config() {
     local xen_memory="${VXN_MEMORY:-512}"
     local xen_vcpus="${VXN_VCPUS:-2}"
 
+    # DomU kernel cmdline additions, based on where the SDK is running:
+    #   * AMD auto-detect: the guest kernel's print_s5_reset_status_mmio initcall
+    #     does a raw ioread32 on AMD FCH MMIO (0xFED803C0) -- valid on AMD bare
+    #     metal, but unmapped in a Xen PV DomU -> page fault in PID 1 ->
+    #     "Attempted to kill init" panic. Blacklisting it is a no-op on Intel
+    #     (never called there). Key off dom0's CPU vendor: dom0 runs -cpu host,
+    #     so it sees the real host -- AMD on an AMD laptop, Intel on the build
+    #     box. The proper fix is guarding that initcall in the DomU kernel (TODO);
+    #     this is the no-kernel-rebuild workaround.
+    #   * VXN_DOMU_CMDLINE_EXTRA: arbitrary extra DomU cmdline (dom0 env / config).
+    local domu_extra=""
+    if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        domu_extra="$domu_extra initcall_blacklist=print_s5_reset_status_mmio"
+    fi
+    [ -n "${VXN_DOMU_CMDLINE_EXTRA:-}" ] && domu_extra="$domu_extra $VXN_DOMU_CMDLINE_EXTRA"
+
     cat > "$config_path" <<XENEOF
 # Auto-generated Xen domain config for vxn
 name = "$HV_DOMNAME"
@@ -336,7 +352,7 @@ vcpus = $xen_vcpus
 
 kernel = "$KERNEL_IMAGE"
 ramdisk = "$INITRAMFS"
-extra = "console=hvc0 quiet loglevel=0 init=/init vcontainer.blk=xvd vcontainer.init=/vxn-init.sh $kernel_append"
+extra = "console=hvc0 quiet loglevel=0 init=/init vcontainer.blk=xvd vcontainer.init=/vxn-init.sh$domu_extra $kernel_append"
 
 disk = [ $disk_array ]
 vif = [ $vif_array ]
