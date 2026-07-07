@@ -71,6 +71,7 @@ SRC_URI = "\
     file://vpdmn.sh \
     file://vxn-command-channel.sh \
     file://vxn-command-channel.service \
+    file://vxn-podman-api.service \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -241,6 +242,10 @@ do_install() {
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${S}/vxn-command-channel.service ${D}${systemd_system_unitdir}/vxn-command-channel.service
 
+    # Podman TCP API service (vxn-podman-api sub-package): exposes dom0's
+    # podman (docker-compat) API for host-side `vxn vexpose` tooling.
+    install -m 0644 ${S}/vxn-podman-api.service ${D}${systemd_system_unitdir}/vxn-podman-api.service
+
     # Docker/Podman CLI frontends (sub-packages)
     install -m 0755 ${S}/vdkr.sh ${D}${bindir}/vdkr
     install -m 0755 ${S}/vpdmn.sh ${D}${bindir}/vpdmn
@@ -294,17 +299,24 @@ do_install() {
 }
 
 # Sub-packages for CLI frontends and native runtime config
-PACKAGES =+ "${PN}-vdkr ${PN}-vpdmn ${PN}-docker-config ${PN}-podman-config"
+PACKAGES =+ "${PN}-vdkr ${PN}-vpdmn ${PN}-docker-config ${PN}-podman-config ${PN}-podman-api"
 
 FILES:${PN}-vdkr = "${bindir}/vdkr"
 FILES:${PN}-vpdmn = "${bindir}/vpdmn"
 FILES:${PN}-docker-config = "${sysconfdir}/docker/daemon.json"
 FILES:${PN}-podman-config = "${sysconfdir}/containers/containers.conf.d/50-vxn-runtime.conf"
+FILES:${PN}-podman-api = "${systemd_system_unitdir}/vxn-podman-api.service"
 
 RDEPENDS:${PN}-vdkr = "${PN} bash"
 RDEPENDS:${PN}-vpdmn = "${PN} bash"
 RDEPENDS:${PN}-docker-config = "${PN} docker virtual-runc"
 RDEPENDS:${PN}-podman-config = "${PN} podman"
+RDEPENDS:${PN}-podman-api = "${PN} ${PN}-podman-config podman"
+
+# vxn-podman-api ships an enabled-by-default systemd service; declare it a
+# systemd package so the unit is enabled at rootfs time.
+SYSTEMD_PACKAGES += "${PN}-podman-api"
+SYSTEMD_SERVICE:${PN}-podman-api = "vxn-podman-api.service"
 
 # daemon.json conflicts with docker-registry-config (only one provider)
 RCONFLICTS:${PN}-docker-config = "docker-registry-config"

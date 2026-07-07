@@ -3118,6 +3118,52 @@ case "$COMMAND" in
 
     # Memory resident subcommand: <tool> memres start|stop|restart|status
     # vmemres is the preferred name (v prefix for tool-specific commands)
+    vexpose)
+        # Expose the guest container-engine API (podman/docker-compat) to the
+        # host, so standard docker/podman-compatible tooling drives it -- for
+        # vxn/qemu-xen that means dom0's engine, which uses vxn-oci-runtime to
+        # create Xen DomUs. The qemu-xen backend forwards the engine's TCP API
+        # to the host's 127.0.0.1:${VXN_API_PORT} at daemon boot; this command
+        # just emits the client env (with the API-version pin that sidesteps
+        # podman's /version quirk). Usage:
+        #   eval "$(vxn vexpose env --export)"
+        #   docker run --network=none --rm alpine echo hi
+        API_PORT="${VXN_API_PORT:-2375}"
+        API_URL="tcp://localhost:${API_PORT}"
+        VEXPOSE_SUB="${COMMAND_ARGS[0]:-}"
+
+        if ! daemon_is_running; then
+            echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} No memres daemon running for $TARGET_ARCH." >&2
+            echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} Start one first: $VCONTAINER_RUNTIME_NAME vmemres start" >&2
+        fi
+
+        case "$VEXPOSE_SUB" in
+            env)
+                # eval-able export lines (both DOCKER_HOST and CONTAINER_HOST so
+                # docker and podman clients both work).
+                echo "export DOCKER_HOST=${API_URL}"
+                echo "export CONTAINER_HOST=${API_URL}"
+                echo "export DOCKER_API_VERSION=1.41"
+                ;;
+            *)
+                echo "Container engine API: ${API_URL}"
+                echo ""
+                echo "Drive it with a docker/podman-compatible client on the host:"
+                echo "  eval \"\$($VCONTAINER_RUNTIME_NAME vexpose env --export)\""
+                echo "  docker run --network=none --rm alpine echo hi"
+                echo ""
+                echo "Notes:"
+                echo "  - DOCKER_API_VERSION=1.41 is set for you (podman /version quirk)"
+                echo "  - containers need --network=none (bridge networking is VM-incompatible)"
+                echo "  - the engine API service must be enabled in the guest"
+                echo "    (podman: the vxn-podman-api package / 'systemctl enable --now podman.socket')"
+                echo "  - override the host port with VXN_API_PORT (before 'vmemres start');"
+                echo "    VXN_API_PORT=none disables the forward"
+                ;;
+        esac
+        exit 0
+        ;;
+
     memres|vmemres)
         if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
             echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} memres requires a subcommand: start, stop, restart, status, list" >&2

@@ -145,6 +145,17 @@ hv_build_network_opts() {
         # boot-xen.sh's :2222->:22 forward.
         NETDEV_OPTS="$NETDEV_OPTS,hostfwd=tcp::${VXN_SSH_PORT:-2222}-:22"
 
+        # Container-engine API forward: dom0's podman (or docker) serves its
+        # Docker-compatible API on tcp:2375; forward it to the HOST's
+        # 127.0.0.1:${VXN_API_PORT} so `vxn vexpose` + a docker/podman client
+        # on the host drive dom0's engine (which uses vxn-oci-runtime -> DomU).
+        # Bound to host loopback only (not 0.0.0.0) since the API is
+        # unauthenticated. VXN_API_PORT=none disables it; a distinct port
+        # deconflicts from a concurrent vdkr/vpdmn vexpose on 2375.
+        if [ "${VXN_API_PORT:-2375}" != "none" ]; then
+            NETDEV_OPTS="$NETDEV_OPTS,hostfwd=tcp:127.0.0.1:${VXN_API_PORT:-2375}-:2375"
+        fi
+
         for pf in "${PORT_FORWARDS[@]}"; do
             HOST_PORT="${pf%%:*}"
             CONTAINER_PART="${pf#*:}"
