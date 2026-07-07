@@ -165,6 +165,16 @@ hv_prepare_container() {
         INPUT_PATH="$oci_dir"
         INPUT_TYPE="oci"
         log "INFO" "OCI image pulled to $oci_dir"
+
+        # DomU inherits dom0's corporate CA(s): stage them alongside the OCI
+        # image so the guest init installs them into the container's trust store
+        # (so containers doing their own TLS/network ops trust a proxy CA too).
+        # dom0's vxn-host-certs.sh left them in /usr/local/share/ca-certificates.
+        if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
+            mkdir -p "$oci_dir/.vxn-ca"
+            cp /usr/local/share/ca-certificates/*.crt "$oci_dir/.vxn-ca/" 2>/dev/null || true
+            log "INFO" "Staged dom0 CA cert(s) for the container trust store"
+        fi
     else
         log "ERROR" "Failed to pull image: $image"
         [ -f "$skopeo_log" ] && while IFS= read -r line; do

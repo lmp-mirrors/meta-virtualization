@@ -72,6 +72,8 @@ SRC_URI = "\
     file://vxn-command-channel.sh \
     file://vxn-command-channel.service \
     file://vxn-podman-api.service \
+    file://vxn-host-certs.sh \
+    file://vxn-host-certs.service \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -246,6 +248,12 @@ do_install() {
     # podman (docker-compat) API for host-side `vxn vexpose` tooling.
     install -m 0644 ${S}/vxn-podman-api.service ${D}${systemd_system_unitdir}/vxn-podman-api.service
 
+    # Host CA cert installer: installs corporate proxy root CA(s) (staged on the
+    # vxn_ca 9p share) into dom0's trust store at boot, so skopeo/docker pulls
+    # trust a TLS-intercepting proxy.
+    install -m 0755 ${S}/vxn-host-certs.sh ${D}${bindir}/vxn-host-certs.sh
+    install -m 0644 ${S}/vxn-host-certs.service ${D}${systemd_system_unitdir}/vxn-host-certs.service
+
     # Docker/Podman CLI frontends (sub-packages)
     install -m 0755 ${S}/vdkr.sh ${D}${bindir}/vdkr
     install -m 0755 ${S}/vpdmn.sh ${D}${bindir}/vpdmn
@@ -328,16 +336,20 @@ FILES:${PN} = "\
     ${bindir}/containerd-shim-vxn-v2 \
     ${bindir}/vctr \
     ${bindir}/vxn-command-channel.sh \
+    ${bindir}/vxn-host-certs.sh \
     ${libexecdir}/vxn/ \
     ${sysconfdir}/containerd/config.toml \
     ${libdir}/vxn/ \
     ${datadir}/vxn/ \
     ${systemd_system_unitdir}/vxn-command-channel.service \
+    ${systemd_system_unitdir}/vxn-host-certs.service \
 "
 
 # Command-channel responder is enabled by default but ConditionPathExists-gated
 # (inactive unless the qemu-xen backend attaches the vdkr virtio-serial port).
-SYSTEMD_SERVICE:${PN} = "vxn-command-channel.service"
+# vxn-host-certs installs corporate CA(s) into the dom0 trust store at boot
+# (no-op when no CA share is attached).
+SYSTEMD_SERVICE:${PN} = "vxn-command-channel.service vxn-host-certs.service"
 
 # Blobs are large binary files
 INSANE_SKIP:${PN} += "already-stripped"

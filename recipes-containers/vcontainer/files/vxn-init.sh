@@ -44,6 +44,28 @@ VCONTAINER_VERSION="1.2.0"
 
 # Find the container rootfs directory from the input disk.
 # Sets CONTAINER_ROOT to the path of the extracted rootfs.
+# Install dom0-provided corporate CA cert(s) into the container's trust store.
+# dom0 staged them at /mnt/input/.vxn-ca (see vrunner-backend-xen.sh). Appends
+# to the existing CA bundle so it works even in minimal containers without
+# ca-certificates tooling (no re-bundle), and also drops them into
+# /usr/local/share/ca-certificates for containers that do re-bundle. Lets a
+# container that does its own TLS/network ops trust a corporate proxy CA.
+install_domu_ca_certs() {
+    [ -n "$CONTAINER_ROOT" ] || return 0
+    ls /mnt/input/.vxn-ca/*.crt >/dev/null 2>&1 || return 0
+
+    local bundle="$CONTAINER_ROOT/etc/ssl/certs/ca-certificates.crt"
+    local n=0 f
+    mkdir -p "$CONTAINER_ROOT/usr/local/share/ca-certificates" \
+             "$CONTAINER_ROOT/etc/ssl/certs" 2>/dev/null
+    for f in /mnt/input/.vxn-ca/*.crt; do
+        [ -f "$f" ] || continue
+        cp "$f" "$CONTAINER_ROOT/usr/local/share/ca-certificates/$(basename "$f")" 2>/dev/null
+        cat "$f" >> "$bundle" 2>/dev/null && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "Installed $n dom0 CA cert(s) into the container trust store"
+}
+
 find_container_rootfs() {
     CONTAINER_ROOT=""
 
@@ -56,27 +78,24 @@ find_container_rootfs() {
     if [ -d /mnt/input/bin ] || [ -d /mnt/input/usr ]; then
         CONTAINER_ROOT="/mnt/input"
         log "Container rootfs: direct mount (/mnt/input)"
-        return 0
-    fi
-
     # Check for OCI layout (index.json + blobs/)
-    if [ -f /mnt/input/index.json ] || [ -f /mnt/input/oci-layout ]; then
+    elif [ -f /mnt/input/index.json ] || [ -f /mnt/input/oci-layout ]; then
         log "Found OCI layout on input disk, extracting layers..."
         extract_oci_rootfs /mnt/input /mnt/container
         CONTAINER_ROOT="/mnt/container"
-        return 0
-    fi
-
     # Check for rootfs/ subdirectory
-    if [ -d /mnt/input/rootfs ]; then
+    elif [ -d /mnt/input/rootfs ]; then
         CONTAINER_ROOT="/mnt/input/rootfs"
         log "Container rootfs: /mnt/input/rootfs"
-        return 0
+    else
+        log "WARNING: Could not determine rootfs layout in /mnt/input"
+        [ "$QUIET_BOOT" = "0" ] && ls -la /mnt/input/
+        return 1
     fi
 
-    log "WARNING: Could not determine rootfs layout in /mnt/input"
-    [ "$QUIET_BOOT" = "0" ] && ls -la /mnt/input/
-    return 1
+    # Container inherits dom0's corporate CA(s), if any were staged.
+    install_domu_ca_certs
+    return 0
 }
 
 # Extract OCI image layers into a flat rootfs.
