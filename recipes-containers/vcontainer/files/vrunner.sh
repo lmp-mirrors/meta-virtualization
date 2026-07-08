@@ -348,6 +348,7 @@ BATCH_IMPORT="false"
 
 # Daemon mode options
 DAEMON_MODE=""          # start, send, stop, status
+FORCE="false"           # --force: skip graceful daemon_stop, go straight to QMP quit + SIGKILL
 DAEMON_SOCKET_DIR=""    # Directory for daemon socket/PID files
 IDLE_TIMEOUT="1800"     # Default: 30 minutes
 EXIT_GRACE_PERIOD=""    # Entrypoint exit grace period (vxn)
@@ -486,6 +487,10 @@ while [ $# -gt 0 ]; do
             DAEMON_MODE="stop"
             shift
             ;;
+        --force)
+            FORCE="true"
+            shift
+            ;;
         --daemon-status)
             DAEMON_MODE="status"
             shift
@@ -607,6 +612,32 @@ daemon_status() {
 daemon_stop() {
     if ! daemon_is_running; then
         log "WARN" "Daemon is not running"
+        return 0
+    fi
+
+    # --force: skip the graceful ===SHUTDOWN=== + up-to-60s poll entirely and
+    # tear the VM down now. For a wedged guest (e.g. reboot-looping after a
+    # failed run) the graceful path blocks the caller; this goes straight to
+    # QMP quit, then SIGKILL, then any backend cleanup. NOTE: this bypasses the
+    # guest's clean umount, so the state disk may be left mid-write -- use only
+    # when the guest is stuck; recover the next session with `memres restart --clean`.
+    if [ "$FORCE" = "true" ]; then
+        local fpid=$(cat "$DAEMON_PID_FILE" 2>/dev/null)
+        log "WARN" "Force-stopping daemon (PID: ${fpid:-unknown})..."
+        local qmp_sock="$DAEMON_SOCKET_DIR/qmp.sock"
+        if [ -S "$qmp_sock" ]; then
+            echo '{"execute":"qmp_capabilities"}{"execute":"quit"}' | \
+                socat - "UNIX-CONNECT:$qmp_sock" >/dev/null 2>&1 || true
+            sleep 1
+        fi
+        if [ -n "$fpid" ]; then
+            kill -0 "$fpid" 2>/dev/null && { kill "$fpid" 2>/dev/null; sleep 1; }
+            kill -0 "$fpid" 2>/dev/null && kill -9 "$fpid" 2>/dev/null || true
+        fi
+        # backend teardown (e.g. xl destroy) best-effort
+        type hv_destroy_vm >/dev/null 2>&1 && hv_destroy_vm 2>/dev/null || true
+        rm -f "$DAEMON_PID_FILE" "$DAEMON_SOCKET"
+        log "INFO" "Daemon force-stopped"
         return 0
     fi
 

@@ -3290,6 +3290,7 @@ case "$COMMAND" in
 
         # Parse memres-specific options (after the subcommand)
         MEMRES_ARGS=("${COMMAND_ARGS[@]:1}")
+        MEMRES_FORCE=""
         i=0
         while [ $i -lt ${#MEMRES_ARGS[@]} ]; do
             arg="${MEMRES_ARGS[$i]}"
@@ -3302,6 +3303,10 @@ case "$COMMAND" in
                         exit 1
                     fi
                     PORT_FORWARDS+=("${MEMRES_ARGS[$i]}")
+                    ;;
+                -f|--force)
+                    # Skip graceful shutdown -- for a wedged/reboot-looping guest.
+                    MEMRES_FORCE="--force"
                     ;;
             esac
             i=$((i + 1))
@@ -3355,7 +3360,7 @@ case "$COMMAND" in
                 if [ -f "$pf_file" ]; then
                     rm -f "$pf_file"
                 fi
-                "$RUNNER" $RUNNER_ARGS --daemon-stop
+                "$RUNNER" $RUNNER_ARGS --daemon-stop $MEMRES_FORCE
                 ;;
             restart)
                 # Stop if running and clear port forward registry
@@ -3363,7 +3368,7 @@ case "$COMMAND" in
                 if [ -f "$pf_file" ]; then
                     rm -f "$pf_file"
                 fi
-                "$RUNNER" $RUNNER_ARGS --daemon-stop 2>/dev/null || true
+                "$RUNNER" $RUNNER_ARGS --daemon-stop $MEMRES_FORCE 2>/dev/null || true
 
                 # Clean if --clean was passed
                 for arg in "${COMMAND_ARGS[@]:1}"; do
