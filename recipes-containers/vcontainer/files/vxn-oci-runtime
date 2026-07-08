@@ -249,6 +249,25 @@ cmd_create() {
         local img_size_kb=$(( (rootfs_size_kb * 3 / 2) ))
         [ "$img_size_kb" -lt 65536 ] && img_size_kb=65536
 
+        # Overlay operator-staged files into the container rootfs before it is
+        # packaged. A vxn container is a DomU (a VM): once it boots, its
+        # filesystem lives inside input.img, unreachable by a host-side `cp` --
+        # there is no live "push a file into the running container" path like a
+        # normal (namespace) container has. This create-time overlay is the
+        # injection point: anything under VXN_INJECT_DIR (laid out as it should
+        # appear in the container, e.g. root/.claude/settings.json) is copied in
+        # so it is present at first boot. Used to deliver credentials/config
+        # (e.g. an Anthropic gateway settings.json) without baking secrets into
+        # the image or relying on runtime env transport. Mirrors the CLI path's
+        # .vxn-ca CA-cert staging. Tiny payloads -- the 50%/64MB headroom above
+        # already covers them, so no size recompute is needed.
+        local inject_dir="${VXN_INJECT_DIR:-/var/lib/vxn-inject}"
+        if [ -d "$inject_dir" ] && [ -n "$(ls -A "$inject_dir" 2>/dev/null)" ]; then
+            log "  Overlaying inject dir into rootfs: $inject_dir"
+            cp -a "$inject_dir/." "$rootfs_dir/" >> "$VXN_LOG" 2>&1 || \
+                log "  WARN: inject overlay from $inject_dir failed (continuing)"
+        fi
+
         log "  Creating ext4 image: ${img_size_kb}KB from $rootfs_dir"
         mke2fs -t ext4 -d "$rootfs_dir" -b 4096 "$input_img" "${img_size_kb}K" \
             >> "$VXN_LOG" 2>&1 || die "create: failed to create ext4 image"

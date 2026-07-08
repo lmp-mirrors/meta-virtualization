@@ -68,7 +68,10 @@ fi
 # Not an engine command; plain ssh, chmod +x on arrival.
 if [ "${1:-}" = "push" ]; then
     [ $# -eq 3 ] && [ -f "$2" ] || { echo "usage: vpm push <local-file> <dom0-dest-path>" >&2; exit 1; }
-    ssh "${OPTS[@]}" root@127.0.0.1 "cat > '$3' && chmod +x '$3'" < "$2" \
+    # mkdir -p the dest parent -- pushes into nested trees (e.g. the inject dir
+    # /var/lib/vxn-inject/root/.claude/settings.json) would otherwise fail on a
+    # missing parent. chmod +x is harmless on data files and wanted for scripts.
+    ssh "${OPTS[@]}" root@127.0.0.1 "mkdir -p \"\$(dirname '$3')\" && cat > '$3' && chmod +x '$3'" < "$2" \
         && echo "vpm: pushed $2 -> dom0:$3" >&2
     exit $?
 fi
