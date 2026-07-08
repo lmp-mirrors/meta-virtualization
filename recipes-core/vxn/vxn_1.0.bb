@@ -284,9 +284,18 @@ do_install() {
     printf '{\n  "runtimes": {\n    "vxn": {\n      "path": "/usr/bin/vxn-oci-runtime"\n    }\n  },\n  "default-runtime": "vxn",\n  "iptables": false\n}\n' \
         > ${D}${sysconfdir}/docker/daemon.json
 
-    # Podman config: register vxn-oci-runtime (vxn-podman-config sub-package)
+    # Podman config: register vxn-oci-runtime (vxn-podman-config sub-package).
+    # netns="none": default every `podman run` to --network=none. A vxn
+    # container is a Xen DomU that does its own networking via a xenbr0 vif
+    # (vxn-oci-runtime), so podman's own netns/netavark path is both unwanted
+    # and unusable here (dom0's kernel lacks the nft NAT modules netavark
+    # needs). Defaulting netns to none means `podman run <image>` works with no
+    # --network=none flag and the container is still networked (via the vif).
+    # NOTE: this is global, so `podman build` RUN steps get no network -- build
+    # images with a normal engine (or `podman build --network=host`), then run
+    # them under vxn. See docs/TODO.
     install -d ${D}${sysconfdir}/containers/containers.conf.d
-    printf '[engine]\nruntime = "vxn"\n\n[engine.runtimes]\nvxn = ["/usr/bin/vxn-oci-runtime"]\n' \
+    printf '[containers]\nnetns = "none"\n\n[engine]\nruntime = "vxn"\n\n[engine.runtimes]\nvxn = ["/usr/bin/vxn-oci-runtime"]\n' \
         > ${D}${sysconfdir}/containers/containers.conf.d/50-vxn-runtime.conf
 
     # Install shared scripts into libdir
