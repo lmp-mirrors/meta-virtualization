@@ -55,6 +55,8 @@ SRC_URI = "\
         file://0001-dynbinary-use-go-cross-compiler.patch;patchdir=src/import \
         file://0001-check-config-make-CONFIG_MEMCG_SWAP-conditional.patch;patchdir=src/import \
         file://CVE-2026-41568.patch;patchdir=src/import \
+        file://CVE-2026-42306_p1.patch;patchdir=src/import \
+        file://CVE-2026-42306_p2.patch;patchdir=src/import \
 	"
 
 DOCKER_COMMIT = "${SRCREV_moby}"
