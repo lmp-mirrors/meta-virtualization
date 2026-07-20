@@ -317,15 +317,24 @@ determine_exec_command() {
 
 # Set up environment variables for the container
 setup_container_env() {
-    # Apply OCI environment variables
+    # Apply OCI environment variables (incl. the image's PATH). Feed the list
+    # via a here-doc, NOT a pipe: `echo | while` runs the loop in a subshell, so
+    # the exports would be lost and the entrypoint would run with the init's
+    # minimal PATH -- e.g. a node image's `claude` in /usr/local/bin becomes
+    # 'exec: claude: not found'. A here-doc keeps the loop in the current shell.
     if [ -n "$OCI_ENV" ]; then
-        echo "$OCI_ENV" | while IFS= read -r env_line; do
+        while IFS= read -r env_line; do
             [ -n "$env_line" ] && export "$env_line" 2>/dev/null || true
-        done
+        done <<OCIENVEOF
+$OCI_ENV
+OCIENVEOF
     fi
 
-    # Ensure basic environment
-    export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+    # Ensure a sane PATH even if the image didn't set one.
+    case ":${PATH:-}:" in
+        *:/usr/local/bin:*) : ;;
+        *) export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}" ;;
+    esac
     export HOME="${HOME:-/root}"
     export TERM="${TERM:-linux}"
 }

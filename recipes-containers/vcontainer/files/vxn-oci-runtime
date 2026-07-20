@@ -230,9 +230,17 @@ cmd_create() {
     esac
 
     local rootfs_dir="$rootfs_path"
-    local input_img="$dir/input.img"
+    # The ext4 input disk is created HERE and can be as large as the container
+    # rootfs (hundreds of MB). The runtime state dir lives under --root, which
+    # podman/containerd put in /run (a small RAM tmpfs) -- building the image
+    # there dies with "failed to create ext4 image" for anything but tiny
+    # images. Put the image on the disk-backed rootfs instead (override with
+    # VXN_IMG_ROOT). State (config/pid) stays under --root.
+    local img_dir="${VXN_IMG_ROOT:-/var/lib/vxn-oci-runtime}/$container_id"
+    mkdir -p "$img_dir" 2>/dev/null
+    local input_img="$img_dir/input.img"
 
-    log "  rootfs_dir=$rootfs_dir"
+    log "  rootfs_dir=$rootfs_dir  input_img=$input_img"
 
     if [ -d "$rootfs_dir" ] && [ -n "$(ls -A "$rootfs_dir" 2>/dev/null)" ]; then
         # Calculate size: rootfs size + 50% headroom, minimum 64MB
@@ -283,6 +291,36 @@ cmd_create() {
         kernel_extra="$kernel_extra docker_interactive=1"
     fi
 
+    # Networking: attach a xenbr0 vif so the container has an interface.
+    # A vxn container is a DomU (a VM), not a network namespace, so docker/ctr/
+    # podman's veth-in-a-netns is never used by it -- unlike runc, we must give
+    # the DomU its own vif or it comes up with no NIC. Do it unconditionally
+    # (independent of docker's --network, which can't apply to a VM); the DomU
+    # gets a dnsmasq lease + NAT on xenbr0, same as the vxn CLI path. Override
+    # the bridge with VXN_BRIDGE, or VXN_BRIDGE=none to opt out.
+    local vxn_vif="'bridge=${VXN_BRIDGE:-xenbr0}'"
+    if [ "${VXN_BRIDGE:-}" = "none" ]; then
+        vxn_vif=""
+    else
+        # Also tell the guest init to bring the interface up (DHCP on xenbr0);
+        # configure_networking() is gated on docker_network=1. Without this the
+        # DomU would have a vif but never request a lease.
+        kernel_extra="$kernel_extra docker_network=1"
+    fi
+
+    # AMD guest-kernel panic workaround -- MUST match the CLI path
+    # (vrunner-backend-xen.sh _write_xen_config). The guest kernel's
+    # print_s5_reset_status_mmio initcall does a raw ioread32 on AMD FCH MMIO
+    # (0xFED803C0) that is unmapped in a Xen PV DomU -> PID 1 page fault. dom0
+    # runs '-cpu host', so it reflects the real host vendor. Without this the
+    # DomU panics on boot on AMD hosts, dies before the entrypoint runs, and the
+    # container engine reaps it with no output (looks like an early exit). The
+    # vxn CLI path already blacklists it; the OCI-runtime path must too.
+    if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        kernel_extra="$kernel_extra initcall_blacklist=print_s5_reset_status_mmio"
+    fi
+    [ -n "${VXN_DOMU_CMDLINE_EXTRA:-}" ] && kernel_extra="$kernel_extra $VXN_DOMU_CMDLINE_EXTRA"
+
     cat > "$config_cfg" <<XENEOF
 # Auto-generated Xen domain config for vxn-oci-runtime
 name = "$domname"
@@ -294,8 +332,8 @@ kernel = "$VXN_KERNEL"
 ramdisk = "$VXN_INITRAMFS"
 extra = "$kernel_extra"
 
-disk = [ 'format=raw,vdev=xvda,access=ro,target=$VXN_ROOTFS', 'format=raw,vdev=xvdb,access=ro,target=$input_img' ]
-vif = []
+disk = [ 'format=raw,vdev=xvda,access=ro,target=$VXN_ROOTFS', 'format=raw,vdev=xvdb,access=rw,target=$input_img' ]
+vif = [ $vxn_vif ]
 
 serial = 'pty'
 
@@ -629,8 +667,10 @@ cmd_delete() {
         kill "$mpid" 2>/dev/null || true
     fi
 
-    # Remove state directory (includes disk images)
+    # Remove state directory (config/pid under --root)
     rm -rf "$dir"
+    # Remove the disk-backed input image dir (see cmd_create's img_dir)
+    rm -rf "${VXN_IMG_ROOT:-/var/lib/vxn-oci-runtime}/$container_id"
 
     log "DELETE: done"
 }
