@@ -1325,6 +1325,41 @@ _vxn_ssh_dom0() {
         root@127.0.0.1 "$@"
 }
 
+# Ensure an ssh_config 'vxn-dom0' Host alias carrying the SDK key + port, so
+# `DOCKER_HOST=ssh://vxn-dom0` authenticates. docker's ssh:// connection helper
+# has no key env var (it just runs `ssh`), so the identity must live in
+# ssh_config. Idempotent: replaces any prior vxn block. (podman is simpler --
+# it takes CONTAINER_SSHKEY directly, so it doesn't need this.)
+_vexpose_ensure_ssh_alias() {
+    local key="$1" port="$2"
+    local cfg="$HOME/.ssh/config"
+    mkdir -p "$HOME/.ssh" 2>/dev/null; chmod 700 "$HOME/.ssh" 2>/dev/null
+    touch "$cfg" 2>/dev/null
+    # Strip any prior vxn block, then PREPEND a fresh one. ssh_config uses the
+    # FIRST value per keyword, so an existing 'Host *' block (User/IdentityFile)
+    # earlier in the file would otherwise override our alias -- putting ours at
+    # the top makes it win.
+    local rest
+    rest=$(sed '/# >>> vxn vexpose >>>/,/# <<< vxn vexpose <<</d' "$cfg" 2>/dev/null)
+    {
+        cat <<VXNSSHCFG
+# >>> vxn vexpose >>>
+Host vxn-dom0
+    HostName 127.0.0.1
+    Port $port
+    User root
+    IdentityFile $key
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+# <<< vxn vexpose <<<
+VXNSSHCFG
+        printf '%s\n' "$rest"
+    } > "$cfg"
+    chmod 600 "$cfg" 2>/dev/null
+}
+
 # Helper function to run command via daemon or regular mode
 run_runtime_command() {
     local runtime_cmd="$1"
@@ -3236,28 +3271,42 @@ case "$COMMAND" in
             echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} Start one first: $VCONTAINER_RUNTIME_NAME vmemres start" >&2
         fi
 
+        # Transport: for qemu-xen use ssh:// to dom0's engine socket -- it
+        # carries the API stream (incl. the interactive attach hijack) over ssh,
+        # which the TCP docker-compat API cannot. So `docker run -it` /
+        # `podman run -it` work from the host after sourcing this. Native-xen
+        # (already in dom0) uses the local socket.
+        VEXPOSE_KEY="${VXN_SSH_KEY:-$HOME/.vxn/id_vxn}"
+        VEXPOSE_PORT="${VXN_SSH_PORT:-18022}"
+
         case "$VEXPOSE_SUB" in
             env)
-                # eval-able export lines (both DOCKER_HOST and CONTAINER_HOST so
-                # docker and podman clients both work).
-                echo "export DOCKER_HOST=${API_URL}"
-                echo "export CONTAINER_HOST=${API_URL}"
-                echo "export DOCKER_API_VERSION=1.41"
+                if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+                    # docker: needs the key in ssh_config (no key env var); set
+                    # up the alias, point DOCKER_HOST at it.
+                    _vexpose_ensure_ssh_alias "$VEXPOSE_KEY" "$VEXPOSE_PORT"
+                    echo "export DOCKER_HOST=ssh://vxn-dom0"
+                    # podman: takes the key directly.
+                    echo "export CONTAINER_HOST=ssh://root@127.0.0.1:${VEXPOSE_PORT}"
+                    echo "export CONTAINER_SSHKEY=${VEXPOSE_KEY}"
+                    echo "# vxn: docker/podman now target dom0's engine over ssh." >&2
+                    echo "# vxn: build LOCALLY first (this shell's docker is now remote)." >&2
+                else
+                    echo "unset DOCKER_HOST CONTAINER_HOST 2>/dev/null || true"
+                fi
                 ;;
             *)
-                echo "Container engine API: ${API_URL}"
-                echo ""
-                echo "Drive it with a docker/podman-compatible client on the host:"
-                echo "  eval \"\$($VCONTAINER_RUNTIME_NAME vexpose env --export)\""
-                echo "  docker run --network=none --rm alpine echo hi"
+                echo "Drive dom0's container engine from the host over ssh:"
+                echo "  eval \"\$($VCONTAINER_RUNTIME_NAME vexpose env)\""
+                echo "  docker run -it --rm alpine echo hi     # or: podman run -it ..."
                 echo ""
                 echo "Notes:"
-                echo "  - DOCKER_API_VERSION=1.41 is set for you (podman /version quirk)"
-                echo "  - containers need --network=none (bridge networking is VM-incompatible)"
-                echo "  - the engine API service must be enabled in the guest"
-                echo "    (podman: the vxn-podman-api package / 'systemctl enable --now podman.socket')"
-                echo "  - override the host port with VXN_API_PORT (before 'vmemres start');"
-                echo "    VXN_API_PORT=none disables the forward"
+                echo "  - ssh:// transport -> interactive (-it) attach works (unlike the TCP API)"
+                echo "  - no --network=none needed (vxn-podman-config sets netns=none; the"
+                echo "    DomU is networked via its xenbr0 vif)"
+                echo "  - this shell's 'docker' is now REMOTE (dom0); build images in a"
+                echo "    separate shell, then load with: docker save <img> | vpm load"
+                echo "  - key: ~/.vxn/id_vxn (override VXN_SSH_KEY); port VXN_SSH_PORT (18022)"
                 ;;
         esac
         exit 0
