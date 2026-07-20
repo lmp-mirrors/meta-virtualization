@@ -9,9 +9,8 @@ OCI_LAYER_MODE = "multi"
 
 # Optional 'dev' mode:
 #   - adds a shell to the container
-#   - adds python3-pip to the python layer (enables `pip install` at runtime)
-#   - runs the container as root (UID 0) so pip can write to site-packages
-# Enable with: PACKAGECONFIG:pn-app-container-python = "dev"
+#   - runs the container as root (UID 0)
+# Enable with: PACKAGECONFIG:pn-app-container-mosquitto = "dev"
 PACKAGECONFIG ??= ""
 PACKAGECONFIG[dev] = ""
 inherit container-dev-mode
