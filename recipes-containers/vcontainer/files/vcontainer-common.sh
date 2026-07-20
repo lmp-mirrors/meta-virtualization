@@ -1236,6 +1236,41 @@ list_port_forwards() {
     done < "$pf_file"
 }
 
+# POSIX single-quote each argument so a payload survives one round of shell
+# word-splitting/re-parsing. The mode-1 dispatch relays a command string across
+# multiple hops (host -> responder shell -> dom0's vxn -> per-container DomU
+# daemon), and each hop shell-executes it. Flattening argv with ${arr[*]} drops
+# quoting, so a payload like `sh -c 'A; B'` gets split at the bare ';' and the
+# tail runs in the wrong context (dom0 instead of the DomU). Quoting each arg
+# ('...' with embedded ' escaped as '\'') keeps `sh -c 'A; B'` a single token
+# through one re-parse; the flatten points quote once per hop. Works with any
+# POSIX shell (the responder may be dash/busybox, not bash -- so no printf %q).
+_vxn_quote() {
+    local out='' a
+    for a in "$@"; do
+        a=${a//\'/\'\\\'\'}
+        out="${out:+$out }'$a'"
+    done
+    printf '%s' "$out"
+}
+
+# Build the arg string for a dispatched command. Quoting is needed ONLY on the
+# qemu-xen (mode-1) host hop, where the dom0 responder shell-executes the
+# relayed `vxn <verb> ...` string -- there an unquoted ';' in `sh -c 'A; B'`
+# splits and runs the tail in dom0. The direct xen backend (running in dom0)
+# and the qemu backend instead consume the command as a RAW string
+# (word-count+cut / base64), where literal single-quotes would break parsing
+# (the image would read as "'--rm'"). So quote only for qemu-xen; otherwise
+# flatten plainly (original behaviour).
+_vxn_args() {
+    if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+        _vxn_quote "$@"
+    else
+        local IFS=' '
+        printf '%s' "$*"
+    fi
+}
+
 # Helper function to run command via daemon or regular mode
 run_runtime_command() {
     local runtime_cmd="$1"
@@ -2049,7 +2084,7 @@ case "$COMMAND" in
             esac
         fi
         # Commands that work with existing images
-        run_runtime_command "$VCONTAINER_RUNTIME_CMD $COMMAND ${COMMAND_ARGS[*]}"
+        run_runtime_command "$VCONTAINER_RUNTIME_CMD $COMMAND $(_vxn_args "${COMMAND_ARGS[@]}")"
         ;;
 
     # Container lifecycle commands
@@ -2286,15 +2321,15 @@ case "$COMMAND" in
                 # Use daemon interactive mode - keeps daemon running
                 [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using daemon interactive mode" >&2
                 RUNNER_ARGS=$(build_runner_args)
-                "$RUNNER" $RUNNER_ARGS --daemon-interactive -- "$VCONTAINER_RUNTIME_CMD exec ${EXEC_ARGS[*]}"
+                "$RUNNER" $RUNNER_ARGS --daemon-interactive -- "$VCONTAINER_RUNTIME_CMD exec $(_vxn_args "${EXEC_ARGS[@]}")"
             else
                 # No daemon running, use regular QEMU
                 RUNNER_ARGS=$(build_runner_args)
-                "$RUNNER" $RUNNER_ARGS -- "$VCONTAINER_RUNTIME_CMD exec ${EXEC_ARGS[*]}"
+                "$RUNNER" $RUNNER_ARGS -- "$VCONTAINER_RUNTIME_CMD exec $(_vxn_args "${EXEC_ARGS[@]}")"
             fi
         else
             # Non-interactive exec via daemon
-            run_runtime_command "$VCONTAINER_RUNTIME_CMD exec ${EXEC_ARGS[*]}"
+            run_runtime_command "$VCONTAINER_RUNTIME_CMD exec $(_vxn_args "${EXEC_ARGS[@]}")"
         fi
         ;;
 
@@ -2952,9 +2987,9 @@ case "$COMMAND" in
         fi
 
         if [ "$INTERACTIVE" = "true" ]; then
-            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run -it $RUN_NETWORK_OPTS ${COMMAND_ARGS[*]}"
+            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run -it $RUN_NETWORK_OPTS $(_vxn_args "${COMMAND_ARGS[@]}")"
         else
-            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run $RUN_NETWORK_OPTS ${COMMAND_ARGS[*]}"
+            RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run $RUN_NETWORK_OPTS $(_vxn_args "${COMMAND_ARGS[@]}")"
         fi
 
         if [ "$INTERACTIVE" = "true" ]; then
@@ -3063,7 +3098,7 @@ case "$COMMAND" in
                     # Generate a random name like docker does
                     RUN_CONTAINER_NAME="$(cat /proc/sys/kernel/random/uuid | cut -c1-12)"
                     # Update COMMAND_ARGS to include the generated name
-                    RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run --name=$RUN_CONTAINER_NAME $RUN_NETWORK_OPTS ${COMMAND_ARGS[*]}"
+                    RUNTIME_CMD="$VCONTAINER_RUNTIME_CMD run --name=$RUN_CONTAINER_NAME $RUN_NETWORK_OPTS $(_vxn_args "${COMMAND_ARGS[@]}")"
                 fi
 
                 # Add port forwards via QMP and register them
