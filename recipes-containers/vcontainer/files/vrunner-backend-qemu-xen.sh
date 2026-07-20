@@ -143,7 +143,7 @@ hv_build_network_opts() {
         # SSH access to the running dom0 (localhost:${VXN_SSH_PORT}), for
         # debugging the mode-1 daemon and general dom0 introspection. Mirrors
         # boot-xen.sh's :2222->:22 forward.
-        NETDEV_OPTS="$NETDEV_OPTS,hostfwd=tcp::${VXN_SSH_PORT:-2222}-:22"
+        NETDEV_OPTS="$NETDEV_OPTS,hostfwd=tcp:127.0.0.1:${VXN_SSH_PORT:-2222}-:22"
 
         # Container-engine API forward: dom0's podman (or docker) serves its
         # Docker-compatible API on tcp:2375; forward it to the HOST's
@@ -165,8 +165,11 @@ hv_build_network_opts() {
             else
                 PROTOCOL="tcp"
             fi
-            NETDEV_OPTS="$NETDEV_OPTS,hostfwd=$PROTOCOL::$HOST_PORT-:$HOST_PORT"
-            log "INFO" "Port forward: host:$HOST_PORT -> dom0:$HOST_PORT (dom0 NATs to DomU:$CONTAINER_PORT)"
+            # Bind to host loopback (not 0.0.0.0): QEMU slirp can't bind
+            # 0.0.0.0 under WSL2, and localhost is what a WSL/host client uses.
+            # For LAN exposure, front it with a portproxy (WSL) / firewall rule.
+            NETDEV_OPTS="$NETDEV_OPTS,hostfwd=$PROTOCOL:127.0.0.1:$HOST_PORT-:$HOST_PORT"
+            log "INFO" "Port forward: 127.0.0.1:$HOST_PORT -> dom0:$HOST_PORT (dom0 NATs to DomU:$CONTAINER_PORT)"
         done
 
         HV_NET_OPTS="-netdev $NETDEV_OPTS -device virtio-net-pci,netdev=net0"
