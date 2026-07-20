@@ -381,6 +381,18 @@ Build it first with:
                 bbfatal "vxn.sh not found in ${FILES_DIR}"
             fi
 
+            # vpm: drive dom0's container engine from the host over ssh, for the
+            # two-context image load (docker save | vpm load) without the ssh
+            # key/port/TMPDIR incantation. Engine via VXN_ENGINE (default docker,
+            # matching the vexpose demo path). NOT for run -- run uses plain
+            # docker/podman after `eval $(vxn vexpose env)`. (No 'vdk' alias --
+            # too easily confused with the vdkr QEMU CLI.)
+            if [ -f "${FILES_DIR}/vpm.sh" ]; then
+                cp "${FILES_DIR}/vpm.sh" "${SDK_OUT}/vpm"
+                chmod 755 "${SDK_OUT}/vpm"
+                bbnote "Installed vpm helper"
+            fi
+
             # mode 2 (interactive): boot-xen.sh drops you into the dom0 shell.
             if [ -f "${FILES_DIR}/boot-xen.sh" ]; then
                 cp "${FILES_DIR}/boot-xen.sh" "${SDK_OUT}/boot-xen.sh"
