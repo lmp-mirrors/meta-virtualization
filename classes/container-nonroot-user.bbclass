@@ -6,6 +6,31 @@
 
 # The behavior here is inspired by dhi.io/python:3 (Docker Hardened Image)
 
+# IMPORTANT: this class MUST be inherited AFTER image-oci. Its
+# oci_nonroot_inject_user() function is registered as a do_image_oci
+# prefunc via '+=', and image-oci's oci_multilayer_install_packages()
+# (which populates OCI_LAYER_*_ROOTFS) is also a do_image_oci prefunc.
+# BitBake runs prefuncs in the order they were appended to the varflag,
+# so the file that inherits second gets its prefunc called second.
+# If container-nonroot-user is inherited before image-oci, the
+# per-layer rootfs vars are not yet set when the injection runs, no
+# layer ships /etc/passwd, and the nonroot account silently doesn't
+# make it into the image. The anonymous python block below asserts
+# that image-oci has already been inherited to catch that ordering
+# mistake at parse time.
+python () {
+    if 'image-oci' not in (d.getVar('__inherit_cache') or []):
+        # __inherit_cache is not part of the public API; fall back to
+        # checking for a variable that image-oci sets, so this survives
+        # a bitbake internals rename.
+        if not d.getVar('OCI_IMAGE_TAG'):
+            bb.fatal("container-nonroot-user must be inherited after "
+                     "image-oci — the per-layer rootfs vars its "
+                     "prefunc consumes are populated by image-oci's "
+                     "own prefunc, and prefunc order follows "
+                     "inherit order.")
+}
+
 inherit extrausers
 
 # NONROOT_USER must be a bare identifier (no quotes or backslash, etc.)
