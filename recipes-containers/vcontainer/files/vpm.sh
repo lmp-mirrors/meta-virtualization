@@ -29,11 +29,20 @@ PORT="${VXN_SSH_PORT:-18022}"
 RTMP="${VXN_DOM0_SCRATCH:-/var/rh}/tmp"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Container engine to drive in dom0. Both docker and podman run there with vxn
-# as their default runtime; default to docker (the vexpose demo path) so
-# `docker save | vpm load` lands where `docker run` looks. VXN_ENGINE=podman to
-# switch. (Load into the SAME engine you'll run with.)
-ENGINE="${VXN_ENGINE:-docker}"
+# Engine to drive in dom0, chosen by VXN_ENGINE, else the invoked name:
+#   vctr  -> vctr  (ctr + the vxn runtime; containerd has no remote API, so it
+#            must be proxied here rather than via a DOCKER_HOST-style env)
+#   vpm   -> docker (the vexpose demo path, so `docker save | vpm load` lands
+#            where `docker run` looks); VXN_ENGINE=podman to switch.
+ENGINE="${VXN_ENGINE:-}"
+if [ -z "$ENGINE" ]; then
+    case "$(basename "$0")" in
+        vctr) ENGINE="vctr" ;;     # containerd (ctr + vxn runtime)
+        vpd)  ENGINE="podman" ;;   # podman in dom0 (for hosts without host podman)
+        vdo)  ENGINE="docker" ;;   # docker in dom0 (for hosts without host docker)
+        *)    ENGINE="docker" ;;   # vpm: docker in dom0 + the load helper
+    esac
+fi
 
 declare -a OPTS=(-i "$KEY" -p "$PORT"
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -64,10 +73,14 @@ if [ "${1:-}" = "push" ]; then
     exit $?
 fi
 
-# Allocate a PTY only for interactive runs; keep stdin raw for piped input
-# (docker save | vpm load) -- a PTY would corrupt the binary stream.
+# Allocate a PTY for interactive commands: an explicit -it/-t flag, OR a
+# fully-interactive terminal on both ends -- the latter covers subcommands with
+# no flag like `vctr task attach <id>` and `... exec`. Piped I/O (e.g.
+# `docker save | vpm load`, `vpm images | grep`) has a non-tty end, so it stays
+# raw and the binary/text stream isn't corrupted by a PTY.
 tt=""
 for a in "$@"; do case "$a" in -it|-ti|-i|-t|--interactive|--tty) tt="-tt" ;; esac; done
+[ -z "$tt" ] && [ -t 0 ] && [ -t 1 ] && tt="-tt"
 
 # Quote each arg for the single remote shell parse.
 remote=""

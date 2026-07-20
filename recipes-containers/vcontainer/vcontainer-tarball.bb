@@ -390,7 +390,15 @@ Build it first with:
             if [ -f "${FILES_DIR}/vpm.sh" ]; then
                 cp "${FILES_DIR}/vpm.sh" "${SDK_OUT}/vpm"
                 chmod 755 "${SDK_OUT}/vpm"
-                bbnote "Installed vpm helper"
+                # Named engine entrypoints (same proxy, different dom0 engine),
+                # for hosts that don't have the client installed:
+                #   vdo  -> docker,  vpd -> podman,  vctr -> containerd
+                # These proxy INTO dom0 (each container is a Xen DomU); distinct
+                # from vdkr/vpdmn (the QEMU-VM CLIs). vpm stays the load helper.
+                ln -sf vpm "${SDK_OUT}/vctr"
+                ln -sf vpm "${SDK_OUT}/vpd"
+                ln -sf vpm "${SDK_OUT}/vdo"
+                bbnote "Installed vpm + vdo + vpd + vctr helpers"
             fi
 
             # mode 2 (interactive): boot-xen.sh drops you into the dom0 shell.
