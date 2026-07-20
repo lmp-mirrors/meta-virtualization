@@ -41,9 +41,6 @@ OCI_LAYERS = "\
     entrypoint:files:${bindir}/container-entrypoint.sh \
 "
 
-# In 'dev' mode, override the nonroot UID inherited from container-nonroot-user
-OCI_IMAGE_RUNTIME_UID = "${@bb.utils.contains('PACKAGECONFIG', 'dev', '0', '${NONROOT_UID}', d)}"
-
 # The 'nonroot' user needs permissions on the following directories
 NONROOT_OWNED_DIRS = "/data /var/lib/valkey /var/log/valkey /run/valkey"
 
