@@ -29,6 +29,8 @@ GO_IMPORT = "import"
 
 PV = "6.1.0-dev"
 
+CVE_STATUS[CVE-2019-10152] = "fixed-version: fixed since v1.4.0"
+CVE_STATUS[CVE-2020-1726] = "fixed-version: fixed since v1.8.1"
 CVE_STATUS[CVE-2022-2989] = "fixed-version: fixed since v4.3.0"
 CVE_STATUS[CVE-2023-0778] = "fixed-version: fixed since v4.5.0"
 
