@@ -4006,6 +4006,55 @@ def generate_recipe(modules: List[Dict], source_dir: Path, output_dir: Optional[
         if excluded_count:
             print(f"\n⚙️  Excluded {excluded_count} modules matching: {', '.join(excluded_prefixes)}")
 
+    # Filter down to the module@version set referenced by the current go.sum.
+    #
+    # Per agent-files/go-mod-vcs/ARCHITECTURE.md ("Why go.sum is the Source
+    # of Truth"): go.sum is the authoritative declaration of required
+    # modules. extract-discovered-modules.py walks GOMODCACHE, which
+    # includes stale entries left over from a previous recipe build in
+    # the same workdir (e.g., bumping cosign v3.0.6 → v3.1.2 leaves the
+    # old dep graph's assertzapper@v0.3.2 in GOMODCACHE even though the
+    # new go.sum never references it). Verifying stale entries and
+    # emitting "Unable to verify ... add gomod://..." hints for a module
+    # the current build won't touch caused a real bug (2026-07-21 cosign
+    # sweep): operator followed the hint, added gomod://opa;version=v1.16.2
+    # (stale), which prefix-excluded the whole opa module and dropped the
+    # winner v1.17.1 too, and compile failed at MVS.
+    #
+    # Use parse_go_sum() (already established as the source-of-truth
+    # helper for the discovery-vs-go.sum reconciliation in the main flow
+    # at line ~1771). Both entry shapes matter:
+    #
+    #   github.com/foo v1.2.3 h1:<hash>            ← winner: full zip
+    #                                                Go imports at build
+    #   github.com/foo v1.1.0/go.mod h1:<hash>     ← "considered" version
+    #                                                Go reads its go.mod
+    #                                                during MVS resolution
+    #
+    # Keep BOTH. Dropping /go.mod losers (as an earlier attempt using
+    # `go list -m all` did) makes compile fail at "module lookup disabled
+    # by GOPROXY=off" for those losers' go.mods. Walking GOMODCACHE also
+    # can't tell "in current go.sum" from "leftover in cache from prior
+    # build" — parse_go_sum does exactly that check.
+    gosum_path = source_dir / "go.sum" if source_dir else Path("go.sum")
+    if gosum_path.exists():
+        gs_winners, gs_indirect = parse_go_sum(gosum_path)
+        selected_set = {f"{p}@{v}" for (p, v) in (gs_winners | gs_indirect)}
+        if selected_set:
+            before_count = len(modules)
+            modules = [
+                m for m in modules
+                if f"{m.get('module_path', '')}@{m.get('version', '')}" in selected_set
+            ]
+            dropped = before_count - len(modules)
+            if dropped:
+                print(f"\n⚙️  Filtered to go.sum-referenced set: "
+                      f"dropped {dropped} stale entries "
+                      f"(kept {len(modules)}). Every kept entry is a "
+                      f"module@version that appears in the current "
+                      f"go.sum either as a winner (full zip) or as a "
+                      f"/go.mod entry (considered by MVS).")
+
     total_modules = len(modules)
     if debug_limit is not None:
         print(f"\n⚙️  Debug limit active: validating first {debug_limit} modules (total list size {total_modules})")
