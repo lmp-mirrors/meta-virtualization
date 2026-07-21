@@ -1,11 +1,11 @@
 include runc.inc
 
-SRCREV = "f8699560587ee98bdb14731cb80f92fc375642bc"
+SRCREV = "2e7540fd3037d774e1fc6ed8ce5740c2fef148be"
 SRC_URI = " \
     git://github.com/opencontainers/runc;branch=release-1.5;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
     file://0001-Makefile-respect-GOBUILDFLAGS-for-runc-and-remove-re.patch \
     "
-RUNC_VERSION = "1.5.0-rc.2"
+RUNC_VERSION = "1.5.1"
 
 # for compatibility with existing RDEPENDS that have existed since
 # runc-docker and runc-opencontainers were separate
