@@ -7,7 +7,7 @@ inherit cargo cargo-update-recipe-crates
 
 PV = "0.3.2+git"
 SRC_URI = "git://github.com/containers/podlet.git;protocol=https;branch=main"
-SRCREV = "47ec1bdfe26878cc8f403a64ca8aad489c1698d3"
+SRCREV = "74ba158ee3b96e215c3aa74e8b64d2f39903fb9a"
 
 require ${BPN}-crates.inc
 
