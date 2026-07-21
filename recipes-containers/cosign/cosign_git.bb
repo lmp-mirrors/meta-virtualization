@@ -1,6 +1,6 @@
 SUMMARY = "Container signing, verification and storage in an OCI registry"
 HOMEPAGE = "https://github.com/sigstore/cosign"
-LICENSE = "Apache-2.0"
+LICENSE = "Apache-2.0 AND BSD-2-Clause AND MIT AND MPL-2.0"
 LIC_FILES_CHKSUM = "file://${S}/src/${GO_IMPORT}/COPYRIGHT.txt;md5=3830a9ca4f9dc30be01bfa2e4042dd46 \
                     file://${S}/src/${GO_IMPORT}/LICENSE;md5=86d3f3a95c324c9479bd8986968f4327 \
                     "
@@ -8,8 +8,8 @@ LIC_FILES_CHKSUM = "file://${S}/src/${GO_IMPORT}/COPYRIGHT.txt;md5=3830a9ca4f9dc
 GO_IMPORT = "github.com/sigstore/cosign"
 
 SRC_URI = "git://github.com/sigstore/cosign.git;branch=main;name=cosign;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX}"
-PV = "3.0.6+git"
-SRCREV_cosign = "55f4d9e2085a6f3c72f2809076655b4745dfab7e"
+PV = "3.1.2+git"
+SRCREV_cosign = "d6857f227c07c04796d6364c4fe60cfe8ea22d17"
 
 SRCREV_FORMAT = "cosign"
 
@@ -22,13 +22,19 @@ GO_MOD_DISCOVERY_GIT_REF = "${SRCREV_cosign}"
 # Modules that can't be fetched via git (no repo metadata or unreachable commits)
 # - buf.build/gen/go: generated protobuf module, no git repository
 # - software.sslmate.com/src/go-pkcs12: commit not reachable via shallow fetch
+# - drjosh.dev/assertzapper: gitea host, commit not reachable via shallow fetch
+# - github.com/open-policy-agent/opa: pinned commit not reachable via shallow fetch
 SRC_URI += "gomod://buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go;version=v1.36.11-20260415201107-50325440f8f2.1;sha256sum=${COSIGN_BUF_BUILD_SHA}"
 SRC_URI += "gomod://software.sslmate.com/src/go-pkcs12;version=v0.4.0;sha256sum=${COSIGN_PKCS12_SHA}"
-GO_MOD_VCS_EXCLUDE = "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go software.sslmate.com/src/go-pkcs12"
+SRC_URI += "gomod://drjosh.dev/assertzapper;version=v0.3.2;sha256sum=${COSIGN_ASSERTZAPPER_SHA}"
+SRC_URI += "gomod://github.com/open-policy-agent/opa;version=v1.17.1;sha256sum=${COSIGN_OPA_SHA}"
+GO_MOD_VCS_EXCLUDE = "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go software.sslmate.com/src/go-pkcs12 drjosh.dev/assertzapper github.com/open-policy-agent/opa"
 
 # Checksums — run bitbake cosign -c fetch to get correct values on first use
 COSIGN_BUF_BUILD_SHA ?= "d07eb34c7a90d2a86ab3cca1040e4ef23a8ef419416ce90cc7b736ceb33bb366"
 COSIGN_PKCS12_SHA ?= "55019a391e5302a51ba62e98909e006224b81207866da90beaf582ec0dee036f"
+COSIGN_ASSERTZAPPER_SHA ?= "a56ecec7fe53aae63f7fbb33c23785ebad6b2b08c25c980430c1145e065ad103"
+COSIGN_OPA_SHA ?= "6a20b70d7453866b7b3d8048c7dcde064a6e5342d446d581e1513b0da64060e4"
 
 # GO_MOD_FETCH_MODE: "vcs" (all git://) or "hybrid" (gomod:// + git://)
 GO_MOD_FETCH_MODE ?= "hybrid"
