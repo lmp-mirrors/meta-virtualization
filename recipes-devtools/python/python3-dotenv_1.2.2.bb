@@ -11,3 +11,5 @@ UPSTREAM_CHECK_PYPI_PACKAGE = "${PYPI_PACKAGE}"
 SRC_URI[sha256sum] = "2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3"
 
 inherit pypi python_setuptools_build_meta
+
+CVE_PRODUCT = "saurabh-kumar:python-dotenv theskumar:python-dotenv"
