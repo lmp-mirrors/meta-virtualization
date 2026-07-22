@@ -3,7 +3,7 @@ HOMEPAGE = "https://virt-manager.org/"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://COPYING;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 DEPENDS += "python3-docutils-native python3-pylint"
-SRCREV = "213b015b2e78d3f3433e1860a34f7be55d3e6149"
+SRCREV = "ab75ff49bc8cdd2154d0014a852e84f6b3285ae2"
 
 SRC_URI = " \
   git://github.com/virt-manager/virt-manager;branch=main;protocol=https \
