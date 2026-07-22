@@ -14,7 +14,7 @@ At a high level, we expect the scope of cri-o to be restricted to the following 
  - Resource isolation as required by the CRI \
  "
 
-SRCREV_cri-o = "869599c20bb99cfbaaa2a400ce1f002321ec9fe2"
+SRCREV_cri-o = "9b6a4ed8dc3790db038308117bcdabdfd190b79c"
 SRC_URI = "\
 	git://github.com/cri-o/cri-o.git;branch=release-1.37;name=cri-o;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
         file://crio.conf \
