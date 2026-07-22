@@ -5,10 +5,10 @@ applications across multiple hosts, providing basic mechanisms for deployment, \
 maintenance, and scaling of applications. \
 "
 
-PV = "1.36.1+git"
-CVE_VERSION = "1.36.1"
-SRCREV_kubernetes = "102c4a4f87ba0a26c4a4f1dd8d1d3d07c83697e5"
-SRCREV_kubernetes-release = "9e3980c6c7b5da3ec3efa0e8b3bdc77ab50c7a0c"
+PV = "1.36.2+git"
+CVE_VERSION = "1.36.2"
+SRCREV_kubernetes = "8ba6370120c1371ab70428be16341c3cf6ba8584"
+SRCREV_kubernetes-release = "cd9ac1e21f12c290810e1134614eb73a2ad4c061"
 PE = "1"
 
 BBCLASSEXTEND = "devupstream:target"
@@ -17,9 +17,9 @@ DEFAULT_PREFERENCE:class-devupstream = "-1"
 SRC_URI:class-devupstream = "git://github.com/kubernetes/kubernetes.git;branch=release-1.36;name=kubernetes;protocol=https \
                              git://github.com/kubernetes/release;branch=master;name=kubernetes-release;destsuffix=${BB_GIT_DEFAULT_DESTSUFFIX}/release;protocol=https \
                             "
-SRCREV_kubernetes:class-devupstream = "102c4a4f87ba0a26c4a4f1dd8d1d3d07c83697e5"
-SRCREV_kubernetes-release:class-devupstream = "9e3980c6c7b5da3ec3efa0e8b3bdc77ab50c7a0c"
-PV:class-devupstream = "1.36.1+git${SRCREV_kubernetes}"
+SRCREV_kubernetes:class-devupstream = "8ba6370120c1371ab70428be16341c3cf6ba8584"
+SRCREV_kubernetes-release:class-devupstream = "cd9ac1e21f12c290810e1134614eb73a2ad4c061"
+PV:class-devupstream = "1.36.2+git${SRCREV_kubernetes}"
 
 SRCREV_FORMAT ?= "kubernetes_release"
 
