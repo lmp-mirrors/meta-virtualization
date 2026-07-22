@@ -16,7 +16,7 @@ What is not in scope for this project? \
     non-exist on the kube-apiserver. \
  "
 
-SRCREV_cri-tools = "8236efb8f6f2b7cc4793a4b47bdc340e9bc37c84"
+SRCREV_cri-tools = "06b100aa32eb071e53d8aabb017b1c68d9a20ae7"
 SRC_URI = "\
 	git://github.com/kubernetes-sigs/cri-tools.git;branch=master;name=cri-tools;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
         file://0001-build-allow-environmental-CGO-settings-and-pass-dont.patch \
