@@ -5051,7 +5051,11 @@ def write_license_inc(output_dir: Path, license_results: Dict[str, Tuple[str, st
         f.write("# Do not modify by hand. Regenerate with:\n")
         f.write("#   bitbake <recipe> -c discover_and_generate\n\n")
         if tidy:
-            f.write(f'LICENSE += "& {" & ".join(tidy)}"\n\n')
+            # SPDX-2 style: `AND` between identifiers, plus a leading `AND`
+            # since this file appends to whatever the recipe's LICENSE already
+            # declares. OE-core's license-format QA warns on the old bitbake
+            # boolean `&` operator (deprecated in favour of `AND`).
+            f.write(f'LICENSE += "AND {" AND ".join(tidy)}"\n\n')
         else:
             f.write('# No known licenses found\n\n')
         f.write('LIC_FILES_CHKSUM += "\\\n')
