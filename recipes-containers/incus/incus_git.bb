@@ -11,9 +11,9 @@ SRC_URI = "git://github.com/lxc/incus.git;branch=main;name=incus;protocol=https 
            file://incus.socket \
            "
 
-SRCREV_incus = "6255b3956027aaa6c2092ed42869f58e8d1942f5"
+SRCREV_incus = "132e1f462b3ead89094608effe93a2977f2925ae"
 SRCREV_FORMAT = "incus"
-PV = "7.0.0+git"
+PV = "7.2.0+git"
 
 COMPATIBLE_HOST = "(x86_64|aarch64).*-linux"
 
