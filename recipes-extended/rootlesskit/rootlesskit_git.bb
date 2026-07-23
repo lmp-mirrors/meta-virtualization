@@ -9,7 +9,7 @@ DEPENDS = " \
     go-md2man \
 "
 
-SRCREV_rootless = "321e732589fd88af6f48de14d3c835f65a12bd81"
+SRCREV_rootless = "9319806484cb4a0a795cff00b0f4e11cf6b9cc72"
 SRCREV_FORMAT = "rootless"
 
 SRC_URI = "git://github.com/rootless-containers/rootlesskit;name=rootless;branch=master;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
@@ -37,7 +37,7 @@ LIC_FILES_CHKSUM = "file://src/import/LICENSE;md5=3b83ef96387f14655fc854ddc3c6bd
 
 GO_IMPORT = "import"
 
-PV = "v3.0.1+git"
+PV = "v3.0.2+git"
 
 ROOTLESS_PKG = "github.com/rootless-containers/rootlesskit"
 
