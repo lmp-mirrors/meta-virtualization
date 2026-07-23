@@ -3,7 +3,7 @@
 # Do not modify by hand. Regenerate with:
 #   bitbake <recipe> -c discover_and_generate
 
-LICENSE += "& Apache-2.0 & MIT"
+LICENSE += "AND Apache-2.0 AND MIT"
 
 LIC_FILES_CHKSUM += "\
     file://pkg/mod/github.com/a8m/envsubst@v1.4.3/LICENSE;md5=20cbf74752fb062bc260b078d71d7e30;spdx=MIT \
@@ -23,13 +23,13 @@ LIC_FILES_CHKSUM += "\
     file://pkg/mod/github.com/mattn/go-colorable@v0.1.14/LICENSE;md5=24ce168f90aec2456a73de1839037245;spdx=MIT \
     file://pkg/mod/github.com/mattn/go-isatty@v0.0.20/LICENSE;md5=f509beadd5a11227c27b5d2ad6c9f2c6;spdx=MIT \
     file://pkg/mod/github.com/mitchellh/go-wordwrap@v1.0.1/LICENSE.md;md5=56da355a12d4821cda57b8f23ec34bc4;spdx=MIT \
-    file://pkg/mod/github.com/pelletier/go-toml/v2@v2.3.1/LICENSE;md5=390892c6562af0d807e527b06d635f94;spdx=Unknown \
+    file://pkg/mod/github.com/pelletier/go-toml/v2@v2.4.2/LICENSE;md5=390892c6562af0d807e527b06d635f94;spdx=Unknown \
     file://pkg/mod/github.com/spf13/cobra@v1.10.2/LICENSE.txt;md5=920d76114a32b0fb75b3f2718c5a91be;spdx=Unknown \
     file://pkg/mod/github.com/spf13/pflag@v1.0.10/LICENSE;md5=1e8b7dc8b906737639131047a590f21d;spdx=Unknown \
     file://pkg/mod/github.com/yuin/gopher-lua@v1.1.2/LICENSE;md5=5ea59bf62229a35ae7b2c7208524163e;spdx=MIT \
     file://pkg/mod/github.com/zclconf/go-cty@v1.18.1/LICENSE;md5=5fa044db97ab139f0b76ceeca0e5a3d5;spdx=MIT \
-    file://pkg/mod/go.yaml.in/yaml/v4@v4.0.0-rc.4/LICENSE;md5=2729d3a1fab7cdaacf8f8e12d2556871;spdx=Apache-2.0 \
-    file://pkg/mod/golang.org/x/net@v0.54.0/LICENSE;md5=7998cb338f82d15c0eff93b7004d272a;spdx=Unknown \
-    file://pkg/mod/golang.org/x/sys@v0.44.0/LICENSE;md5=7998cb338f82d15c0eff93b7004d272a;spdx=Unknown \
-    file://pkg/mod/golang.org/x/text@v0.37.0/LICENSE;md5=7998cb338f82d15c0eff93b7004d272a;spdx=Unknown \
+    file://pkg/mod/go.yaml.in/yaml/v4@v4.0.0-rc.6/LICENSE;md5=2729d3a1fab7cdaacf8f8e12d2556871;spdx=Apache-2.0 \
+    file://pkg/mod/golang.org/x/net@v0.56.0/LICENSE;md5=7998cb338f82d15c0eff93b7004d272a;spdx=Unknown \
+    file://pkg/mod/golang.org/x/sys@v0.46.0/LICENSE;md5=7998cb338f82d15c0eff93b7004d272a;spdx=Unknown \
+    file://pkg/mod/golang.org/x/text@v0.38.0/LICENSE;md5=7998cb338f82d15c0eff93b7004d272a;spdx=Unknown \
 "
