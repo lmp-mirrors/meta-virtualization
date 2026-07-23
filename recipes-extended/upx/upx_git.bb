@@ -6,8 +6,8 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=353753597aa110e0ded3508408c6374a"
 # Note: DO NOT use released tarball in favor of the git repository with submodules.
 # it makes maintenance easier for CVEs or other issues.
 
-SRCREV_upx = "93abc161af744df62197dd1fd5f7e20266bd2ab6"
-PV = "5.1.1+git${SRCPV}"
+SRCREV_upx = "3408ed7dc5d4d8cc9e4f78f520882769d4f83ae1"
+PV = "5.2.0+git${SRCPV}"
 
 # SRCREVs are from:
 #   git submodule status | awk '{ commit_hash = $1; sub(/vendor\//, "", $2); gsub("-", "_", $2); printf "SRCREV_vendor_%s = \"%s\"\n", $2, commit_hash }'
