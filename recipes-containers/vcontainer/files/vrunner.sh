@@ -28,6 +28,7 @@ set -e
 
 VERSION="3.5.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATH="$PATH:/sbin:/usr/sbin"
 
 # Runtime selection: docker or podman
 # This affects blob directory, cmdline prefix, state directory, and log prefix
