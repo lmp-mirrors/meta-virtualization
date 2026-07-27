@@ -16,6 +16,7 @@ CONTAINER_IMAGES ?= "\
     app-container-nginx \
     app-container-python \
     app-container-valkey \
+    container-yocto-builder \
 "
 
 inherit oci-multiarch
