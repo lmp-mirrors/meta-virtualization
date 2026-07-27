@@ -495,7 +495,7 @@ class VdkrRunner:
             cmd, proc.returncode, stdout=output, stderr="")
         return result
 
-    def memres_stop(self, timeout=30):
+    def memres_stop(self, timeout=120):
         """Stop memory resident mode."""
         return self.run("memres", "stop", timeout=timeout, check=False)
 
@@ -794,7 +794,7 @@ class VpdmnRunner:
             cmd, proc.returncode, stdout=output, stderr="")
         return result
 
-    def memres_stop(self, timeout=30):
+    def memres_stop(self, timeout=120):
         """Stop memory resident mode."""
         return self.run("memres", "stop", timeout=timeout, check=False)
 
