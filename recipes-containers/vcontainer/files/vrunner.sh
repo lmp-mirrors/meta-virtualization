@@ -669,7 +669,15 @@ daemon_stop() {
     #   Error: reading blob sha256:<hash>: file integrity checksum
     #          failed for "<file>"
     if [ -S "$DAEMON_SOCKET" ]; then
-        echo "===SHUTDOWN===" | socat - "UNIX-CONNECT:$DAEMON_SOCKET" 2>/dev/null || true
+        # Hold the connection open briefly after sending the command so the
+        # guest's "===SHUTTING_DOWN===" ack has somewhere to land (mirrors
+        # the ===PING===/===PONG=== handshake above). A bare `echo | socat`
+        # closes the connection the instant echo's stdin hits EOF; the
+        # guest's write of its ack into that already-closed channel then
+        # never returns, so it never reaches `break` and graceful_shutdown()
+        # never runs -- every stop was silently burning the full 60s poll
+        # below and falling through to QMP quit / SIGKILL instead.
+        { echo "===SHUTDOWN==="; sleep 3; } | timeout 10 socat - "UNIX-CONNECT:$DAEMON_SOCKET" 2>/dev/null || true
         # Poll up to 60s (120 * 0.5s). Generous enough to cover heavy
         # ext4 journal commits; short enough that a truly hung guest
         # doesn't block the caller indefinitely.
