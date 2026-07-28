@@ -70,6 +70,24 @@ do_image_oci[depends] += "jq-native:do_populate_sysroot"
 OCI_PM_DEPENDS = "${@oci_get_pm_depends(d)}"
 do_image_oci[depends] += "${OCI_PM_DEPENDS}"
 
+def oci_pkg_type(d):
+    """Resolve IMAGE_PKGTYPE with a single, documented default.
+
+    Historically three separate call sites in this class each hardcoded
+    their own default for IMAGE_PKGTYPE when it was unset -- and they
+    disagreed with each other ('rpm', 'ipk', 'rpm'). That meant the
+    build-time dependency graph and the actual per-layer install could
+    silently take different code paths when no upper-level config had
+    pinned IMAGE_PKGTYPE.
+
+    The default here matches oe-core's PACKAGE_CLASSES default of
+    'package_ipk' (meta/conf/distro/defaultsetup.conf), which sets
+    IMAGE_PKGTYPE=ipk. Recipes/distros that pin IMAGE_PKGTYPE via
+    PACKAGE_CLASSES or directly always win.
+    """
+    return d.getVar('IMAGE_PKGTYPE') or 'ipk'
+
+
 def oci_get_pm_depends(d):
     """Get native package manager dependency for multi-layer mode."""
     if d.getVar('OCI_LAYER_MODE') != 'multi':
@@ -78,7 +96,7 @@ def oci_get_pm_depends(d):
         return ''
     # rsync-native is needed to copy pre-installed packages to bundle rootfs
     deps = 'rsync-native:do_populate_sysroot'
-    pkg_type = d.getVar('IMAGE_PKGTYPE') or 'rpm'
+    pkg_type = oci_pkg_type(d)
     if pkg_type == 'rpm':
         deps += ' dnf-native:do_populate_sysroot createrepo-c-native:do_populate_sysroot'
     elif pkg_type == 'ipk':
@@ -358,7 +376,7 @@ python __anonymous() {
 
         # Add package manager native dependency if using 'packages' layer type
         if has_packages_layer:
-            pkg_type = d.getVar('IMAGE_PKGTYPE') or 'ipk'
+            pkg_type = oci_pkg_type(d)
             if pkg_type == 'ipk':
                 d.appendVarFlag('do_image_oci', 'depends',
                     " opkg-native:do_populate_sysroot opkg-utils-native:do_populate_sysroot")
@@ -464,7 +482,7 @@ def oci_install_layer_packages(d, layer_rootfs, layer_packages, layer_name):
 
     bb.note(f"OCI: Installing packages for layer '{layer_name}': {' '.join(packages)}")
 
-    pkg_type = d.getVar('IMAGE_PKGTYPE') or 'rpm'
+    pkg_type = oci_pkg_type(d)
 
     # Ensure layer rootfs directory exists
     bb.utils.mkdirhier(layer_rootfs)
