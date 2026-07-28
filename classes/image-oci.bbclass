@@ -484,6 +484,7 @@ def oci_install_layer_packages(d, layer_rootfs, layer_packages, layer_name):
 
         # Generate/update repo indexes
         pm.write_index()
+        pm.update()
 
         # Install packages
         # Use attempt_only=True to allow unresolved deps (resolved in later layers)
@@ -509,6 +510,7 @@ def oci_install_layer_packages(d, layer_rootfs, layer_packages, layer_name):
 
         # Write indexes
         pm.write_index()
+        pm.update()
 
         # Install packages
         try:
