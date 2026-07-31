@@ -159,6 +159,12 @@ parse_cmdline() {
     RUNTIME_AUTH="0"  # registry auth config (config.json / auth.json) available on dedicated 9p share
     RUNTIME_CA="0"    # host CA certificate(s) available on a dedicated 9p share (corporate proxy roots)
     RUNTIME_IDLE_TIMEOUT="1800"  # Default: 30 minutes
+    # Static network config from the host (skips udhcpc when RUNTIME_IP is set).
+    # Empty => fall back to the per-HV_TYPE path (Xen DHCP / QEMU slirp static).
+    RUNTIME_IP=""       # <prefix>_ip=<addr>       e.g. 10.0.100.201
+    RUNTIME_GW=""       # <prefix>_gw=<addr>       e.g. 10.0.100.1
+    RUNTIME_PREFIXLEN="24"  # <prefix>_prefixlen=<n>  CIDR mask length
+    RUNTIME_DNS=""      # <prefix>_dns=<addr>[,addr] DNS server(s), comma-separated
 
     for param in $(cat /proc/cmdline); do
         case "$param" in
@@ -194,6 +200,18 @@ parse_cmdline() {
                 ;;
             ${VCONTAINER_RUNTIME_PREFIX}_ca=*)
                 RUNTIME_CA="${param#${VCONTAINER_RUNTIME_PREFIX}_ca=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_ip=*)
+                RUNTIME_IP="${param#${VCONTAINER_RUNTIME_PREFIX}_ip=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_gw=*)
+                RUNTIME_GW="${param#${VCONTAINER_RUNTIME_PREFIX}_gw=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_prefixlen=*)
+                RUNTIME_PREFIXLEN="${param#${VCONTAINER_RUNTIME_PREFIX}_prefixlen=}"
+                ;;
+            ${VCONTAINER_RUNTIME_PREFIX}_dns=*)
+                RUNTIME_DNS="${param#${VCONTAINER_RUNTIME_PREFIX}_dns=}"
                 ;;
         esac
     done
@@ -390,20 +408,30 @@ configure_networking() {
             # Bring up the interface
             ip link set "$NET_IFACE" up
 
-            if [ "$HV_TYPE" = "xen" ]; then
-                # Xen bridge networking: use DHCP or static config
-                # Try DHCP first if udhcpc is available
+            # Static config from the host cmdline (<prefix>_ip=...) is the FAST
+            # path -- no udhcpc round-trip. Used by all backends whenever the
+            # host allocates an address (VXN_NET_MODE=static, the default). When
+            # unset, fall through to the per-HV_TYPE path (Xen DHCP / QEMU slirp).
+            if [ -n "$RUNTIME_IP" ]; then
+                log "Static IP from host: $RUNTIME_IP/$RUNTIME_PREFIXLEN gw ${RUNTIME_GW:-none}"
+                ip addr add "$RUNTIME_IP/$RUNTIME_PREFIXLEN" dev "$NET_IFACE"
+                [ -n "$RUNTIME_GW" ] && ip route add default via "$RUNTIME_GW"
+            elif [ "$HV_TYPE" = "xen" ]; then
+                # Xen bridge networking: DHCP (dnsmasq on the bridge), with a
+                # static fallback. The fallback is a single host-.15 on the DomU
+                # subnet -- concurrent DomUs that hit it collide, so the static
+                # path above is preferred; this only catches "no DHCP, no host IP".
                 if command -v udhcpc >/dev/null 2>&1; then
                     log "Requesting IP via DHCP (Xen bridge)..."
                     udhcpc -i "$NET_IFACE" -t 5 -T 3 -q 2>/dev/null || {
                         log "DHCP failed, using static fallback"
-                        ip addr add 10.0.0.15/24 dev "$NET_IFACE"
-                        ip route add default via 10.0.0.1
+                        ip addr add 10.0.100.15/24 dev "$NET_IFACE"
+                        ip route add default via 10.0.100.1
                     }
                 else
-                    # Static fallback for Xen bridge
-                    ip addr add 10.0.0.15/24 dev "$NET_IFACE"
-                    ip route add default via 10.0.0.1
+                    # Static fallback for Xen bridge (correct DomU subnet)
+                    ip addr add 10.0.100.15/24 dev "$NET_IFACE"
+                    ip route add default via 10.0.100.1
                 fi
             else
                 # QEMU slirp provides:
@@ -417,7 +445,12 @@ configure_networking() {
             # Configure DNS
             mkdir -p /etc
             rm -f /etc/resolv.conf
-            if [ "$HV_TYPE" = "xen" ]; then
+            if [ -n "$RUNTIME_DNS" ]; then
+                # Host-provided DNS (comma-separated) -> one nameserver per line
+                echo "$RUNTIME_DNS" | tr ',' '\n' | while IFS= read -r _ns; do
+                    [ -n "$_ns" ] && echo "nameserver $_ns"
+                done > /etc/resolv.conf
+            elif [ "$HV_TYPE" = "xen" ]; then
                 cat > /etc/resolv.conf << 'DNSEOF'
 nameserver 8.8.8.8
 nameserver 1.1.1.1

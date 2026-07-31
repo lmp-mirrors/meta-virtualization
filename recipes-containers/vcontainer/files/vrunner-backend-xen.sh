@@ -318,6 +318,56 @@ hv_build_vm_cmd() {
     HV_OPTS=""
 }
 
+# ============================================================================
+# Static IP allocation (VXN_NET_MODE=static, the default)
+# ============================================================================
+# Pick a unique address on the DomU bridge subnet and hand it to the guest on
+# the kernel cmdline, so the guest configures statically and skips the ~3s
+# udhcpc round-trip. Range is OUTSIDE dnsmasq's DHCP pool (10.0.100.50-200) so
+# static leases never collide with DHCP leases. Leases are atomic (mkdir) and
+# self-cleaning: a lease whose owning domain is no longer running is reaped and
+# reused, so a crashed/killed container never permanently leaks its address --
+# and the single hardcoded DHCP fallback in the guest (which every DomU shares,
+# hence collides) is avoided entirely. If the pool is exhausted or mode!=static,
+# emit nothing and the guest falls back to DHCP.
+#
+# NOTE: currently inlined here; the same logic is added to vxn-oci-runtime for
+# the docker/podman/ctr path. Extract to a shared vxn-ipam helper if it grows.
+VXN_IPAM_DIR="${VXN_IPAM_DIR:-/var/lib/vxn-ipam}"
+VXN_NET_BASE="${VXN_NET_BASE:-10.0.100}"          # /24 base (hosts .START-.END)
+VXN_NET_RANGE_START="${VXN_NET_RANGE_START:-201}" # outside dnsmasq pool .50-.200
+VXN_NET_RANGE_END="${VXN_NET_RANGE_END:-254}"
+VXN_NET_GW="${VXN_NET_GW:-10.0.100.1}"
+VXN_NET_DNS="${VXN_NET_DNS:-10.0.100.1}"
+VXN_NET_PREFIXLEN="${VXN_NET_PREFIXLEN:-24}"
+
+# vxn_ipam_alloc <owner-domain-name> -> echoes an IP, or nothing if exhausted.
+vxn_ipam_alloc() {
+    local id="$1" ip lease owner n
+    # Explicit pin wins (VXN_NET_IP=10.0.100.210 for a deterministic address).
+    [ -n "${VXN_NET_IP:-}" ] && { echo "$VXN_NET_IP"; return 0; }
+    mkdir -p "$VXN_IPAM_DIR" 2>/dev/null || return 0
+    # Reap stale leases: owner domain no longer known to xl.
+    for lease in "$VXN_IPAM_DIR/$VXN_NET_BASE".*; do
+        [ -d "$lease" ] || continue
+        owner=$(cat "$lease/owner" 2>/dev/null)
+        [ -n "$owner" ] && ! xl domid "$owner" >/dev/null 2>&1 && rm -rf "$lease"
+    done
+    # Claim the first free slot -- mkdir is atomic, so concurrent allocs can't
+    # both win the same address.
+    n="$VXN_NET_RANGE_START"
+    while [ "$n" -le "$VXN_NET_RANGE_END" ]; do
+        ip="$VXN_NET_BASE.$n"
+        if mkdir "$VXN_IPAM_DIR/$ip" 2>/dev/null; then
+            echo "$id" > "$VXN_IPAM_DIR/$ip/owner" 2>/dev/null
+            echo "$ip"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+    return 0   # pool exhausted -> caller emits nothing -> guest DHCPs
+}
+
 # Internal: write Xen domain config file
 _write_xen_config() {
     local kernel_append="$1"
@@ -365,6 +415,19 @@ _write_xen_config() {
     if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
         domu_extra="$domu_extra initcall_blacklist=print_s5_reset_status_mmio"
     fi
+
+    # Static IP (VXN_NET_MODE=static, default): allocate an address and emit it
+    # on the guest cmdline so the guest skips udhcpc. Only when networking is on;
+    # empty allocation (pool exhausted) or VXN_NET_MODE=dhcp -> guest DHCPs.
+    if [ "$NETWORK" = "true" ] && [ "${VXN_NET_MODE:-static}" = "static" ]; then
+        local _vxn_ip
+        _vxn_ip=$(vxn_ipam_alloc "$HV_DOMNAME")
+        if [ -n "$_vxn_ip" ]; then
+            domu_extra="$domu_extra ${CMDLINE_PREFIX}_ip=$_vxn_ip ${CMDLINE_PREFIX}_gw=$VXN_NET_GW ${CMDLINE_PREFIX}_prefixlen=$VXN_NET_PREFIXLEN ${CMDLINE_PREFIX}_dns=$VXN_NET_DNS"
+            log "INFO" "Static IP allocated: $_vxn_ip (gw $VXN_NET_GW)"
+        fi
+    fi
+
     [ -n "${VXN_DOMU_CMDLINE_EXTRA:-}" ] && domu_extra="$domu_extra $VXN_DOMU_CMDLINE_EXTRA"
 
     cat > "$config_path" <<XENEOF
