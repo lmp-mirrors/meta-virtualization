@@ -150,6 +150,56 @@ EOF
 }
 
 # ============================================================================
+# Static IP allocation (VXN_NET_MODE=static, the default)
+# ============================================================================
+# Same scheme as vrunner-backend-xen.sh (the vxn CLI path) -- KEEP IN SYNC (or
+# extract a shared vxn-ipam helper). Pick a unique address on the DomU bridge
+# subnet, OUTSIDE dnsmasq's DHCP pool (10.0.100.50-200), and hand it to the
+# guest on the cmdline so it configures statically and skips the ~3s udhcpc
+# round-trip. Leases are atomic (mkdir) and self-cleaning: a lease whose owning
+# domain is no longer known to `xl` is reaped and reused. Pool exhausted or
+# VXN_NET_MODE=dhcp -> emit nothing -> guest DHCPs.
+VXN_IPAM_DIR="${VXN_IPAM_DIR:-/var/lib/vxn-ipam}"
+VXN_NET_BASE="${VXN_NET_BASE:-10.0.100}"
+VXN_NET_RANGE_START="${VXN_NET_RANGE_START:-201}"
+VXN_NET_RANGE_END="${VXN_NET_RANGE_END:-254}"
+VXN_NET_GW="${VXN_NET_GW:-10.0.100.1}"
+VXN_NET_DNS="${VXN_NET_DNS:-10.0.100.1}"
+VXN_NET_PREFIXLEN="${VXN_NET_PREFIXLEN:-24}"
+
+vxn_ipam_alloc() {
+    local id="$1" ip lease owner n
+    [ -n "${VXN_NET_IP:-}" ] && { echo "$VXN_NET_IP"; return 0; }
+    mkdir -p "$VXN_IPAM_DIR" 2>/dev/null || return 0
+    for lease in "$VXN_IPAM_DIR/$VXN_NET_BASE".*; do
+        [ -d "$lease" ] || continue
+        owner=$(cat "$lease/owner" 2>/dev/null)
+        [ -n "$owner" ] && ! xl domid "$owner" >/dev/null 2>&1 && rm -rf "$lease"
+    done
+    n="$VXN_NET_RANGE_START"
+    while [ "$n" -le "$VXN_NET_RANGE_END" ]; do
+        ip="$VXN_NET_BASE.$n"
+        if mkdir "$VXN_IPAM_DIR/$ip" 2>/dev/null; then
+            echo "$id" > "$VXN_IPAM_DIR/$ip/owner" 2>/dev/null
+            echo "$ip"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+    return 0
+}
+
+# vxn_ipam_free <owner-domain-name>: release any lease this owner holds.
+# (Reap-on-stale already covers crashes; this keeps the dir tidy on clean delete.)
+vxn_ipam_free() {
+    local id="$1" lease
+    for lease in "$VXN_IPAM_DIR/$VXN_NET_BASE".*; do
+        [ -d "$lease" ] || continue
+        [ "$(cat "$lease/owner" 2>/dev/null)" = "$id" ] && rm -rf "$lease"
+    done
+}
+
+# ============================================================================
 # OCI Runtime Commands
 # ============================================================================
 
@@ -321,10 +371,22 @@ cmd_create() {
     if [ "${VXN_BRIDGE:-}" = "none" ]; then
         vxn_vif=""
     else
-        # Also tell the guest init to bring the interface up (DHCP on xenbr0);
-        # configure_networking() is gated on docker_network=1. Without this the
-        # DomU would have a vif but never request a lease.
+        # Also tell the guest init to bring the interface up;
+        # configure_networking() is gated on docker_network=1.
         kernel_extra="$kernel_extra docker_network=1"
+
+        # Static IP (VXN_NET_MODE=static, default): allocate a unique address
+        # and emit it so the guest skips udhcpc (~3s). Empty (pool exhausted) or
+        # VXN_NET_MODE=dhcp -> guest DHCPs. Owner = this container's domain name,
+        # released in cmd_delete (and self-reaped if the domain dies).
+        if [ "${VXN_NET_MODE:-static}" = "static" ]; then
+            local vxn_ip
+            vxn_ip=$(vxn_ipam_alloc "$domname")
+            if [ -n "$vxn_ip" ]; then
+                kernel_extra="$kernel_extra docker_ip=$vxn_ip docker_gw=$VXN_NET_GW docker_prefixlen=$VXN_NET_PREFIXLEN docker_dns=$VXN_NET_DNS"
+                log "  Static IP allocated: $vxn_ip (gw $VXN_NET_GW)"
+            fi
+        fi
     fi
 
     # AMD guest-kernel panic workaround -- MUST match the CLI path
@@ -677,6 +739,9 @@ cmd_delete() {
         if xl list "$domname" >/dev/null 2>&1; then
             xl destroy "$domname" >> "$VXN_LOG" 2>&1 || true
         fi
+        # Release any static-IP lease this container held (reap-on-stale also
+        # covers it, but free it eagerly on clean delete).
+        vxn_ipam_free "$domname"
     fi
 
     # Kill monitor process (also kills console capture child)
