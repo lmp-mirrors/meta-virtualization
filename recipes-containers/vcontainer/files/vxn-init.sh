@@ -396,6 +396,11 @@ exec_in_container() {
         log "Exit code: $EXEC_EXIT_CODE"
 
         echo "===OUTPUT_START==="
+        # Boot-flow timing (vcontainer_timing): print the collected stamps inside
+        # the captured OUTPUT so they reach the user's terminal directly (the
+        # runner only surfaces this region; pre-boot console goes to a temp file
+        # that a plain `vxn run` cleans up).
+        [ "$_VXN_TIMING" = "1" ] && [ -f /vxntiming ] && cat /vxntiming
         cat "$EXEC_OUTPUT"
         echo "===OUTPUT_END==="
         echo "===EXIT_CODE=$EXEC_EXIT_CODE==="
@@ -688,6 +693,18 @@ if [ "$QUIET_BOOT" = "1" ]; then
     dmesg -n 1 2>/dev/null || true
 fi
 
+# Boot-flow timing (opt-in via `vcontainer_timing` on the kernel cmdline).
+# Continues the stamps from vcontainer-preinit.sh; userspace echoes land in the
+# runner's captured vm_output.txt (`vxn run --keep-temp`, grep VXNTIME). init:start
+# vs preinit:switch_root shows the initramfs->real-init handoff; later deltas show
+# where the vxn-init sequence spends time.
+_VXN_TIMING=0
+case " $(cat /proc/cmdline 2>/dev/null) " in *" vcontainer_timing"*) _VXN_TIMING=1 ;; esac
+# Append init stamps to /run/vxntiming (preinit already seeded it before
+# switch_root); exec_in_container prints the file inside the OUTPUT markers.
+_ts() { [ "$_VXN_TIMING" = "1" ] && { echo "VXNTIME init:$1 $(cut -d' ' -f1 /proc/uptime)" >> /vxntiming; }; }
+_ts start
+
 log "=== vxn Init ==="
 log "Version: $VCONTAINER_VERSION"
 
@@ -697,6 +714,7 @@ setup_cgroups
 
 # Parse kernel command line
 parse_cmdline
+_ts cmdline
 
 # Parse vxn-specific kernel parameters
 ENTRYPOINT_GRACE_PERIOD="300"
@@ -712,9 +730,11 @@ detect_disks
 
 # Mount input disk (container rootfs from host)
 mount_input_disk
+_ts disks
 
 # Configure networking
 configure_networking
+_ts net
 
 # Find the container rootfs on the input disk
 if ! find_container_rootfs; then
@@ -733,6 +753,7 @@ fi
 
 # Parse OCI config for entrypoint/env/workdir
 parse_oci_config
+_ts rootfs
 
 # Set up container environment
 setup_container_env
@@ -759,6 +780,7 @@ else
     fi
 
     # Execute in container rootfs
+    _ts preexec
     exec_in_container "$CONTAINER_ROOT" "$EXEC_CMD"
 fi
 
