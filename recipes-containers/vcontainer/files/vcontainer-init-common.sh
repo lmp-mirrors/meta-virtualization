@@ -223,12 +223,6 @@ parse_cmdline() {
 # ============================================================================
 
 detect_disks() {
-    log "Waiting for block devices..."
-    sleep 2
-
-    log "Block devices (${HV_TYPE:-qemu}, /dev/${BLK_PREFIX}*):"
-    [ "$QUIET_BOOT" = "0" ] && ls -la /dev/${BLK_PREFIX}* 2>/dev/null || log "No /dev/${BLK_PREFIX}* devices"
-
     # Determine which disk is input and which is state
     # Drive layout (rootfs is always the first block device, mounted by preinit as /):
     #   QEMU: /dev/vda, /dev/vdb, /dev/vdc
@@ -245,6 +239,23 @@ detect_disks() {
     elif [ "$RUNTIME_INPUT" != "none" ]; then
         INPUT_DISK="/dev/${BLK_PREFIX}b"
     fi
+
+    # Wait for the disks we actually use to appear, rather than a blind fixed
+    # sleep (was: sleep 2). blkfront devices settle within tens of ms under Xen
+    # PV/PVH; poll fast, bounded to ~3s so a genuinely missing disk still falls
+    # through to the mount error paths instead of hanging.
+    log "Waiting for block devices..."
+    _wait_dev="${INPUT_DISK:-$STATE_DISK}"
+    if [ -n "$_wait_dev" ]; then
+        _i=0
+        while [ ! -b "$_wait_dev" ] && [ "$_i" -lt 300 ]; do
+            sleep 0.01
+            _i=$((_i + 1))
+        done
+    fi
+
+    log "Block devices (${HV_TYPE:-qemu}, /dev/${BLK_PREFIX}*):"
+    [ "$QUIET_BOOT" = "0" ] && ls -la /dev/${BLK_PREFIX}* 2>/dev/null || log "No /dev/${BLK_PREFIX}* devices"
 }
 
 # ============================================================================
@@ -419,24 +430,11 @@ nameserver 1.1.1.1
 DNSEOF
             fi
 
-            sleep 1
-
-            # Verify connectivity
-            local gw_ip
-            gw_ip=$(ip route | awk '/default/{print $3}' | head -n 1)
-            log "Testing network connectivity..."
-            if [ -n "$gw_ip" ] && ping -c 1 -W 3 "$gw_ip" >/dev/null 2>&1; then
-                log "  Gateway ($gw_ip): OK"
-            else
-                log "  Gateway: FAILED"
-            fi
-
-            if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-                log "  External (8.8.8.8): OK"
-            else
-                log "  External (8.8.8.8): FAILED (may be filtered)"
-            fi
-
+            # NOTE: the post-config `sleep 1` and the two `ping -W 3` connectivity
+            # probes (gateway + 8.8.8.8) were removed from the boot path -- they
+            # were diagnostics only, and each failed ping blocked up to 3s
+            # (~7s total worst case). Networking is already configured above; the
+            # container's own traffic is the real connectivity test.
             local my_ip
             my_ip=$(ip -4 addr show "$NET_IFACE" 2>/dev/null | awk '/inet /{print $2}' | head -n 1)
             log "Network configured: $NET_IFACE ($my_ip)"
@@ -805,7 +803,12 @@ graceful_shutdown() {
         [ -b "$dev" ] && blockdev --flushbufs "$dev" 2>/dev/null || true
     done
     sync
-    sleep 2
+    # Post-flush settle margin: only needed when a state disk was in use. The
+    # sync + blockdev --flushbufs + sync above already commit buffers; this
+    # extra margin guards the state-disk half-commit failure mode (commits
+    # 664dc7e8 / 23438ae4 / 1c1fb6d1). Ephemeral runs (no state disk, the common
+    # vxn case) skip it (was: unconditional sleep 2).
+    [ "$RUNTIME_STATE" = "disk" ] && sleep 2
 
     log "=== ${VCONTAINER_RUNTIME_NAME} Complete ==="
     # Use reboot -f which works with QEMU's -no-reboot flag to exit cleanly

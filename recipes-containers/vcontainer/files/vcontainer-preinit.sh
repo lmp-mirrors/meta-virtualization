@@ -41,17 +41,24 @@ log() {
 
 log "=== vcontainer preinit (squashfs) ==="
 
-# Wait for block devices to appear
+# The rootfs.img is always the first block device
+# QEMU: /dev/vda, Xen: /dev/xvda
+ROOTFS_DEV="/dev/${BLK_PREFIX}a"
+
+# Wait for the rootfs device to appear. Under Xen PV/PVH the blkfront device
+# shows up within tens of ms of the xenbus probe, so poll fast instead of a
+# blind fixed sleep (was: sleep 2). Bounded to ~3s so a genuinely missing
+# device still falls through to the error path below rather than hanging.
 log "Waiting for block devices..."
-sleep 2
+_i=0
+while [ ! -b "$ROOTFS_DEV" ] && [ "$_i" -lt 300 ]; do
+    sleep 0.01
+    _i=$((_i + 1))
+done
 
 # Show available block devices
 log "Block devices:"
 [ "$QUIET" = "0" ] && ls -la /dev/${BLK_PREFIX}* 2>/dev/null || log "No /dev/${BLK_PREFIX}* block devices found"
-
-# The rootfs.img is always the first block device
-# QEMU: /dev/vda, Xen: /dev/xvda
-ROOTFS_DEV="/dev/${BLK_PREFIX}a"
 
 if [ ! -b "$ROOTFS_DEV" ]; then
     echo "ERROR: Rootfs device $ROOTFS_DEV not found!"
