@@ -481,7 +481,9 @@ hv_start_vm_background() {
     _write_xen_config "$kernel_append" "$HV_XEN_CFG"
 
     # Create the domain
+    [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME xlcreate_start $(date +%s.%N)" >&2
     xl create "$HV_XEN_CFG" >> "$log_file" 2>&1
+    [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME xlcreate_done $(date +%s.%N)" >&2
 
     # Xen domains don't have a PID on Dom0 — xl manages them by name.
     # For daemon mode, start a lightweight monitor process that stays alive

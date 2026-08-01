@@ -1440,7 +1440,9 @@ if [ -n "$INPUT_PATH" ] && [ "$INPUT_TYPE" != "none" ]; then
 
     log "DEBUG" "Input size: ${SIZE_KB}KB, Image size: ${SIZE_MB}MB"
 
+    [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME diskbuild_start $(date +%s.%N)" >&2
     dd if=/dev/zero of="$INPUT_IMG" bs=1M count=$SIZE_MB 2>/dev/null
+    [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME dd_done $(date +%s.%N)" >&2
 
     if [ -d "$INPUT_PATH" ]; then
         mke2fs -t ext4 -d "$INPUT_PATH" "$INPUT_IMG" >/dev/null 2>&1
@@ -1451,6 +1453,7 @@ if [ -n "$INPUT_PATH" ] && [ "$INPUT_TYPE" != "none" ]; then
         cp "$INPUT_PATH" "$EXTRACT_DIR/"
         mke2fs -t ext4 -d "$EXTRACT_DIR" "$INPUT_IMG" >/dev/null 2>&1
     fi
+    [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME mke2fs_done $(date +%s.%N)" >&2
 
     DISK_OPTS="-drive file=$INPUT_IMG,if=virtio,format=raw"
     log "DEBUG" "Input disk: $(ls -lh "$INPUT_IMG" | awk '{print $5}')"
