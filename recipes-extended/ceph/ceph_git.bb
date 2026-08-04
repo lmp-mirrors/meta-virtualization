@@ -1,5 +1,5 @@
 SUMMARY = "User space components of the Ceph file system"
-LICENSE = "LGPL-2.1-only & GPL-2.0-only & Apache-2.0 & MIT & BSL-1.0 & Zlib"
+LICENSE = "Apache-2.0 AND BSL-1.0 AND GPL-2.0-only AND LGPL-2.1-only AND MIT AND Zlib"
 LIC_FILES_CHKSUM = "file://COPYING-LGPL2.1;md5=fbc093901857fcd118f065f900982c24 \
                     file://COPYING-GPL2;md5=b234ee4d69f5fce4486a80fdaf4a4263 \
                     file://COPYING;md5=2f83d608c026a3156e4c186721954da2 \

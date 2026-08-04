@@ -5,8 +5,15 @@ DESCRIPTION = "\
   service. Check the release notes for what has changed in this version. \
   "
 SECTION = "devel/python"
-LICENSE = "BSD-3-Clause & MIT & Python-2.0 & BSD-2-Clause & NewRelic"
+LICENSE = "BSD-2-Clause AND BSD-3-Clause AND MIT AND Python-2.0 AND LicenseRef-NewRelic"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=2b42edef8fa55315f34f2370b4715ca9"
+
+# NewRelic is a custom, non-SPDX license identifier -- OE-core's SPDX-2
+# validator remaps it to LicenseRef-NewRelic on parse. Point the resolver at
+# the top-level LICENSE file that already covers this content. Note: the
+# NO_GENERIC_LICENSE varflag KEY drops the "LicenseRef-" prefix (per the
+# spdx_license.LicenseRef regex in oe.license).
+NO_GENERIC_LICENSE[NewRelic] = "LICENSE"
 
 SRC_URI[sha256sum] = "1492f0fe510cdc0c1347f597baca2a3ddd7e0662895a800e19fe524396f7bf05"
 

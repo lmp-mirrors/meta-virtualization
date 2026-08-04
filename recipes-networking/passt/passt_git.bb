@@ -1,5 +1,5 @@
 SUMMARY = "User-mode networking daemons for virtual machines and namespaces"
-LICENSE = "GPL-2.0-or-later & BSD-3-Clause"
+LICENSE = "BSD-3-Clause AND GPL-2.0-or-later"
 LIC_FILES_CHKSUM = "file://LICENSES/GPL-2.0-or-later.txt;md5=3d26203303a722dedc6bf909d95ba815 \
                     file://LICENSES/BSD-3-Clause.txt;md5=c6c623ff088c13278097b9f79637ca77"
 
