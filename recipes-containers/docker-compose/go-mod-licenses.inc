@@ -3,7 +3,7 @@
 # Do not modify by hand. Regenerate with:
 #   bitbake <recipe> -c discover_and_generate
 
-LICENSE += "& Apache-2.0 & MIT"
+LICENSE += "AND Apache-2.0 AND MIT"
 
 LIC_FILES_CHKSUM += "\
     file://pkg/mod/github.com/!alec!aivazis/survey/v2@v2.3.7/LICENSE;md5=615828847c7140c5e6bac90e11888eb5;spdx=MIT \

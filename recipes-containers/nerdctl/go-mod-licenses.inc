@@ -3,7 +3,7 @@
 # Do not modify by hand. Regenerate with:
 #   bitbake <recipe> -c discover_and_generate
 
-LICENSE += "& Apache-2.0 & BSD-2-Clause & MIT & MPL-2.0"
+LICENSE += "AND Apache-2.0 AND BSD-2-Clause AND MIT AND MPL-2.0"
 
 LIC_FILES_CHKSUM += "\
     file://pkg/mod/cel.dev/expr@v0.25.1/LICENSE;md5=3b83ef96387f14655fc854ddc3c6bd57;spdx=Apache-2.0 \
