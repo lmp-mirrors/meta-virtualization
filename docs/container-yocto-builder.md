@@ -5,7 +5,8 @@
 To build a multiarch `container-yocto-builder`, we need to add it to
 `CONTAINER_IMAGES` in `container-image-multiarch.bb`. This also required
 modifying `vcontainer-bbmask.inc` to allow `python3-pexpect` and its
-`python3-ptyprocess` dependency. This then exposes
+`python3-ptyprocess` dependency in order to satisfy the dependencies in
+`packagegroup-yocto-builder-extras`. This then exposes
 `meta-oe/dynamic-layers/meta-python` so we needed to add that to the mask.
 
 To build the container:
