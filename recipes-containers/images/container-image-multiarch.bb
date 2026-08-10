@@ -26,7 +26,5 @@ BBCLASSEXTEND = "${@' '.join(['mcextend:'+x for x in d.getVar('CONTAINER_IMAGES'
 OCI_MULTIARCH_RECIPE = "${MCNAME}"
 OCI_MULTIARCH_PLATFORMS = "aarch64 x86_64"
 
-python () {
-    if not d.getVar("MCNAME"):
-        raise bb.parse.SkipRecipe("No class extension set")
-}
+# The MCNAME-empty skip for the base recipe (parsed before mcextend runs)
+# is handled inside oci-multiarch.bbclass -- no per-recipe check needed.
