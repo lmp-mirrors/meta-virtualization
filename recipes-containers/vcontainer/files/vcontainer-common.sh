@@ -3070,7 +3070,18 @@ case "$COMMAND" in
         # Use bridge networking (Docker's default) - each container gets 172.17.0.x IP
         # User can override with --network=host for legacy behavior
         RUN_NETWORK_OPTS=""
-        if [ "$RUN_HAS_NETWORK" = "false" ]; then
+        if [ "$NETWORK" = "false" ] && [ "$VCONTAINER_RUNTIME_CMD" = "vxn" ]; then
+            # Thread the host `--no-network` into the dispatched `vxn run` string
+            # so the dom0-side container DomU drops its vif (#26). dom0's vxn
+            # already gates the vif on NETWORK (vrunner-backend-xen.sh drops it to
+            # vif=[] when false), but the daemon dispatch never encoded the flag,
+            # so the per-run intent was lost and the container came up networked
+            # despite `network.mode: block`. vxn-only: the dispatched runtime
+            # understands `--no-network` (docker/podman use `--network=none` and
+            # are driven by their own engines, untouched here). `--no-network` was
+            # consumed from COMMAND_ARGS on the host, so there is no double-flag.
+            RUN_NETWORK_OPTS="--no-network"
+        elif [ "$RUN_HAS_NETWORK" = "false" ]; then
             RUN_NETWORK_OPTS="--dns=10.0.2.3 --dns=8.8.8.8"
             [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} Using default bridge networking" >&2
         fi
