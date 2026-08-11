@@ -84,6 +84,16 @@ hv_skip_state_disk() {
 #
 # The host resolves the OCI entrypoint using jq (available on Dom0)
 # so the guest doesn't need jq to determine what to execute.
+# Stage per-run env (#20) onto the input disk as .vxn-env/env (0600). Mirrors the
+# .vxn-ca staging; the guest sources it before exec. Never on any kernel cmdline.
+_stage_vxn_env() {
+    [ -n "$VXN_ENV_B64" ] || return 0
+    mkdir -p "$1/.vxn-env" 2>/dev/null || return 0
+    printf '%s' "$VXN_ENV_B64" | base64 -d > "$1/.vxn-env/env" 2>/dev/null
+    chmod 600 "$1/.vxn-env/env" 2>/dev/null || true
+    log "INFO" "Staged per-run env for the container ($(grep -c . "$1/.vxn-env/env" 2>/dev/null || echo 0) var(s))"
+}
+
 hv_prepare_container() {
     # Skip if user already provided --input
     [ -n "$INPUT_PATH" ] && return 0
@@ -92,6 +102,23 @@ hv_prepare_container() {
     case "$DOCKER_CMD" in
         *" run "*)  ;;
         *)          return 0 ;;
+    esac
+
+    # Secret-safe per-run env (#20): AXIS passes container env as
+    # --env-b64=<base64(KEY=VAL\n...)>. Pull it out of DOCKER_CMD HERE in dom0 so
+    # the values are staged onto the per-run input disk (.vxn-env/env, like
+    # .vxn-ca below) and STRIPPED from the command -- they never reach the
+    # container DomU's kernel cmdline. The guest sources /mnt/input/.vxn-env/env
+    # before exec. (The base64 value is transiently in dom0's argv here -- the
+    # trusted control plane, like `docker run -e` on a host; a ssh/9p channel that
+    # avoids dom0 argv entirely is a hardening follow-up.)
+    VXN_ENV_B64=""
+    case "$DOCKER_CMD" in
+        *--env-b64=*)
+            VXN_ENV_B64=$(printf '%s' "$DOCKER_CMD" | grep -oE '\-\-env-b64=[A-Za-z0-9+/=]+' | head -1)
+            VXN_ENV_B64="${VXN_ENV_B64#--env-b64=}"
+            DOCKER_CMD=$(printf '%s' "$DOCKER_CMD" | sed -E 's/ *--env-b64=[A-Za-z0-9+/=]+//')
+            ;;
     esac
 
     # Check for skopeo
@@ -176,6 +203,7 @@ hv_prepare_container() {
                     cp /usr/local/share/ca-certificates/*.crt "$image/.vxn-ca/" 2>/dev/null || true
                     log "INFO" "Staged dom0 CA cert(s) for the container trust store"
                 fi
+                _stage_vxn_env "$image"
                 return 0
             fi
             ;;
@@ -199,6 +227,7 @@ hv_prepare_container() {
             cp /usr/local/share/ca-certificates/*.crt "$oci_dir/.vxn-ca/" 2>/dev/null || true
             log "INFO" "Staged dom0 CA cert(s) for the container trust store"
         fi
+        _stage_vxn_env "$oci_dir"
     else
         log "ERROR" "Failed to pull image: $image"
         [ -f "$skopeo_log" ] && while IFS= read -r line; do

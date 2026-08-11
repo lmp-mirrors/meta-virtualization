@@ -330,6 +330,22 @@ $OCI_ENV
 OCIENVEOF
     fi
 
+    # Per-run env from the host (#20): dom0 staged it on the input disk
+    # (.vxn-env/env, off any kernel cmdline). KEY=VAL lines -- export each into
+    # the container's environment so the entrypoint (e.g. claude) sees them.
+    # SKIP container-owned filesystem vars: a vxn DomU has its OWN rootfs, so the
+    # host's PATH/HOME/SHELL/etc. are wrong and must not clobber the image's (that
+    # would break binary lookup, e.g. `claude` in /usr/local/bin). Provider/agent
+    # vars (ANTHROPIC_*, and anything forwarded via VXN_FORWARD_ENV) pass through.
+    if [ -f /mnt/input/.vxn-env/env ]; then
+        while IFS= read -r env_line; do
+            case "$env_line" in
+                PATH=*|HOME=*|SHELL=*|USER=*|LOGNAME=*|PWD=*|OLDPWD=*|TMPDIR=*|TERM=*|XDG_*=*) continue ;;
+            esac
+            [ -n "$env_line" ] && export "$env_line" 2>/dev/null || true
+        done < /mnt/input/.vxn-env/env
+    fi
+
     # Ensure a sane PATH even if the image didn't set one.
     case ":${PATH:-}:" in
         *:/usr/local/bin:*) : ;;
