@@ -368,6 +368,29 @@ exec_in_container() {
         log "No /bin/sh in container, using direct exec"
     fi
 
+    # Opaque argv (#31): the command may be a single sentinel token
+    #   __VXNARGV__<base64(arg0)>,<base64(arg1)>,...
+    # carrying the container argv as a space-free, metacharacter-free unit that
+    # survives the string dispatch (no flag-eating: no '-' prefix; no shell
+    # mangling: no spaces/metachars in transit). Decode it back into the
+    # positional parameters and exec the VECTOR verbatim below -- passed as "$@"
+    # to a fixed `exec "$@"` script, so an arbitrary command (quotes, parens, $)
+    # is never re-lexed by a shell. `set --` is safe here: rootfs/cmd/workdir are
+    # already saved in locals.
+    local _vxn_argv_mode=0 _tok _oifs
+    case "$cmd" in
+        __VXNARGV__*)
+            _vxn_argv_mode=1
+            set --
+            _oifs="$IFS"; IFS=,
+            for _tok in ${cmd#__VXNARGV__}; do
+                set -- "$@" "$(printf '%s' "$_tok" | base64 -d)"
+            done
+            IFS="$_oifs"
+            log "Container argv: $# element(s), exec'd verbatim (no shell re-parse)"
+            ;;
+    esac
+
     if [ "$RUNTIME_INTERACTIVE" = "1" ]; then
         # Interactive mode: establish a controlling terminal for job control.
         # PID 1 is already a session leader, so setsid() would fork — run in
@@ -375,7 +398,10 @@ exec_in_container() {
         # The -c flag does ioctl(TIOCSCTTY) on stdin to set the controlling tty.
         export TERM=linux
         dmesg -n 1 2>/dev/null || true
-        if [ "$use_sh" = "true" ]; then
+        if [ "$_vxn_argv_mode" = "1" ]; then
+            # argv rides as positional params, never re-lexed
+            (exec setsid -c chroot "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@")
+        elif [ "$use_sh" = "true" ]; then
             (exec setsid -c chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd")
         else
             (exec setsid -c chroot "$rootfs" $cmd)
@@ -385,7 +411,11 @@ exec_in_container() {
         # Non-interactive: capture output
         EXEC_OUTPUT="/tmp/container_output.txt"
         EXEC_EXIT_CODE=0
-        if [ "$use_sh" = "true" ]; then
+        if [ "$_vxn_argv_mode" = "1" ]; then
+            # argv rides as positional params, never re-lexed
+            chroot "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@" \
+                > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
+        elif [ "$use_sh" = "true" ]; then
             chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd" \
                 > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
         else
