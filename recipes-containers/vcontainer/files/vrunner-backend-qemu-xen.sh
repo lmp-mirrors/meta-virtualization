@@ -137,7 +137,16 @@ hv_build_network_opts() {
     # land on dom0's slirp NIC and dom0's DNAT/forwarding carries them to the
     # DomU.  Identical hostfwd handling to the plain qemu backend.
     HV_NET_OPTS=""
-    if [ "$NETWORK" = "true" ]; then
+    # dom0's uplink is INFRASTRUCTURE, not per-container policy: image pull /
+    # provisioning and the ssh transport need it, so it is always on and
+    # decoupled from any container's network mode. A container's network
+    # isolation is enforced at the container DomU's vif (see
+    # vrunner-backend-xen.sh), NOT by starving dom0 -- so a `--no-network`
+    # (AXIS block) run can pull its image yet still get no container network, and
+    # can't poison a warm/memres dom0 that later runs need for provisioning.
+    # VXN_DOM0_NETWORK=none deliberately airgaps dom0 (operator choice, not
+    # per-run); the container's --no-network no longer reaches this decision.
+    if [ "${VXN_DOM0_NETWORK:-on}" != "none" ]; then
         NETDEV_OPTS="user,id=net0"
 
         # SSH access to the running dom0 (localhost:${VXN_SSH_PORT}), for
