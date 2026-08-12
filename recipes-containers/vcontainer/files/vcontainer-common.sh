@@ -1921,7 +1921,119 @@ case "$COMMAND" in
         ;;
 
     load)
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] && vxn_unsupported "load"
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+            # Host side of the nested SDK: the image cache lives in dom0 (that's
+            # where `vxn run` pulls), and the cache ops only run under
+            # hypervisor=xen, so relay the archive to dom0's `vxn load` over ssh
+            # -- streaming it on stdin, exactly like `docker save <img> | vpm
+            # load`. Works for a piped archive or `-i <file>`; an explicit
+            # name:tag is forwarded so dom0 stores it under that ref. dom0's vxn
+            # (hypervisor=xen) does the skopeo ingest into ~/.vxn/images.
+            _vxn_load_file=""
+            _vxn_load_name=""
+            i=0
+            while [ $i -lt ${#COMMAND_ARGS[@]} ]; do
+                arg="${COMMAND_ARGS[$i]}"
+                case "$arg" in
+                    -i|--input) i=$((i + 1)); _vxn_load_file="${COMMAND_ARGS[$i]}" ;;
+                    *) [ -z "$_vxn_load_name" ] && _vxn_load_name="$arg" ;;
+                esac
+                i=$((i + 1))
+            done
+            if [ -z "$_vxn_load_file" ] && [ -t 0 ]; then
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} load needs an archive: 'vxn load -i <file>' or 'docker save <img> | vxn load'" >&2
+                exit 1
+            fi
+            if [ -n "$_vxn_load_file" ]; then
+                [ -f "$_vxn_load_file" ] || {
+                    echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} File not found: $_vxn_load_file" >&2; exit 1; }
+                _vxn_ssh_dom0 -- vxn load ${_vxn_load_name:+"$_vxn_load_name"} < "$_vxn_load_file"
+            else
+                _vxn_ssh_dom0 -- vxn load ${_vxn_load_name:+"$_vxn_load_name"}
+            fi
+            exit $?
+        fi
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
+            # vxn: load a local image archive into the ~/.vxn/images cache so
+            # `vxn run <image>` can use it WITHOUT a registry -- the mirror of
+            # `docker load` / `vpm load`. The cache lives wherever vxn runs
+            # (host-side when nested under QEMU, dom0 when in dom0), same side as
+            # the pull/ls/rm/tag cache ops above, and the run-path cache-hit
+            # feeds the cached OCI dir into the DomU via the existing --input
+            # transport. Accepts either `-i <file>` or a piped archive
+            # (`docker save <img> | vxn load`).
+            command -v skopeo >/dev/null 2>&1 || {
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} load requires skopeo" >&2; exit 1; }
+            # dom0's default /tmp (and /var/tmp) are small RAM tmpfs; a
+            # multi-hundred-MB archive plus its OCI expansion overflow them ("No
+            # space left on device"). Route all temp files through the
+            # disk-backed cache filesystem -- ~/.vxn holds the image store, so its
+            # parent is real disk. mktemp and skopeo both honor TMPDIR.
+            TMPDIR="$(dirname "$VXN_IMAGE_CACHE")/tmp"
+            mkdir -p "$TMPDIR" 2>/dev/null
+            export TMPDIR
+            _vxn_load_file=""
+            _vxn_load_name=""
+            i=0
+            while [ $i -lt ${#COMMAND_ARGS[@]} ]; do
+                arg="${COMMAND_ARGS[$i]}"
+                case "$arg" in
+                    -i|--input) i=$((i + 1)); _vxn_load_file="${COMMAND_ARGS[$i]}" ;;
+                    # first non-flag positional is an explicit name:tag override
+                    *) [ -z "$_vxn_load_name" ] && _vxn_load_name="$arg" ;;
+                esac
+                i=$((i + 1))
+            done
+            # No -i: read the archive from stdin (docker save <img> | vxn load).
+            # Spool to a temp file -- we read it twice (manifest + skopeo).
+            _vxn_load_tmp=""
+            if [ -z "$_vxn_load_file" ]; then
+                if [ -t 0 ]; then
+                    echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} load needs an archive: 'vxn load -i <file>' or 'docker save <img> | vxn load'" >&2
+                    exit 1
+                fi
+                _vxn_load_tmp="$(mktemp)"
+                cat > "$_vxn_load_tmp"
+                _vxn_load_file="$_vxn_load_tmp"
+            fi
+            if [ ! -f "$_vxn_load_file" ]; then
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} File not found: $_vxn_load_file" >&2
+                [ -n "$_vxn_load_tmp" ] && rm -f "$_vxn_load_tmp"
+                exit 1
+            fi
+            # Derive the image name from the archive's RepoTags when not given.
+            # docker-save (docker-archive) carries manifest.json with RepoTags;
+            # nameless saves (or OCI-layout tars with only index.json) fall
+            # through to the explicit-name requirement below.
+            if [ -z "$_vxn_load_name" ]; then
+                # Pull the first RepoTags entry: "RepoTags":["claude-demo:latest"]
+                # -> claude-demo:latest. Strip up to the opening [" and after the
+                # closing ". (An earlier `grep -o '"[^"]*:[^"]*"'` mis-matched the
+                # `":["` between the key and the value, caching under a bogus name.)
+                _vxn_load_name=$(tar xOf "$_vxn_load_file" manifest.json 2>/dev/null \
+                    | grep -o '"RepoTags":\[[^]]*\]' \
+                    | sed 's/.*\["//; s/".*//')
+            fi
+            if [ -z "$_vxn_load_name" ]; then
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} cannot determine image name from archive; pass one: 'vxn load -i <file> <name:tag>'" >&2
+                [ -n "$_vxn_load_tmp" ] && rm -f "$_vxn_load_tmp"
+                exit 1
+            fi
+            _vxn_normalized=$(vxn_normalize_image_name "$_vxn_load_name")
+            echo "Loading $_vxn_normalized..."
+            _vxn_tmpoci="$(mktemp -d)/oci-image"
+            if skopeo copy "docker-archive:$_vxn_load_file" "oci:$_vxn_tmpoci:latest" 2>&1; then
+                vxn_image_cache_store "$_vxn_load_name" "$_vxn_tmpoci"
+                echo "Loaded: $_vxn_normalized"
+                _vxn_load_rc=0
+            else
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Failed to load $_vxn_normalized" >&2
+                _vxn_load_rc=1
+            fi
+            rm -rf "$(dirname "$_vxn_tmpoci")"
+            [ -n "$_vxn_load_tmp" ] && rm -f "$_vxn_load_tmp"
+            exit $_vxn_load_rc
+        fi
         # runtime load -i <file>
         # Parse -i argument
         INPUT_FILE=""
@@ -3099,6 +3211,21 @@ case "$COMMAND" in
         # `vxn run -it '<quoted args>'`, sized for a single remote shell parse.
         if [ "$INTERACTIVE" = "true" ] && [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
             _vxn_ssh_dom0 -tt -- "$RUNTIME_CMD"
+            exit $?
+        fi
+
+        # qemu-xen non-interactive: run in the PERSISTENT dom0 over ssh -- the same
+        # hypervisor-agnostic transport the interactive path above uses, minus the
+        # PTY. The default $RUNNER path boots a FRESH nested dom0 per run, whose
+        # ~/.vxn/images cache is empty, so `vxn run` there always re-pulls from a
+        # registry and `vxn load`/`vxn pull` are never seen. The persistent dom0 is
+        # the single runtime host that HOLDS the cache, so dispatch runs into it
+        # (this is exactly what `vxn ssh -- vxn run` does, which hits the cache).
+        # Detached (-d) keeps its own path below -- it must return a container id,
+        # not stream stdout.
+        if [ "$INTERACTIVE" != "true" ] && [ "$RUN_IS_DETACHED" != "true" ] \
+           && [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+            _vxn_ssh_dom0 -- "$RUNTIME_CMD"
             exit $?
         fi
 

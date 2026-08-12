@@ -209,25 +209,38 @@ hv_prepare_container() {
             ;;
     esac
 
-    log "INFO" "Pulling OCI image: $image"
-
     local oci_dir="$TEMP_DIR/oci-image"
     local skopeo_log="$TEMP_DIR/skopeo.log"
-    if skopeo copy "docker://$image" "oci:$oci_dir:latest" > "$skopeo_log" 2>&1; then
+
+    # Local image cache (#28): if this image was previously `vxn pull`ed or
+    # `vxn load`ed, reuse it instead of hitting the registry every run. The cache
+    # (~/.vxn/images) is the same store the frontend's pull/load/ls/rm/tag ops
+    # populate -- refs/<normalized-name, / -> _> symlinks a content-addressed
+    # store/sha256/<digest> OCI dir. hv_prepare_container runs in the same dom0
+    # as those ops, so it sees the same cache. On a hit we copy the cached OCI
+    # into oci_dir and skip the network pull; the CA + per-run env (#20) +
+    # entrypoint resolution below run unchanged either way. The runner doesn't
+    # source the frontend, so name normalization is inlined here to match
+    # vcontainer-common.sh's vxn_normalize_image_name.
+    local vxn_cache="${VXN_IMAGE_CACHE:-$HOME/.vxn/images}"
+    local cache_name="$image"
+    case "$cache_name" in
+        *.*/*) ;;                                    # has registry (dot before /)
+        */*)   cache_name="docker.io/$cache_name" ;; # namespace, no registry
+        *)     cache_name="docker.io/library/$cache_name" ;;
+    esac
+    case "$cache_name" in *:*) ;; *) cache_name="$cache_name:latest" ;; esac
+    local cache_ref="$vxn_cache/refs/$(printf '%s' "$cache_name" | tr '/' '_')"
+
+    if [ -L "$cache_ref" ] && [ -d "$cache_ref" ]; then
+        log "INFO" "Using cached image: $cache_name (no registry pull)"
+        cp -a "$(readlink -f "$cache_ref")" "$oci_dir"
+        INPUT_PATH="$oci_dir"
+        INPUT_TYPE="oci"
+    elif skopeo copy "docker://$image" "oci:$oci_dir:latest" > "$skopeo_log" 2>&1; then
         INPUT_PATH="$oci_dir"
         INPUT_TYPE="oci"
         log "INFO" "OCI image pulled to $oci_dir"
-
-        # DomU inherits dom0's corporate CA(s): stage them alongside the OCI
-        # image so the guest init installs them into the container's trust store
-        # (so containers doing their own TLS/network ops trust a proxy CA too).
-        # dom0's vxn-host-certs.sh left them in /usr/local/share/ca-certificates.
-        if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
-            mkdir -p "$oci_dir/.vxn-ca"
-            cp /usr/local/share/ca-certificates/*.crt "$oci_dir/.vxn-ca/" 2>/dev/null || true
-            log "INFO" "Staged dom0 CA cert(s) for the container trust store"
-        fi
-        _stage_vxn_env "$oci_dir"
     else
         log "ERROR" "Failed to pull image: $image"
         [ -f "$skopeo_log" ] && while IFS= read -r line; do
@@ -235,6 +248,18 @@ hv_prepare_container() {
         done < "$skopeo_log"
         exit 1
     fi
+
+    # DomU inherits dom0's corporate CA(s): stage them alongside the OCI image so
+    # the guest init installs them into the container's trust store (so containers
+    # doing their own TLS/network ops trust a proxy CA too). dom0's
+    # vxn-host-certs.sh left them in /usr/local/share/ca-certificates. Runs for
+    # both the cache-hit and pull paths.
+    if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
+        mkdir -p "$oci_dir/.vxn-ca"
+        cp /usr/local/share/ca-certificates/*.crt "$oci_dir/.vxn-ca/" 2>/dev/null || true
+        log "INFO" "Staged dom0 CA cert(s) for the container trust store"
+    fi
+    _stage_vxn_env "$oci_dir"
 
     # Resolve entrypoint from OCI config on the host (jq available here).
     # Rewrite DOCKER_CMD so the guest receives the actual command to exec,

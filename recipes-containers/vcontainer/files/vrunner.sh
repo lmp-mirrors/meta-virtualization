@@ -992,8 +992,13 @@ if [ -z "$DOCKER_CMD" ] && [ "$DAEMON_MODE" != "start" ] && [ "$BATCH_IMPORT" !=
     exit 1
 fi
 
-# Create temp directory early (needed for batch import and other operations)
-TEMP_DIR="${TMPDIR:-/tmp}/vdkr-$$"
+# Create temp directory early (needed for batch import and other operations).
+# Default to a disk-backed path under $HOME, NOT /tmp: in a vxn dom0 /tmp is a
+# small RAM tmpfs, and image prep (copying the OCI out of the ~/.vxn/images cache
+# plus building the DomU disk) needs real space for multi-hundred-MB images --
+# that overflow is the "No space left on device" seen on a cache-hit. $HOME is on
+# the rootfs (disk) in both dom0 and on the host. An explicit TMPDIR still wins.
+TEMP_DIR="${TMPDIR:-${HOME:-/var/tmp}/.vxn/tmp}/vdkr-$$"
 mkdir -p "$TEMP_DIR"
 
 # ============================================================================
