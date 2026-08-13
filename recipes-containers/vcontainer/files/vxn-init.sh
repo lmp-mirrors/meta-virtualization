@@ -417,6 +417,15 @@ exec_in_container() {
         # TERM is correct here -- `linux` crippled TUIs like claude's Ink UI to
         # basic escapes. Override with VXN_TERM if a target terminal differs.
         export TERM="${VXN_TERM:-xterm-256color}"
+        # Set the controlling tty geometry to the dom0 terminal's size before
+        # exec. winsize is a property of the tty device (hvc0 = our stdin), so
+        # claude inherits it across chroot/exec -- including the direct-exec
+        # argv path, which has no shell wrapper to run stty itself. Without this
+        # the guest tty is 80x25 and the TUI renders clipped. (Live resize is
+        # the hvc1 side-channel follow-up; this fixes the initial geometry.)
+        if [ -n "$VXN_WIN_ROWS" ] && [ -n "$VXN_WIN_COLS" ]; then
+            stty rows "$VXN_WIN_ROWS" cols "$VXN_WIN_COLS" 2>/dev/null || true
+        fi
         dmesg -n 1 2>/dev/null || true
         if [ "$_vxn_argv_mode" = "1" ]; then
             # argv rides as positional params, never re-lexed
@@ -768,9 +777,17 @@ _ts cmdline
 
 # Parse vxn-specific kernel parameters
 ENTRYPOINT_GRACE_PERIOD="300"
+# Window size captured on dom0 at launch (see hv_start_vm_foreground). hvc0 /
+# xl console never relay the terminal winsize into the guest, so without this
+# the guest tty stays at the kernel default 80x25 and full-screen TUIs render
+# clipped. Applied in exec_in_container's interactive branch before exec.
+VXN_WIN_ROWS=""
+VXN_WIN_COLS=""
 for param in $(cat /proc/cmdline); do
     case "$param" in
         docker_exit_grace=*) ENTRYPOINT_GRACE_PERIOD="${param#docker_exit_grace=}" ;;
+        vcontainer.rows=*) VXN_WIN_ROWS="${param#vcontainer.rows=}" ;;
+        vcontainer.cols=*) VXN_WIN_COLS="${param#vcontainer.cols=}" ;;
     esac
 done
 log "Entrypoint grace period: ${ENTRYPOINT_GRACE_PERIOD}s"

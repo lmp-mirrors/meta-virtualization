@@ -543,6 +543,13 @@ _write_xen_config() {
 
     [ -n "${VXN_DOMU_CMDLINE_EXTRA:-}" ] && domu_extra="$domu_extra $VXN_DOMU_CMDLINE_EXTRA"
 
+    # Initial terminal geometry for interactive runs (captured in
+    # hv_start_vm_foreground). The guest's vxn-init.sh applies it to hvc0 via
+    # stty before exec so full-screen TUIs aren't clipped to 80x25.
+    if [ -n "${_VXN_WIN_ROWS:-}" ] && [ -n "${_VXN_WIN_COLS:-}" ]; then
+        domu_extra="$domu_extra vcontainer.rows=$_VXN_WIN_ROWS vcontainer.cols=$_VXN_WIN_COLS"
+    fi
+
     cat > "$config_path" <<XENEOF
 # Auto-generated Xen domain config for vxn
 name = "$HV_DOMNAME"
@@ -649,6 +656,24 @@ hv_start_vm_background() {
 
 hv_start_vm_foreground() {
     local kernel_append="$1"
+
+    # Capture the controlling terminal's window size so the guest can set its
+    # hvc0 geometry before exec. xl console shuttles raw bytes but never relays
+    # winsize into the guest, so the guest tty otherwise defaults to 80x25 and
+    # full-screen TUIs (claude's Ink UI) render clipped. ssh -tt already sized
+    # this pty (config-a) / it's the real terminal (config-b), so `stty size`
+    # here reads the correct dimensions. Best-effort, integers only (the values
+    # ride the kernel cmdline -- reject anything non-numeric). _VXN_WIN_* are
+    # read by _write_xen_config below (same shell).
+    _VXN_WIN_ROWS=""; _VXN_WIN_COLS=""
+    if [ -t 0 ]; then
+        _vxn_sz=$(stty size 2>/dev/null)   # "rows cols"
+        _vxn_r=${_vxn_sz%% *}; _vxn_c=${_vxn_sz##* }
+        case "$_vxn_r$_vxn_c" in
+            ''|*[!0-9]*) ;;                 # non-numeric -> leave unset
+            *) [ "$_vxn_r" -gt 0 ] && [ "$_vxn_c" -gt 0 ] && { _VXN_WIN_ROWS=$_vxn_r; _VXN_WIN_COLS=$_vxn_c; } ;;
+        esac
+    fi
 
     HV_XEN_CFG="${TEMP_DIR:-/tmp}/vxn-$$.cfg"
     _write_xen_config "$kernel_append" "$HV_XEN_CFG"
