@@ -1434,13 +1434,23 @@ if [ -n "$INPUT_PATH" ] && [ "$INPUT_TYPE" != "none" ]; then
     log "INFO" "Creating input disk image..."
     INPUT_IMG="$TEMP_DIR/input.img"
 
-    # Calculate size (use -L to dereference hardlinks in OCI containers)
+    # Calculate size. NOTE: no -L. A real rootfs is full of symlinks with
+    # absolute targets (etc/ssl/certs/*, /etc/alternatives/*, zoneinfo); -L makes
+    # du follow them against dom0's root, spraying "cannot access" errors and
+    # undercounting. Plain du counts each file once (hardlinks included) -- the
+    # size we actually need for the disk.
     if [ -d "$INPUT_PATH" ]; then
-        SIZE_KB=$(du -skL "$INPUT_PATH" | cut -f1)
+        SIZE_KB=$(du -sk "$INPUT_PATH" | cut -f1)
     else
         SIZE_KB=$(($(stat -c%s "$INPUT_PATH") / 1024))
     fi
-    SIZE_MB=$(( (SIZE_KB / 1024) + 20 ))
+    # ext4 overhead (journal, inode tables, the default 5% reserved blocks, block
+    # rounding) scales with disk size, so a flat +20MB margin TRUNCATES large
+    # images: a ~300MB binary lost half its bytes here and Bun then SIGBUS'd
+    # mmap'ing past the cut. Give content + 30% + 64MB, and drop the reserved
+    # cushion (-m 0). The image is sparse and lands on ample scratch, so
+    # over-sizing costs nothing.
+    SIZE_MB=$(( (SIZE_KB / 1024) * 130 / 100 + 64 ))
     [ $SIZE_MB -lt 20 ] && SIZE_MB=20
 
     log "DEBUG" "Input size: ${SIZE_KB}KB, Image size: ${SIZE_MB}MB"
@@ -1450,13 +1460,20 @@ if [ -n "$INPUT_PATH" ] && [ "$INPUT_TYPE" != "none" ]; then
     [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME dd_done $(date +%s.%N)" >&2
 
     if [ -d "$INPUT_PATH" ]; then
-        mke2fs -t ext4 -d "$INPUT_PATH" "$INPUT_IMG" >/dev/null 2>&1
+        _mke2fs_src="$INPUT_PATH"
     else
         # Single file - create temp dir with the file
         EXTRACT_DIR="$TEMP_DIR/input-extract"
         mkdir -p "$EXTRACT_DIR"
         cp "$INPUT_PATH" "$EXTRACT_DIR/"
-        mke2fs -t ext4 -d "$EXTRACT_DIR" "$INPUT_IMG" >/dev/null 2>&1
+        _mke2fs_src="$EXTRACT_DIR"
+    fi
+    # Do NOT silence mke2fs: an out-of-space -d copy is exactly what truncated
+    # the binary and turned a hard error into a runtime SIGBUS. Fail loudly.
+    if ! mke2fs -t ext4 -m 0 -F -d "$_mke2fs_src" "$INPUT_IMG" > "$TEMP_DIR/mke2fs.log" 2>&1; then
+        log "ERROR" "mke2fs failed building the container disk (${SIZE_MB}MB may be too small):"
+        while IFS= read -r _l; do log "ERROR" "  mke2fs: $_l"; done < "$TEMP_DIR/mke2fs.log"
+        exit 1
     fi
     [ "${VXN_TIMING:-0}" = "1" ] && echo "DTIME mke2fs_done $(date +%s.%N)" >&2
 

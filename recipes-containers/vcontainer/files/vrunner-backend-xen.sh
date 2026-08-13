@@ -249,17 +249,51 @@ hv_prepare_container() {
         exit 1
     fi
 
-    # DomU inherits dom0's corporate CA(s): stage them alongside the OCI image so
-    # the guest init installs them into the container's trust store (so containers
-    # doing their own TLS/network ops trust a proxy CA too). dom0's
-    # vxn-host-certs.sh left them in /usr/local/share/ca-certificates. Runs for
-    # both the cache-hit and pull paths.
+    # Extract the OCI layers into a flat rootfs HERE (dom0 side, ample disk) so
+    # the input disk carries the READY rootfs and the guest DIRECT-MOUNTS it rw
+    # (vxn-init find_container_rootfs bin/usr path -- the same path `vxn run
+    # <dir>` uses). Shipping the OCI blobs and unpacking in the guest instead
+    # overflows the DomU's RAM tmpfs: the DomU root is read-only, so extraction
+    # lands in RAM, and a 512MB DomU truncated a ~300MB binary, which then
+    # SIGBUSed when mmap'd. Extracting on dom0 also skips a slow guest-boot
+    # unpack. (Layers apply in order; OCI whiteouts are not processed -- same
+    # basic behavior the guest extractor had, fine for additive images.)
+    local rootfs_dir="$TEMP_DIR/rootfs"
+    mkdir -p "$rootfs_dir"
+    local _mdigest _mfile _ldigest _lfile
+    _mdigest=$(jq -r '.manifests[0].digest' "$oci_dir/index.json" 2>/dev/null)
+    _mfile="$oci_dir/blobs/${_mdigest/://}"
+    if ! command -v jq >/dev/null 2>&1 || [ ! -f "$_mfile" ]; then
+        log "ERROR" "cannot read OCI manifest to extract layers for $image"
+        exit 1
+    fi
+    for _ldigest in $(jq -r '.layers[].digest' "$_mfile" 2>/dev/null); do
+        _lfile="$oci_dir/blobs/${_ldigest/://}"
+        [ -f "$_lfile" ] || { log "ERROR" "layer blob missing: $_ldigest"; exit 1; }
+        # Do NOT silence tar: an out-of-space extract is exactly what truncated
+        # the binary in the guest; fail loudly instead.
+        if ! tar -xf "$_lfile" -C "$rootfs_dir" 2>"$TEMP_DIR/tar.log"; then
+            log "ERROR" "layer extract failed ($_ldigest):"
+            while IFS= read -r _tl; do log "ERROR" "  tar: $_tl"; done < "$TEMP_DIR/tar.log"
+            exit 1
+        fi
+    done
+    # The ready rootfs is now the input; the guest direct-mounts it (no RAM
+    # unpack). Overrides the INPUT_PATH=oci_dir set in the pull/cache-hit block.
+    INPUT_PATH="$rootfs_dir"
+    INPUT_TYPE="dir"
+
+    # DomU inherits dom0's corporate CA(s): stage them INTO the rootfs so the
+    # guest init installs them into the container trust store (containers doing
+    # their own TLS/network ops then trust a proxy CA too). With the rootfs as
+    # the input disk, .vxn-ca / .vxn-env sit at its root, where the guest already
+    # looks (/mnt/input/.vxn-ca, /mnt/input/.vxn-env).
     if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
-        mkdir -p "$oci_dir/.vxn-ca"
-        cp /usr/local/share/ca-certificates/*.crt "$oci_dir/.vxn-ca/" 2>/dev/null || true
+        mkdir -p "$rootfs_dir/.vxn-ca"
+        cp /usr/local/share/ca-certificates/*.crt "$rootfs_dir/.vxn-ca/" 2>/dev/null || true
         log "INFO" "Staged dom0 CA cert(s) for the container trust store"
     fi
-    _stage_vxn_env "$oci_dir"
+    _stage_vxn_env "$rootfs_dir"
 
     # Resolve entrypoint from OCI config on the host (jq available here).
     # Rewrite DOCKER_CMD so the guest receives the actual command to exec,
