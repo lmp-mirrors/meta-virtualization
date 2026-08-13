@@ -76,6 +76,7 @@ SRC_URI = "\
     file://vxn-host-certs.service \
     file://vxn-authorized-keys.sh \
     file://vxn-authorized-keys.service \
+    file://vxn-recipes/claude/Vxnfile \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -304,6 +305,14 @@ do_install() {
     install -m 0755 ${S}/vrunner-backend-xen.sh ${D}${libdir}/vxn/
     install -m 0755 ${S}/vrunner-backend-qemu.sh ${D}${libdir}/vxn/
     install -m 0644 ${S}/vcontainer-common.sh ${D}${libdir}/vxn/
+
+    # Ship provision recipes, pre-positioned in dom0 so `vxn run <name>` /
+    # `axis run --policy vxn -- <name>` auto-provisions with no setup in an
+    # installed SDK. A recipe is instructions (it fetches the tool at provision
+    # time), not the tool itself -- same as the layer's other third-party-fetch
+    # container recipes. ${datadir}/vxn/ is already in FILES:${PN}.
+    install -d ${D}${datadir}/vxn/recipes/claude
+    install -m 0644 ${S}/vxn-recipes/claude/Vxnfile ${D}${datadir}/vxn/recipes/claude/Vxnfile
 
     # Install blobs from do_compile output
     install -d ${D}${datadir}/vxn/${BLOB_ARCH}

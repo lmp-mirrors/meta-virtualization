@@ -654,7 +654,7 @@ _vxn_provision_build() {
     local name="$1" dockerfile="$2" context="${3:-.}"
     command -v skopeo >/dev/null 2>&1 || { echo "provision: skopeo required (run in dom0)" >&2; return 1; }
     command -v jq     >/dev/null 2>&1 || { echo "provision: jq required" >&2; return 1; }
-    [ -f "$dockerfile" ] || { echo "provision: Dockerfile not found: $dockerfile" >&2; return 1; }
+    [ -f "$dockerfile" ] || { echo "provision: build file not found: $dockerfile" >&2; return 1; }
 
     local rootfs="$VXN_ROOTFS_CACHE/$name" conf="$VXN_ROOTFS_CACHE/$name.conf"
     mkdir -p "$VXN_ROOTFS_CACHE"; rm -rf "$rootfs" "$conf"
@@ -697,7 +697,7 @@ _vxn_provision_build() {
             *) echo "provision: ignoring unsupported instruction: $instr" >&2 ;;
         esac
     done < "$dockerfile"
-    [ "$from_done" = 1 ] || { echo "provision: no FROM in Dockerfile" >&2; return 1; }
+    [ "$from_done" = 1 ] || { echo "provision: no FROM in build file" >&2; return 1; }
 
     { echo "P_ENTRYPOINT='$p_entrypoint'"; echo "P_CMD='$p_cmd'"
       echo "P_WORKDIR='$p_workdir'"; echo "P_ENV='$p_env'"; } > "$conf"
@@ -717,7 +717,7 @@ _vxn_autoprovision() {
     # Already built in dom0?
     _vxn_ssh_dom0 -- "[ -d \"\$HOME/.vxn/rootfs/$name\" ]" </dev/null >/dev/null 2>&1 && return 0
     # A recipe for it in dom0's registry?
-    _vxn_ssh_dom0 -- "[ -f \"\$HOME/.vxn/recipes/$name/Dockerfile\" ] || [ -f \"/usr/share/vxn/recipes/$name/Dockerfile\" ]" </dev/null >/dev/null 2>&1 || return 0
+    _vxn_ssh_dom0 -- "for d in \"\$HOME/.vxn/recipes/$name\" /usr/share/vxn/recipes/$name; do [ -f \"\$d/Vxnfile\" ] || [ -f \"\$d/Dockerfile\" ] && exit 0; done; exit 1" </dev/null >/dev/null 2>&1 || return 0
     echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} '$name' not provisioned; building it (first run, one-time)..." >&2
     # Bare `provision <name>` -> host relays a plain (non-tt) ssh to dom0, which
     # resolves its registry and builds. Runs to completion before we launch.
@@ -2052,7 +2052,7 @@ case "$COMMAND" in
         ;;
 
     provision)
-        # vxn provision <name> [-f <Dockerfile>] [<context-dir>]
+        # vxn provision <name> [-f <Vxnfile>] [<context-dir>]
         # Assemble a rootfs from a mini-Dockerfile dom0-side (no docker) and cache
         # it at ~/.vxn/rootfs/<name>; `vxn run <name>` then direct-mounts it.
         _p_name=""; _p_dockerfile=""; _p_context=""
@@ -2067,13 +2067,19 @@ case "$COMMAND" in
             i=$((i + 1))
         done
         [ -n "$_p_name" ] || {
-            echo "usage: $VCONTAINER_RUNTIME_NAME provision <name> [[-f <Dockerfile>] <context-dir>]" >&2; exit 1; }
+            echo "usage: $VCONTAINER_RUNTIME_NAME provision <name> [[-f <Vxnfile>] <context-dir>]" >&2; exit 1; }
         # Bare `vxn provision <name>` (no -f, no context) resolves the dom0 recipe
         # registry; an explicit -f/context builds from that instead.
         _p_from_registry=0
         [ -z "$_p_dockerfile" ] && [ -z "$_p_context" ] && _p_from_registry=1
         [ -n "$_p_dockerfile" ] && [ -z "$_p_context" ] && _p_context="$(dirname "$_p_dockerfile")"
-        [ -n "$_p_context" ] && [ -z "$_p_dockerfile" ] && _p_dockerfile="$_p_context/Dockerfile"
+        # Default build file: Vxnfile (our documented subset), else Dockerfile
+        # (back-compat -- we parse the same FROM/COPY/RUN/ENV/WORKDIR/ENTRYPOINT/
+        # CMD subset either way; the name just doesn't over-promise Docker syntax).
+        if [ -n "$_p_context" ] && [ -z "$_p_dockerfile" ]; then
+            if [ -f "$_p_context/Vxnfile" ]; then _p_dockerfile="$_p_context/Vxnfile"
+            else _p_dockerfile="$_p_context/Dockerfile"; fi
+        fi
 
         if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
             if [ "$_p_from_registry" = 1 ]; then
@@ -2087,7 +2093,7 @@ case "$COMMAND" in
             # there, clean up. Dockerfile referenced by basename inside the
             # transported context (like docker, keep it in the context dir).
             [ -f "$_p_dockerfile" ] || {
-                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Dockerfile not found: $_p_dockerfile" >&2; exit 1; }
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} build file not found: $_p_dockerfile" >&2; exit 1; }
             _dfbase=$(basename "$_p_dockerfile")
             _vxn_ssh_dom0 -- true </dev/null || {
                 echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} cannot reach dom0" >&2; exit 1; }
@@ -2100,7 +2106,9 @@ case "$COMMAND" in
         # dom0: resolve the recipe registry for a bare name.
         if [ "$_p_from_registry" = 1 ]; then
             for _rd in "$HOME/.vxn/recipes/$_p_name" "/usr/share/vxn/recipes/$_p_name"; do
-                [ -f "$_rd/Dockerfile" ] && { _p_context="$_rd"; _p_dockerfile="$_rd/Dockerfile"; break; }
+                for _rf in Vxnfile Dockerfile; do
+                    [ -f "$_rd/$_rf" ] && { _p_context="$_rd"; _p_dockerfile="$_rd/$_rf"; break 2; }
+                done
             done
             [ -n "$_p_context" ] || {
                 echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} no recipe for '$_p_name' (looked in ~/.vxn/recipes and /usr/share/vxn/recipes)" >&2; exit 1; }
