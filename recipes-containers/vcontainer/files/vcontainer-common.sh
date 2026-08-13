@@ -1478,6 +1478,25 @@ _vxn_ssh_dom0() {
         root@127.0.0.1 "$@"
 }
 
+# Forward container-DomU tunables set on the HOST across the ssh hop to dom0's
+# vxn. These are read by vrunner-backend-xen.sh, which runs IN dom0, so a
+# host-set value is otherwise silently dropped -- e.g. `VXN_MEMORY=1280 vxn run`
+# on the host had no effect (the container DomU used the dom0 default), which is
+# the trap the claude SIGBUS fix hit. ssh does not forward env, so emit a
+# `VAR='val' ...` prefix for the remote login shell to consume before `vxn run`.
+# Whitelist ONLY -- never forward arbitrary host env. Values are single-quoted
+# (with ' -> '\'' escaping) so spaces in VXN_DOMU_CMDLINE_EXTRA survive the
+# remote shell parse.
+_vxn_env_prefix() {
+    local v esc out=""
+    for v in VXN_MEMORY VXN_VCPUS VXN_NET_MODE VXN_DOMU_CMDLINE_EXTRA; do
+        [ -n "${!v}" ] || continue
+        esc=$(printf '%s' "${!v}" | sed "s/'/'\\\\''/g")
+        out="$out$v='$esc' "
+    done
+    printf '%s' "$out"
+}
+
 # Ensure an ssh_config 'vxn-dom0' Host alias carrying the SDK key + port, so
 # `DOCKER_HOST=ssh://vxn-dom0` authenticates. docker's ssh:// connection helper
 # has no key env var (it just runs `ssh`), so the identity must live in
@@ -3448,7 +3467,7 @@ case "$COMMAND" in
         # the non-interactive channel drives. RUNTIME_CMD is already
         # `vxn run -it '<quoted args>'`, sized for a single remote shell parse.
         if [ "$INTERACTIVE" = "true" ] && [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
-            _vxn_ssh_dom0 -tt -- "$RUNTIME_CMD"
+            _vxn_ssh_dom0 -tt -- "$(_vxn_env_prefix)$RUNTIME_CMD"
             exit $?
         fi
 
@@ -3463,7 +3482,7 @@ case "$COMMAND" in
         # not stream stdout.
         if [ "$INTERACTIVE" != "true" ] && [ "$RUN_IS_DETACHED" != "true" ] \
            && [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
-            _vxn_ssh_dom0 -- "$RUNTIME_CMD"
+            _vxn_ssh_dom0 -- "$(_vxn_env_prefix)$RUNTIME_CMD"
             exit $?
         fi
 
