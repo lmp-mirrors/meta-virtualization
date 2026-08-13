@@ -704,23 +704,45 @@ _vxn_provision_build() {
     echo "provision: cached '$name' rootfs at $rootfs"
 }
 
-# Auto-provision (host pre-step): if <name> is a known dom0 recipe and not yet
-# built, build it NON-interactively BEFORE the interactive launch -- so
-# `vxn run <name>` (and `axis run -- <name>`) work with nothing more. Recipes
-# live in dom0 (user-added ~/.vxn/recipes/<name>/, shipped
-# /usr/share/vxn/recipes/<name>/); this only queries/triggers, the build runs in
-# dom0. It is deliberately NOT run inside the interactive `-tt` session: the
-# heavy chroot build over that PTY dropped the connection mid-build.
+# Auto-provision: if <name> is a known dom0 recipe and not yet built, build it
+# BEFORE the launch dispatch -- so `vxn run <name>` (and `axis run -- <name>`)
+# work with nothing more, zero setup, in BOTH topologies:
+#   - qemu-xen (config-a, nested SDK): host pre-step. Query/build in the
+#     persistent dom0 over a plain (non-tt) ssh -- deliberately NOT on the
+#     interactive `-tt` session, whose PTY dropped mid-build under the heavy
+#     chroot. Runs to completion, then the interactive launch dispatches.
+#   - xen (config-b, in a real dom0): build LOCALLY, in-process. No ssh, no -tt
+#     drop risk -- it's a local terminal, so the inline build precedes the
+#     `xl create -c` launch just fine.
+# Recipes live in dom0 (user-added ~/.vxn/recipes/<name>/, shipped
+# /usr/share/vxn/recipes/<name>/). Both paths defer to `provision <name>`, which
+# resolves that same registry.
 _vxn_autoprovision() {
     local name="$1"
-    [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ] || return 0
-    # Already built in dom0?
-    _vxn_ssh_dom0 -- "[ -d \"\$HOME/.vxn/rootfs/$name\" ]" </dev/null >/dev/null 2>&1 && return 0
-    # A recipe for it in dom0's registry?
-    _vxn_ssh_dom0 -- "for d in \"\$HOME/.vxn/recipes/$name\" /usr/share/vxn/recipes/$name; do [ -f \"\$d/Vxnfile\" ] || [ -f \"\$d/Dockerfile\" ] && exit 0; done; exit 1" </dev/null >/dev/null 2>&1 || return 0
+    case "${VCONTAINER_HYPERVISOR:-}" in
+        qemu-xen)
+            # Already built in dom0?
+            _vxn_ssh_dom0 -- "[ -d \"\$HOME/.vxn/rootfs/$name\" ]" </dev/null >/dev/null 2>&1 && return 0
+            # A recipe for it in dom0's registry?
+            _vxn_ssh_dom0 -- "for d in \"\$HOME/.vxn/recipes/$name\" /usr/share/vxn/recipes/$name; do [ -f \"\$d/Vxnfile\" ] || [ -f \"\$d/Dockerfile\" ] && exit 0; done; exit 1" </dev/null >/dev/null 2>&1 || return 0
+            ;;
+        xen)
+            # Already built locally?
+            [ -d "$VXN_ROOTFS_CACHE/$name" ] && return 0
+            # A recipe for it in the local registry?
+            _ap_found=0
+            for _apd in "$HOME/.vxn/recipes/$name" "/usr/share/vxn/recipes/$name"; do
+                { [ -f "$_apd/Vxnfile" ] || [ -f "$_apd/Dockerfile" ]; } && { _ap_found=1; break; }
+            done
+            [ "$_ap_found" = 1 ] || return 0
+            ;;
+        *)
+            return 0
+            ;;
+    esac
     echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} '$name' not provisioned; building it (first run, one-time)..." >&2
-    # Bare `provision <name>` -> host relays a plain (non-tt) ssh to dom0, which
-    # resolves its registry and builds. Runs to completion before we launch.
+    # qemu-xen: host relays a plain (non-tt) ssh to dom0. xen: builds in-process.
+    # Either way `provision <name>` resolves the dom0 recipe registry.
     "$0" provision "$name" </dev/null || {
         echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} auto-provision of '$name' failed" >&2; return 1; }
 }
@@ -3297,12 +3319,12 @@ case "$COMMAND" in
             exit 1
         fi
 
-        # Auto-provision (host pre-step): if the image is a known dom0 recipe not
-        # yet built, build it NON-interactively here, BEFORE the interactive
-        # launch dispatch below -- so `vxn run <name>` / `axis run -- <name>` work
-        # with nothing more, without the build running on the -tt session.
-        # Non-recipe names fall through to the normal path unchanged.
-        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+        # Auto-provision: if the image is a known dom0 recipe not yet built, build
+        # it here, BEFORE the launch dispatch below -- so `vxn run <name>` /
+        # `axis run -- <name>` work with nothing more, in both topologies
+        # (qemu-xen host pre-step over ssh, or xen in-process in dom0; the
+        # function self-selects). Non-recipe names fall through unchanged.
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ] || [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ]; then
             _ap_img=""; _ap_skip=false
             for arg in "${COMMAND_ARGS[@]}"; do
                 if [ "$_ap_skip" = true ]; then _ap_skip=false; continue; fi
