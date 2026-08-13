@@ -412,7 +412,11 @@ exec_in_container() {
         # PID 1 is already a session leader, so setsid() would fork — run in
         # a subshell (not session leader) where setsid() succeeds directly.
         # The -c flag does ioctl(TIOCSCTTY) on stdin to set the controlling tty.
-        export TERM=linux
+        # TERM: the console is a byte pass-through (hvc0 -> xl console -> dom0 pty
+        # -> ssh -> the user's REAL terminal, which does the rendering), so a rich
+        # TERM is correct here -- `linux` crippled TUIs like claude's Ink UI to
+        # basic escapes. Override with VXN_TERM if a target terminal differs.
+        export TERM="${VXN_TERM:-xterm-256color}"
         dmesg -n 1 2>/dev/null || true
         if [ "$_vxn_argv_mode" = "1" ]; then
             # argv rides as positional params, never re-lexed
