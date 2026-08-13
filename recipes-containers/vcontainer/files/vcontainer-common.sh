@@ -594,6 +594,116 @@ vxn_image_cache_inspect() {
     }' "$config_file"
 }
 
+# ============================================================================
+# vxn provision: assemble a rootfs from a mini-Dockerfile, dom0-side, no docker.
+# Supports FROM / COPY / RUN / ENV / WORKDIR / ENTRYPOINT / CMD (the subset the
+# claude-demo image uses). FROM is skopeo-pulled + extracted; RUN runs in a
+# chroot with proc/sys/dev + resolv.conf and dom0 network; the assembled rootfs
+# is cached at ~/.vxn/rootfs/<name> with a sidecar <name>.conf recording
+# ENTRYPOINT/CMD/WORKDIR/ENV for the run path. Runs where hypervisor=xen (dom0).
+# ============================================================================
+VXN_ROOTFS_CACHE="${VXN_ROOTFS_CACHE:-$HOME/.vxn/rootfs}"
+
+# Extract an OCI layout's layers into a flat rootfs (mirrors the dom0 extract in
+# vrunner-backend-xen.sh). $1=oci_dir $2=target
+_vxn_oci_extract() {
+    local oci_dir="$1" target="$2" mdigest mfile ldigest lfile
+    mkdir -p "$target"
+    mdigest=$(jq -r '.manifests[0].digest' "$oci_dir/index.json" 2>/dev/null)
+    mfile="$oci_dir/blobs/${mdigest/://}"
+    [ -f "$mfile" ] || { echo "provision: OCI manifest not found" >&2; return 1; }
+    for ldigest in $(jq -r '.layers[].digest' "$mfile" 2>/dev/null); do
+        lfile="$oci_dir/blobs/${ldigest/://}"
+        [ -f "$lfile" ] || { echo "provision: layer blob missing: $ldigest" >&2; return 1; }
+        tar -xf "$lfile" -C "$target" 2>/dev/null || { echo "provision: layer extract failed" >&2; return 1; }
+    done
+}
+
+# Run a RUN step in a chroot of the rootfs, with the mounts + resolv.conf apt/
+# curl/network need. $1=rootfs, rest=command.
+_vxn_provision_run() {
+    local rootfs="$1"; shift
+    local rc
+    cp -f /etc/resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+    mount -t proc proc "$rootfs/proc" 2>/dev/null || true
+    mount -t sysfs sys "$rootfs/sys" 2>/dev/null || true
+    mount -o bind /dev "$rootfs/dev" 2>/dev/null || true   # -o bind: busybox-safe
+    # Reset TMPDIR to the chroot's OWN /tmp: the provision build exports
+    # TMPDIR=~/.vxn/tmp (disk-backed dom0 scratch), which does NOT exist inside
+    # the chroot -- update-ca-certificates' mktemp then fails ("No such file or
+    # directory"). DEBIAN_FRONTEND=noninteractive: `vxn ssh` gives the chroot a
+    # tty, so apt's debconf would otherwise go interactive; docker build has no
+    # tty and never prompts. Both harmless for non-apt RUN steps.
+    chroot "$rootfs" /usr/bin/env DEBIAN_FRONTEND=noninteractive TMPDIR=/tmp \
+        /bin/sh -c "$*"; rc=$?
+    umount "$rootfs/dev" "$rootfs/sys" "$rootfs/proc" 2>/dev/null || true
+    return $rc
+}
+
+# Normalize a Dockerfile ENTRYPOINT/CMD: ["a","b"] -> a b ; else verbatim.
+_vxn_exec_form() {
+    case "$1" in
+        "["*"]") printf '%s' "$1" | jq -r 'if type=="array" then join(" ") else . end' 2>/dev/null ;;
+        *)       printf '%s' "$1" ;;
+    esac
+}
+
+# Interpret a mini-Dockerfile into a cached rootfs + config sidecar.
+# $1=name $2=Dockerfile $3=context-dir
+_vxn_provision_build() {
+    local name="$1" dockerfile="$2" context="${3:-.}"
+    command -v skopeo >/dev/null 2>&1 || { echo "provision: skopeo required (run in dom0)" >&2; return 1; }
+    command -v jq     >/dev/null 2>&1 || { echo "provision: jq required" >&2; return 1; }
+    [ -f "$dockerfile" ] || { echo "provision: Dockerfile not found: $dockerfile" >&2; return 1; }
+
+    local rootfs="$VXN_ROOTFS_CACHE/$name" conf="$VXN_ROOTFS_CACHE/$name.conf"
+    mkdir -p "$VXN_ROOTFS_CACHE"; rm -rf "$rootfs" "$conf"
+    export TMPDIR="${TMPDIR:-$HOME/.vxn/tmp}"; mkdir -p "$TMPDIR"
+
+    local from_done=0 p_entrypoint="" p_cmd="" p_workdir="" p_env="" acc="" line instr rest
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        if [ -n "$acc" ]; then line="$acc $line"; acc=""; else
+            case "$line" in \#*|"") continue ;; esac
+        fi
+        case "$line" in *\\) acc="${line%\\}"; continue ;; esac
+        instr=$(printf '%s' "$line" | awk '{print $1}')
+        rest="${line#"$instr"}"; rest="${rest# }"
+        case "$instr" in
+            FROM)
+                local oci="$TMPDIR/prov-from.$$"; rm -rf "$oci"
+                echo "provision: FROM $rest"
+                skopeo copy "docker://$(vxn_normalize_image_name "$rest")" "oci:$oci:latest" >/dev/null 2>&1 \
+                    || { echo "provision: FROM pull failed: $rest" >&2; return 1; }
+                _vxn_oci_extract "$oci" "$rootfs" || return 1
+                rm -rf "$oci"; from_done=1 ;;
+            COPY)
+                [ "$from_done" = 1 ] || { echo "provision: COPY before FROM" >&2; return 1; }
+                local src dst
+                src=$(printf '%s' "$rest" | awk '{print $1}')
+                dst=$(printf '%s' "$rest" | awk '{print $2}')
+                mkdir -p "$rootfs/${dst#/}"
+                cp -a "$context/$src/." "$rootfs/${dst#/}/" 2>/dev/null \
+                    || echo "provision: COPY $src (empty/absent, skipped)" >&2 ;;
+            RUN)
+                [ "$from_done" = 1 ] || { echo "provision: RUN before FROM" >&2; return 1; }
+                echo "provision: RUN $rest"
+                _vxn_provision_run "$rootfs" "$rest" \
+                    || { echo "provision: RUN failed: $rest" >&2; return 1; } ;;
+            ENV)     p_env="$p_env${p_env:+ }$rest" ;;
+            WORKDIR) p_workdir="$rest" ;;
+            ENTRYPOINT) p_entrypoint=$(_vxn_exec_form "$rest") ;;
+            CMD)        p_cmd=$(_vxn_exec_form "$rest") ;;
+            *) echo "provision: ignoring unsupported instruction: $instr" >&2 ;;
+        esac
+    done < "$dockerfile"
+    [ "$from_done" = 1 ] || { echo "provision: no FROM in Dockerfile" >&2; return 1; }
+
+    { echo "P_ENTRYPOINT='$p_entrypoint'"; echo "P_CMD='$p_cmd'"
+      echo "P_WORKDIR='$p_workdir'"; echo "P_ENV='$p_env'"; } > "$conf"
+    echo "provision: cached '$name' rootfs at $rootfs"
+}
+
 show_usage() {
     local PROG_NAME=$(basename "$0")
     local RUNTIME_UPPER=$(echo "$VCONTAINER_RUNTIME_CMD" | sed 's/./\U&/')
@@ -1918,6 +2028,52 @@ case "$COMMAND" in
             RUNNER_ARGS=$(build_runner_args)
             "$RUNNER" $RUNNER_ARGS -- "$VCONTAINER_RUNTIME_CMD pull $IMAGE_NAME && $VCONTAINER_RUNTIME_CMD images"
         fi
+        ;;
+
+    provision)
+        # vxn provision <name> [-f <Dockerfile>] [<context-dir>]
+        # Assemble a rootfs from a mini-Dockerfile dom0-side (no docker) and cache
+        # it at ~/.vxn/rootfs/<name>; `vxn run <name>` then direct-mounts it.
+        _p_name=""; _p_dockerfile=""; _p_context=""
+        i=0
+        while [ $i -lt ${#COMMAND_ARGS[@]} ]; do
+            arg="${COMMAND_ARGS[$i]}"
+            case "$arg" in
+                -f|--file) i=$((i + 1)); _p_dockerfile="${COMMAND_ARGS[$i]}" ;;
+                *) if [ -z "$_p_name" ]; then _p_name="$arg"
+                   elif [ -z "$_p_context" ]; then _p_context="$arg"; fi ;;
+            esac
+            i=$((i + 1))
+        done
+        [ -n "$_p_name" ] || {
+            echo "usage: $VCONTAINER_RUNTIME_NAME provision <name> [-f <Dockerfile>] [<context-dir>]" >&2; exit 1; }
+        # Default the context to the Dockerfile's dir (or CWD); default the
+        # Dockerfile to <context>/Dockerfile.
+        [ -n "$_p_dockerfile" ] && [ -z "$_p_context" ] && _p_context="$(dirname "$_p_dockerfile")"
+        [ -n "$_p_context" ] || _p_context="."
+        [ -n "$_p_dockerfile" ] || _p_dockerfile="$_p_context/Dockerfile"
+
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+            # Host side: provision must run in dom0 (skopeo/chroot/network live
+            # there). Tar the context, stream it over ssh into dom0 scratch, run
+            # `vxn provision` there, clean up. The Dockerfile is referenced by
+            # basename inside the transported context (like docker, keep it in the
+            # context dir).
+            [ -f "$_p_dockerfile" ] || {
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Dockerfile not found: $_p_dockerfile" >&2; exit 1; }
+            _dfbase=$(basename "$_p_dockerfile")
+            # Bring dom0 up first (stdin-safe) so its auto-start can't consume the
+            # tar stream.
+            _vxn_ssh_dom0 -- true </dev/null || {
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} cannot reach dom0" >&2; exit 1; }
+            _dom0_ctx="/var/rh/vxn-provision-$$"
+            tar -C "$_p_context" -cf - . | _vxn_ssh_dom0 -- \
+                "mkdir -p $_dom0_ctx && tar -C $_dom0_ctx -xf - && vxn provision $_p_name -f $_dom0_ctx/$_dfbase $_dom0_ctx; _rc=\$?; rm -rf $_dom0_ctx; exit \$_rc"
+            exit $?
+        fi
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] || vxn_unsupported "provision"
+        _vxn_provision_build "$_p_name" "$_p_dockerfile" "$_p_context"
+        exit $?
         ;;
 
     load)

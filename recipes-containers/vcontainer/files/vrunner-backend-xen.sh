@@ -209,6 +209,31 @@ hv_prepare_container() {
             ;;
     esac
 
+    # Provisioned rootfs (vxn provision <name>): a bare image name resolving to a
+    # cached rootfs at ~/.vxn/rootfs/<name>. Direct-mount it (no OCI, no
+    # registry) and apply the recorded ENTRYPOINT/CMD so `vxn run <name>` runs the
+    # tool. Checked BEFORE the OCI cache/registry path so a provisioned name wins;
+    # names that were never provisioned fall through to the OCI path unchanged.
+    local prov_cache="${VXN_ROOTFS_CACHE:-$HOME/.vxn/rootfs}"
+    if [ -d "$prov_cache/$image" ] && { [ -d "$prov_cache/$image/bin" ] || [ -d "$prov_cache/$image/usr" ]; }; then
+        INPUT_PATH="$prov_cache/$image"
+        INPUT_TYPE="dir"
+        log "INFO" "Using provisioned rootfs: $image"
+        local P_ENTRYPOINT="" P_CMD="" P_WORKDIR="" P_ENV="" _rc=""
+        [ -f "$prov_cache/$image.conf" ] && . "$prov_cache/$image.conf"
+        # entrypoint + (user command if given, else the recorded CMD)
+        _rc="$P_ENTRYPOINT"
+        if [ -n "$user_cmd" ]; then _rc="$_rc${_rc:+ }$user_cmd"
+        elif [ -n "$P_CMD" ]; then _rc="$_rc${_rc:+ }$P_CMD"; fi
+        [ -n "$_rc" ] && { DOCKER_CMD="$_rc"; log "INFO" "Provisioned command: $_rc"; }
+        if ls /usr/local/share/ca-certificates/*.crt >/dev/null 2>&1; then
+            mkdir -p "$INPUT_PATH/.vxn-ca"
+            cp /usr/local/share/ca-certificates/*.crt "$INPUT_PATH/.vxn-ca/" 2>/dev/null || true
+        fi
+        _stage_vxn_env "$INPUT_PATH"
+        return 0
+    fi
+
     local oci_dir="$TEMP_DIR/oci-image"
     local skopeo_log="$TEMP_DIR/skopeo.log"
 
