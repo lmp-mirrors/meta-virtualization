@@ -704,6 +704,27 @@ _vxn_provision_build() {
     echo "provision: cached '$name' rootfs at $rootfs"
 }
 
+# Auto-provision (host pre-step): if <name> is a known dom0 recipe and not yet
+# built, build it NON-interactively BEFORE the interactive launch -- so
+# `vxn run <name>` (and `axis run -- <name>`) work with nothing more. Recipes
+# live in dom0 (user-added ~/.vxn/recipes/<name>/, shipped
+# /usr/share/vxn/recipes/<name>/); this only queries/triggers, the build runs in
+# dom0. It is deliberately NOT run inside the interactive `-tt` session: the
+# heavy chroot build over that PTY dropped the connection mid-build.
+_vxn_autoprovision() {
+    local name="$1"
+    [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ] || return 0
+    # Already built in dom0?
+    _vxn_ssh_dom0 -- "[ -d \"\$HOME/.vxn/rootfs/$name\" ]" </dev/null >/dev/null 2>&1 && return 0
+    # A recipe for it in dom0's registry?
+    _vxn_ssh_dom0 -- "[ -f \"\$HOME/.vxn/recipes/$name/Dockerfile\" ] || [ -f \"/usr/share/vxn/recipes/$name/Dockerfile\" ]" </dev/null >/dev/null 2>&1 || return 0
+    echo -e "${CYAN}[$VCONTAINER_RUNTIME_NAME]${NC} '$name' not provisioned; building it (first run, one-time)..." >&2
+    # Bare `provision <name>` -> host relays a plain (non-tt) ssh to dom0, which
+    # resolves its registry and builds. Runs to completion before we launch.
+    "$0" provision "$name" </dev/null || {
+        echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} auto-provision of '$name' failed" >&2; return 1; }
+}
+
 show_usage() {
     local PROG_NAME=$(basename "$0")
     local RUNTIME_UPPER=$(echo "$VCONTAINER_RUNTIME_CMD" | sed 's/./\U&/')
@@ -2046,24 +2067,28 @@ case "$COMMAND" in
             i=$((i + 1))
         done
         [ -n "$_p_name" ] || {
-            echo "usage: $VCONTAINER_RUNTIME_NAME provision <name> [-f <Dockerfile>] [<context-dir>]" >&2; exit 1; }
-        # Default the context to the Dockerfile's dir (or CWD); default the
-        # Dockerfile to <context>/Dockerfile.
+            echo "usage: $VCONTAINER_RUNTIME_NAME provision <name> [[-f <Dockerfile>] <context-dir>]" >&2; exit 1; }
+        # Bare `vxn provision <name>` (no -f, no context) resolves the dom0 recipe
+        # registry; an explicit -f/context builds from that instead.
+        _p_from_registry=0
+        [ -z "$_p_dockerfile" ] && [ -z "$_p_context" ] && _p_from_registry=1
         [ -n "$_p_dockerfile" ] && [ -z "$_p_context" ] && _p_context="$(dirname "$_p_dockerfile")"
-        [ -n "$_p_context" ] || _p_context="."
-        [ -n "$_p_dockerfile" ] || _p_dockerfile="$_p_context/Dockerfile"
+        [ -n "$_p_context" ] && [ -z "$_p_dockerfile" ] && _p_dockerfile="$_p_context/Dockerfile"
 
         if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
-            # Host side: provision must run in dom0 (skopeo/chroot/network live
-            # there). Tar the context, stream it over ssh into dom0 scratch, run
-            # `vxn provision` there, clean up. The Dockerfile is referenced by
-            # basename inside the transported context (like docker, keep it in the
-            # context dir).
+            if [ "$_p_from_registry" = 1 ]; then
+                # Bare name: dom0 resolves its own recipe registry. NON-interactive
+                # (plain ssh, not -tt) so the heavy chroot build never runs on an
+                # interactive PTY -- that dropped the connection mid-build.
+                _vxn_ssh_dom0 -- "vxn provision $_p_name" </dev/null
+                exit $?
+            fi
+            # Explicit context: tar it and stream to dom0, run `vxn provision`
+            # there, clean up. Dockerfile referenced by basename inside the
+            # transported context (like docker, keep it in the context dir).
             [ -f "$_p_dockerfile" ] || {
                 echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Dockerfile not found: $_p_dockerfile" >&2; exit 1; }
             _dfbase=$(basename "$_p_dockerfile")
-            # Bring dom0 up first (stdin-safe) so its auto-start can't consume the
-            # tar stream.
             _vxn_ssh_dom0 -- true </dev/null || {
                 echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} cannot reach dom0" >&2; exit 1; }
             _dom0_ctx="/var/rh/vxn-provision-$$"
@@ -2072,6 +2097,14 @@ case "$COMMAND" in
             exit $?
         fi
         [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] || vxn_unsupported "provision"
+        # dom0: resolve the recipe registry for a bare name.
+        if [ "$_p_from_registry" = 1 ]; then
+            for _rd in "$HOME/.vxn/recipes/$_p_name" "/usr/share/vxn/recipes/$_p_name"; do
+                [ -f "$_rd/Dockerfile" ] && { _p_context="$_rd"; _p_dockerfile="$_rd/Dockerfile"; break; }
+            done
+            [ -n "$_p_context" ] || {
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} no recipe for '$_p_name' (looked in ~/.vxn/recipes and /usr/share/vxn/recipes)" >&2; exit 1; }
+        fi
         _vxn_provision_build "$_p_name" "$_p_dockerfile" "$_p_context"
         exit $?
         ;;
@@ -3254,6 +3287,25 @@ case "$COMMAND" in
             echo "  $VCONTAINER_RUNTIME_NAME run --rm -e FOO=bar myapp:latest" >&2
             echo "  $VCONTAINER_RUNTIME_NAME run -v /tmp/data:/data alpine cat /data/file.txt" >&2
             exit 1
+        fi
+
+        # Auto-provision (host pre-step): if the image is a known dom0 recipe not
+        # yet built, build it NON-interactively here, BEFORE the interactive
+        # launch dispatch below -- so `vxn run <name>` / `axis run -- <name>` work
+        # with nothing more, without the build running on the -tt session.
+        # Non-recipe names fall through to the normal path unchanged.
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+            _ap_img=""; _ap_skip=false
+            for arg in "${COMMAND_ARGS[@]}"; do
+                if [ "$_ap_skip" = true ]; then _ap_skip=false; continue; fi
+                case "$arg" in
+                    --rm|-d|--detach|-i|-t|-it|--privileged|--interactive|--tty|--no-network) ;;
+                    -e|--env|-p|--publish|-v|--volume|--name|--network|-w|--workdir|--entrypoint|-m|--memory|--cpus) _ap_skip=true ;;
+                    -*) ;;
+                    *) _ap_img="$arg"; break ;;
+                esac
+            done
+            [ -n "$_ap_img" ] && { _vxn_autoprovision "$_ap_img" || exit 1; }
         fi
 
         # vxn (Xen): ephemeral mode by default.
