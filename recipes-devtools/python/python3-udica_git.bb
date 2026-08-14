@@ -5,7 +5,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=1ebbd3e34237af26da5dc08a4e440464"
 
 SRC_URI = "git://github.com/containers/udica;protocol=https;branch=main"
 
-SRCREV = "0ffdba2ab1f34da248ff5b53a8343bf5062f826b"
+SRCREV = "890847075c8d79ad4ef98dcea4bee0e3db46af30"
 PV = "0.2.9+git"
 
 SRC_URI[md5sum] = "9cc5156a2ff6458a8f52114b9bbc0d7e"
