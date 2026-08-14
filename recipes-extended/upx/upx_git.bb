@@ -6,7 +6,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=353753597aa110e0ded3508408c6374a"
 # Note: DO NOT use released tarball in favor of the git repository with submodules.
 # it makes maintenance easier for CVEs or other issues.
 
-SRCREV_upx = "3408ed7dc5d4d8cc9e4f78f520882769d4f83ae1"
+SRCREV_upx = "aeb180b5bc4cbc0895ad666ca8376d40d22f5589"
 PV = "5.2.0+git${SRCPV}"
 
 # SRCREVs are from:
