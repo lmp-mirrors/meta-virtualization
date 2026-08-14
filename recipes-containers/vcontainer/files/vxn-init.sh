@@ -440,6 +440,62 @@ CGEOF
     fi
 }
 
+# Nested enforcement (#31, Phase 2): apply the AXIS filesystem policy as a
+# bind-mount view on the container rootfs BEFORE chroot, as defense-in-depth.
+#   RO=<path>   -> remount that subtree read-only
+#   RW=<path>   -> remount read-write (carve-out that wins over a broader RO)
+#   DENY=<path> -> over-mount (empty tmpfs over a dir, /dev/null over a file) so
+#                  the original content is inaccessible
+# CAVEAT: bind-mount ro/deny is best-effort against a NON-privileged agent. A
+# root agent with CAP_SYS_ADMIN can remount rw / umount to escape it UNTIL
+# Phase 3's seccomp denies the mount/umount syscalls -- that is the intended
+# layering (Phase 2 builds the view, Phase 3 locks it). Requests that cannot be
+# enforced are logged, never silently dropped.
+apply_fs_policy() {
+    local rootfs="$1"
+    local pol="/mnt/input/.vxn-policy/policy"
+    [ -f "$pol" ] || return 0
+    grep -qE '^(RO|RW|DENY)=' "$pol" 2>/dev/null || return 0
+
+    local applied=0 kind path tgt
+    # Pass 1: RO. Bind onto self first so remount,ro,bind scopes to this subtree.
+    while IFS='=' read -r kind path; do
+        [ "$kind" = "RO" ] || continue
+        tgt="$rootfs$path"
+        [ -e "$tgt" ] || { log "fs-policy: RO target missing, skip: $path"; continue; }
+        if mount -o bind "$tgt" "$tgt" 2>/dev/null && mount -o remount,ro,bind "$tgt" 2>/dev/null; then
+            applied=$((applied + 1))
+        else
+            log "WARNING: fs-policy could not make read-only: $path"
+        fi
+    done < "$pol"
+
+    # Pass 2: RW carve-outs (win over any broader RO applied above).
+    while IFS='=' read -r kind path; do
+        [ "$kind" = "RW" ] || continue
+        tgt="$rootfs$path"
+        [ -e "$tgt" ] || { log "fs-policy: RW target missing, skip: $path"; continue; }
+        mount -o bind "$tgt" "$tgt" 2>/dev/null
+        mount -o remount,rw,bind "$tgt" 2>/dev/null && applied=$((applied + 1))
+    done < "$pol"
+
+    # Pass 3: DENY (hide + block). Empty ro tmpfs over dirs; /dev/null over files.
+    while IFS='=' read -r kind path; do
+        [ "$kind" = "DENY" ] || continue
+        tgt="$rootfs$path"
+        [ -e "$tgt" ] || { log "fs-policy: DENY target missing, skip: $path"; continue; }
+        if [ -d "$tgt" ]; then
+            mount -t tmpfs -o ro,nosuid,nodev,mode=000 vxn-deny "$tgt" 2>/dev/null \
+                && applied=$((applied + 1)) || log "WARNING: fs-policy could not deny dir: $path"
+        else
+            mount -o bind /dev/null "$tgt" 2>/dev/null \
+                && applied=$((applied + 1)) || log "WARNING: fs-policy could not deny file: $path"
+        fi
+    done < "$pol"
+
+    [ "$applied" -gt 0 ] && log "Nested enforcement: filesystem policy applied ($applied mount(s))"
+}
+
 exec_in_container() {
     local rootfs="$1"
     local cmd="$2"
@@ -494,6 +550,9 @@ exec_in_container() {
     # policy and select the cgroup-entering chroot wrapper (VXN_CGEXEC). No-op
     # (VXN_CGEXEC=chroot) when no policy was staged.
     setup_nested_enforcement
+    # Phase 2: apply the filesystem policy as a bind-mount view on the rootfs
+    # (after /proc,/sys,/dev are mounted above, before chroot). No-op if none.
+    apply_fs_policy "$rootfs"
 
     if [ "$RUNTIME_INTERACTIVE" = "1" ]; then
         # Interactive mode: establish a controlling terminal for job control.
