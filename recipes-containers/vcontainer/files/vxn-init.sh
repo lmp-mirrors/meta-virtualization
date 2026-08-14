@@ -357,6 +357,89 @@ OCIENVEOF
 
 # Execute a command inside the container rootfs via chroot.
 # Mounts /proc, /sys, /dev inside the container and copies DNS config.
+# Nested enforcement (#31, Phase 1): apply cgroup v2 resource limits from the
+# policy dom0 staged at /mnt/input/.vxn-policy/policy, as defense-in-depth INSIDE
+# the guest (behind the VM boundary). Sets VXN_CGEXEC to a wrapper that drops the
+# entrypoint into the limited cgroup right before chroot; leaves it as plain
+# `chroot` when there are no limits, so the no-policy path is unchanged. Requested
+# limits that can't be enforced are logged loudly, never silently dropped -- the
+# VM boundary still holds, but the operator must know the fine-grained cap didn't.
+setup_nested_enforcement() {
+    VXN_CGEXEC="chroot"
+    VXN_CGROUP_DIR=""
+    export VXN_CGROUP_DIR
+    local pol="/mnt/input/.vxn-policy/policy"
+    [ -f "$pol" ] || return 0
+
+    local mem_mb="" pids="" cpu_pct=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            MAX_MEMORY_MB) mem_mb="$v" ;;
+            MAX_PIDS) pids="$v" ;;
+            CPU_RATE_PERCENT) cpu_pct="$v" ;;
+        esac
+    done < "$pol"
+    [ -n "$mem_mb$pids$cpu_pct" ] || return 0
+
+    # cgroup v2 unified hierarchy required (setup_cgroups mounts it at
+    # /sys/fs/cgroup). If it isn't there, the requested limits can't be enforced.
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        log "WARNING: policy requests resource limits but cgroup v2 is unavailable; running UNCONFINED within the VM"
+        return 0
+    fi
+
+    # Enable the controllers we need on the root's children.
+    local avail want=""
+    avail=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null)
+    case " $avail " in *" memory "*) [ -n "$mem_mb" ] && want="$want +memory" ;; esac
+    case " $avail " in *" pids "*)   [ -n "$pids" ]   && want="$want +pids"   ;; esac
+    case " $avail " in *" cpu "*)    [ -n "$cpu_pct" ] && want="$want +cpu"   ;; esac
+    [ -n "$want" ] && echo $want > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null
+
+    local cg=/sys/fs/cgroup/vxn-agent
+    if ! mkdir -p "$cg" 2>/dev/null; then
+        log "WARNING: could not create the enforcement cgroup; running UNCONFINED within the VM"
+        return 0
+    fi
+
+    # memory.max (bytes), pids.max (count), cpu.max ("<quota_us> <period_us>").
+    local applied=""
+    if [ -n "$mem_mb" ] && [ -w "$cg/memory.max" ]; then
+        echo $((mem_mb * 1024 * 1024)) > "$cg/memory.max" 2>/dev/null && applied="$applied mem=${mem_mb}MB"
+    fi
+    if [ -n "$pids" ] && [ -w "$cg/pids.max" ]; then
+        echo "$pids" > "$cg/pids.max" 2>/dev/null && applied="$applied pids=$pids"
+    fi
+    if [ -n "$cpu_pct" ] && [ -w "$cg/cpu.max" ]; then
+        local period=100000
+        echo "$((period * cpu_pct / 100)) $period" > "$cg/cpu.max" 2>/dev/null && applied="$applied cpu=${cpu_pct}%"
+    fi
+    if [ -z "$applied" ]; then
+        log "WARNING: policy requests resource limits but none could be written (controllers missing?); running UNCONFINED within the VM"
+        return 0
+    fi
+
+    # Wrapper: move the to-be-exec'd entrypoint into the cgroup right before
+    # chroot. It runs in init's namespace (where /sys is visible) and chroot
+    # preserves the pid + cgroup membership. VXN_CGROUP_DIR is read from the env.
+    VXN_CGROUP_DIR="$cg"; export VXN_CGROUP_DIR
+    mkdir -p /run 2>/dev/null
+    if cat > /run/vxn-cgexec <<'CGEOF' 2>/dev/null
+#!/bin/sh
+[ -n "$VXN_CGROUP_DIR" ] && echo $$ > "$VXN_CGROUP_DIR/cgroup.procs" 2>/dev/null
+exec chroot "$@"
+CGEOF
+    then
+        chmod +x /run/vxn-cgexec 2>/dev/null
+    fi
+    if [ -x /run/vxn-cgexec ]; then
+        VXN_CGEXEC="/run/vxn-cgexec"
+        log "Nested enforcement: cgroup limits applied ($applied )"
+    else
+        log "WARNING: cgroup limits set but the cgexec wrapper is unavailable; the entrypoint may not enter the cgroup"
+    fi
+}
+
 exec_in_container() {
     local rootfs="$1"
     local cmd="$2"
@@ -407,6 +490,11 @@ exec_in_container() {
             ;;
     esac
 
+    # Nested enforcement (#31): apply cgroup resource limits from the staged
+    # policy and select the cgroup-entering chroot wrapper (VXN_CGEXEC). No-op
+    # (VXN_CGEXEC=chroot) when no policy was staged.
+    setup_nested_enforcement
+
     if [ "$RUNTIME_INTERACTIVE" = "1" ]; then
         # Interactive mode: establish a controlling terminal for job control.
         # PID 1 is already a session leader, so setsid() would fork — run in
@@ -429,11 +517,11 @@ exec_in_container() {
         dmesg -n 1 2>/dev/null || true
         if [ "$_vxn_argv_mode" = "1" ]; then
             # argv rides as positional params, never re-lexed
-            (exec setsid -c chroot "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@")
+            (exec setsid -c $VXN_CGEXEC "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@")
         elif [ "$use_sh" = "true" ]; then
-            (exec setsid -c chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd")
+            (exec setsid -c $VXN_CGEXEC "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; exec $cmd")
         else
-            (exec setsid -c chroot "$rootfs" $cmd)
+            (exec setsid -c $VXN_CGEXEC "$rootfs" $cmd)
         fi
         EXEC_EXIT_CODE=$?
     else
@@ -442,13 +530,13 @@ exec_in_container() {
         EXEC_EXIT_CODE=0
         if [ "$_vxn_argv_mode" = "1" ]; then
             # argv rides as positional params, never re-lexed
-            chroot "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@" \
+            $VXN_CGEXEC "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@" \
                 > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
         elif [ "$use_sh" = "true" ]; then
-            chroot "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd" \
+            $VXN_CGEXEC "$rootfs" /bin/sh -c "cd '$workdir' 2>/dev/null; $cmd" \
                 > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
         else
-            chroot "$rootfs" $cmd \
+            $VXN_CGEXEC "$rootfs" $cmd \
                 > "$EXEC_OUTPUT" 2>&1 || EXEC_EXIT_CODE=$?
         fi
 

@@ -94,6 +94,18 @@ _stage_vxn_env() {
     log "INFO" "Staged per-run env for the container ($(grep -c . "$1/.vxn-env/env" 2>/dev/null || echo 0) var(s))"
 }
 
+# Stage the per-run enforcement policy (#31) onto the input disk as
+# .vxn-policy/policy (0600). Mirrors _stage_vxn_env; vxn-init reads it and
+# applies the limits (Phase 1: cgroup v2 memory/pids/cpu) before exec. Off any
+# kernel cmdline.
+_stage_vxn_policy() {
+    [ -n "$VXN_POLICY_B64" ] || return 0
+    mkdir -p "$1/.vxn-policy" 2>/dev/null || return 0
+    printf '%s' "$VXN_POLICY_B64" | base64 -d > "$1/.vxn-policy/policy" 2>/dev/null
+    chmod 600 "$1/.vxn-policy/policy" 2>/dev/null || true
+    log "INFO" "Staged per-run enforcement policy ($(grep -c . "$1/.vxn-policy/policy" 2>/dev/null || echo 0) directive(s))"
+}
+
 hv_prepare_container() {
     # Skip if user already provided --input
     [ -n "$INPUT_PATH" ] && return 0
@@ -118,6 +130,20 @@ hv_prepare_container() {
             VXN_ENV_B64=$(printf '%s' "$DOCKER_CMD" | grep -oE '\-\-env-b64=[A-Za-z0-9+/=]+' | head -1)
             VXN_ENV_B64="${VXN_ENV_B64#--env-b64=}"
             DOCKER_CMD=$(printf '%s' "$DOCKER_CMD" | sed -E 's/ *--env-b64=[A-Za-z0-9+/=]+//')
+            ;;
+    esac
+
+    # Nested enforcement (#31): AXIS passes the enforcement-relevant policy subset
+    # as --policy-b64=<base64(KEY=VAL\n...)>. Same treatment as --env-b64 -- stage
+    # it on the per-run input disk (.vxn-policy/policy) and STRIP it from the
+    # command so it never reaches the DomU kernel cmdline. vxn-init applies it
+    # (Phase 1: cgroup resource limits) before exec, inside the guest.
+    VXN_POLICY_B64=""
+    case "$DOCKER_CMD" in
+        *--policy-b64=*)
+            VXN_POLICY_B64=$(printf '%s' "$DOCKER_CMD" | grep -oE '\-\-policy-b64=[A-Za-z0-9+/=]+' | head -1)
+            VXN_POLICY_B64="${VXN_POLICY_B64#--policy-b64=}"
+            DOCKER_CMD=$(printf '%s' "$DOCKER_CMD" | sed -E 's/ *--policy-b64=[A-Za-z0-9+/=]+//')
             ;;
     esac
 
@@ -204,6 +230,7 @@ hv_prepare_container() {
                     log "INFO" "Staged dom0 CA cert(s) for the container trust store"
                 fi
                 _stage_vxn_env "$image"
+                _stage_vxn_policy "$image"
                 return 0
             fi
             ;;
@@ -231,6 +258,7 @@ hv_prepare_container() {
             cp /usr/local/share/ca-certificates/*.crt "$INPUT_PATH/.vxn-ca/" 2>/dev/null || true
         fi
         _stage_vxn_env "$INPUT_PATH"
+        _stage_vxn_policy "$INPUT_PATH"
         return 0
     fi
 
@@ -319,6 +347,7 @@ hv_prepare_container() {
         log "INFO" "Staged dom0 CA cert(s) for the container trust store"
     fi
     _stage_vxn_env "$rootfs_dir"
+    _stage_vxn_policy "$rootfs_dir"
 
     # Resolve entrypoint from OCI config on the host (jq available here).
     # Rewrite DOCKER_CMD so the guest receives the actual command to exec,
