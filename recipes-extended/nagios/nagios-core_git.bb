@@ -10,7 +10,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=4c4203caac58013115c9ca4b85f296ae"
 
 SRCNAME = "nagios"
 
-SRCREV = "367ec800bfbecf1ca1e857fe73bdb5fba5cc9003"
+SRCREV = "ea1f4cbe2a5743329f689fe16b1a84464102ba39"
 
 SRC_URI = "git://github.com/NagiosEnterprises/nagioscore.git;protocol=https;branch=master \
            file://eventhandlers_nagioscmd_path.patch \
