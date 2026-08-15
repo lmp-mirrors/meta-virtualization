@@ -16,7 +16,7 @@ DEPENDS = " \
     gettext-native \
 "
 
-SRCREV = "90034777f22e875c541e30e08250903a709536a2"
+SRCREV = "a2409076ef2fef60ad9ac046375dedc7d9410ef4"
 SRC_URI = " \
     git://github.com/containers/podman.git;branch=main;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
     ${@bb.utils.contains('PACKAGECONFIG', 'rootless', 'file://50-podman-rootless.conf', '', d)} \
