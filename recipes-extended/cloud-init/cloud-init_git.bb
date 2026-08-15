@@ -7,7 +7,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=c6dd79b6ec2130a3364f6fa9d6380408 \
     file://LICENSE-Apache2.0;md5=3b83ef96387f14655fc854ddc3c6bd57 \
 "
 
-SRCREV = "a30c7db1f963eee7f47e2c18c479de166fab53cb"
+SRCREV = "35ada55691e4d7b3578a7304221be4ba94a76cf6"
 SRC_URI = "git://github.com/canonical/cloud-init;branch=main;protocol=https \
            file://cloud-init-source-local-lsb-functions.patch \
 "
