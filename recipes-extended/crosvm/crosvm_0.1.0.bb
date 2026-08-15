@@ -18,8 +18,8 @@ SRC_URI = " \
     git://github.com/google/minijail.git;branch=main;protocol=https;name=minijail;destsuffix=${BB_GIT_DEFAULT_DESTSUFFIX}/third_party/minijail \
 "
 
-SRCREV_crosvm = "b04c13a65b93034010b20612e3566d4f9d83c4f0"
-SRCREV_minijail = "bfd22f25fd2302fe4ae5121d80c836e0f124e742"
+SRCREV_crosvm = "4156aed946818f1e86803d645b5d57229475d9a4"
+SRCREV_minijail = "7845d89927a82dbdcdee6276837cd0978f69ba19"
 
 SRCREV_FORMAT = "crosvm_minijail"
 
