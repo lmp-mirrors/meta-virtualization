@@ -273,6 +273,7 @@ DATA_DIR = CACHE_BASE_DIR
 CLONE_CACHE_DIR = SCRIPT_DIR / ".cache" / "repos"  # Repository clone cache
 VERIFY_BASE_DIR = CACHE_BASE_DIR / ".verify"
 LS_REMOTE_CACHE_PATH = DATA_DIR / "ls-remote-cache.json"
+DUMB_HTTP_CACHE_PATH = DATA_DIR / "dumb-http-urls.json"
 VERIFY_COMMIT_CACHE_PATH = DATA_DIR / "verify-cache.json"
 MODULE_REPO_OVERRIDES_PATH = DATA_DIR / "repo-overrides.json"
 # Manual overrides file - tracked in git, for permanent overrides when discovery fails
@@ -318,6 +319,8 @@ VERIFY_CACHE_MAX_AGE_DAYS = 30  # Re-verify commits older than this
 VERIFY_DETECTED_BRANCHES: Dict[Tuple[str, str], str] = {}  # (url, commit) -> branch_name
 VERIFY_FALLBACK_COMMITS: Dict[Tuple[str, str], str] = {}  # Maps (url, original_commit) -> fallback_commit
 VERIFY_FULL_REPOS: Set[str] = set()  # Track repos that have been fetched with full history
+DUMB_HTTP_URLS: Set[str] = set()  # URLs known to serve via dumb-HTTP (no shallow-fetch support)
+DUMB_HTTP_CACHE_DIRTY = False
 VERIFY_CORRECTIONS_APPLIED = False  # Track if any commit corrections were made
 MODULE_REPO_OVERRIDES: Dict[Tuple[str, Optional[str]], str] = {}  # Dynamic overrides from --set-repo
 MODULE_REPO_OVERRIDES_DIRTY = False
@@ -395,7 +398,7 @@ def configure_cache_paths(cache_dir: Optional[str], clone_cache_dir: Optional[st
         clone_cache_dir: Directory for git repository clones (default: scripts/.cache/repos)
     """
     global CACHE_BASE_DIR, DATA_DIR, CLONE_CACHE_DIR
-    global LS_REMOTE_CACHE_PATH, MODULE_METADATA_CACHE_PATH, VANITY_URL_CACHE_PATH
+    global LS_REMOTE_CACHE_PATH, DUMB_HTTP_CACHE_PATH, MODULE_METADATA_CACHE_PATH, VANITY_URL_CACHE_PATH
     global VERIFY_COMMIT_CACHE_PATH, MODULE_REPO_OVERRIDES_PATH
 
     # Configure JSON metadata cache directory
@@ -408,6 +411,7 @@ def configure_cache_paths(cache_dir: Optional[str], clone_cache_dir: Optional[st
     DATA_DIR = CACHE_BASE_DIR  # cache_dir IS the data directory now
 
     LS_REMOTE_CACHE_PATH = DATA_DIR / "ls-remote-cache.json"
+    DUMB_HTTP_CACHE_PATH = DATA_DIR / "dumb-http-urls.json"
     MODULE_METADATA_CACHE_PATH = DATA_DIR / "module-cache.json"
     VANITY_URL_CACHE_PATH = DATA_DIR / "vanity-url-cache.json"
     VERIFY_COMMIT_CACHE_PATH = DATA_DIR / "verify-cache.json"
@@ -794,17 +798,9 @@ def verify_commit_accessible(vcs_url: str, commit: str, ref_hint: str = "", vers
         # Only do shallow fetch if commit is not already present
         # Doing --depth=1 on an already-full repo causes git to re-process history (very slow on large repos)
         if not commit_present and ref_hint:
-            fetch_args = ["git", "fetch", "--depth=1", "origin", ref_hint]
-
             try:
-                subprocess.run(
-                    fetch_args,
-                    cwd=str(repo_dir),
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=GIT_CMD_TIMEOUT,
-                    env=env,
+                _git_fetch_with_shallow_fallback(
+                    repo_dir, [ref_hint], env, vcs_url,
                 )
             except subprocess.TimeoutExpired:
                 print(f"  ⚠️  git fetch timeout ({GIT_CMD_TIMEOUT}s) for {vcs_url} {ref_hint or ''}")
@@ -824,15 +820,8 @@ def verify_commit_accessible(vcs_url: str, commit: str, ref_hint: str = "", vers
         if is_tag_ref and not commit_present:
             # Tagged version: try shallow fetch of the specific commit (only if not already present)
             try:
-                fetch_cmd = ["git", "fetch", "--depth=1", "origin", commit]
-                subprocess.run(
-                    fetch_cmd,
-                    cwd=str(repo_dir),
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=GIT_CMD_TIMEOUT,
-                    env=env,
+                _git_fetch_with_shallow_fallback(
+                    repo_dir, [commit], env, vcs_url,
                 )
                 commit_fetched = True
 
@@ -846,14 +835,8 @@ def verify_commit_accessible(vcs_url: str, commit: str, ref_hint: str = "", vers
                     print(f"  → Tag commit not fetchable, checking if tag moved...")
                     try:
                         # Try fetching the tag again to see what it currently points to
-                        subprocess.run(
-                            ["git", "fetch", "--depth=1", "origin", ref_hint],
-                            cwd=str(repo_dir),
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            timeout=GIT_CMD_TIMEOUT,
-                            env=env,
+                        _git_fetch_with_shallow_fallback(
+                            repo_dir, [ref_hint], env, vcs_url,
                         )
 
                         # Check what commit the tag now points to
@@ -1087,14 +1070,8 @@ def verify_commit_accessible(vcs_url: str, commit: str, ref_hint: str = "", vers
                             print(f"     → Using current tag commit")
 
                             # Fetch the tag to update local repo
-                            subprocess.run(
-                                ["git", "fetch", "--depth=1", "origin", ref_hint],
-                                cwd=str(repo_dir),
-                                check=True,
-                                capture_output=True,
-                                text=True,
-                                timeout=GIT_CMD_TIMEOUT,
-                                env=env,
+                            _git_fetch_with_shallow_fallback(
+                                repo_dir, [ref_hint], env, vcs_url,
                             )
 
                             # Update to use current commit
@@ -1711,6 +1688,7 @@ def _execute(args: argparse.Namespace) -> int:
     )
     prune_metadata_cache()
     load_ls_remote_cache()
+    load_dumb_http_cache()
     load_vanity_url_cache()
 
     if args.dry_run:
@@ -2304,6 +2282,91 @@ def save_ls_remote_cache() -> None:
         LS_REMOTE_CACHE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True))
     except Exception:
         pass
+
+
+def load_dumb_http_cache() -> None:
+    if not DUMB_HTTP_CACHE_PATH.exists():
+        return
+    try:
+        data = json.loads(DUMB_HTTP_CACHE_PATH.read_text())
+    except Exception:
+        return
+    if isinstance(data, list):
+        DUMB_HTTP_URLS.update(str(u) for u in data)
+
+
+def save_dumb_http_cache() -> None:
+    if not DUMB_HTTP_CACHE_DIRTY:
+        return
+    try:
+        DUMB_HTTP_CACHE_PATH.write_text(
+            json.dumps(sorted(DUMB_HTTP_URLS), indent=2)
+        )
+    except Exception:
+        pass
+
+
+def _mark_dumb_http(vcs_url: str) -> None:
+    """Record that a URL requires full (non-shallow) fetches."""
+    global DUMB_HTTP_CACHE_DIRTY
+    if vcs_url not in DUMB_HTTP_URLS:
+        DUMB_HTTP_URLS.add(vcs_url)
+        DUMB_HTTP_CACHE_DIRTY = True
+        print(f"  ℹ️  {vcs_url}: dumb-HTTP server (no shallow-fetch); using full clone from here on")
+
+
+def _stderr_indicates_dumb_http(stderr: str) -> bool:
+    if not stderr:
+        return False
+    return "dumb http transport does not support shallow capabilities" in stderr
+
+
+def _git_fetch_with_shallow_fallback(
+    repo_dir: Path,
+    ref_args: List[str],
+    env: Dict[str, str],
+    vcs_url: str,
+    timeout: int = GIT_CMD_TIMEOUT,
+) -> subprocess.CompletedProcess:
+    """
+    Run `git fetch --depth=1 origin <ref_args...>` inside repo_dir.
+
+    If the server doesn't speak the shallow-fetch capability (typical of
+    old dumb-HTTP servers behind Apache — e.g. software.sslmate.com), retry
+    without --depth=1 and remember the URL so subsequent calls skip the
+    shallow attempt entirely.
+
+    Raises subprocess.CalledProcessError for any non-shallow failure.
+    """
+    known_dumb = vcs_url in DUMB_HTTP_URLS
+    base = ["git", "fetch", "origin"] + list(ref_args)
+    if not known_dumb:
+        try:
+            return subprocess.run(
+                ["git", "fetch", "--depth=1", "origin"] + list(ref_args),
+                cwd=str(repo_dir),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            if not _stderr_indicates_dumb_http(stderr):
+                raise
+            _mark_dumb_http(vcs_url)
+    # Full fetch (either previously marked dumb, or shallow just failed).
+    # Dumb HTTP is slow; give it more headroom.
+    return subprocess.run(
+        base,
+        cwd=str(repo_dir),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout * 5,
+        env=env,
+    )
 
 
 def git_ls_remote(url: str, ref: str, *, debug: bool = False) -> Optional[str]:
@@ -4210,7 +4273,8 @@ def generate_recipe(modules: List[Dict], source_dir: Path, output_dir: Optional[
         for _, module_path, version, commit_hash, vcs_url, ref_hint in failed_results:
             print(f"\n   - {module_path}@{version} ({commit_hash})")
             hint = f" {ref_hint}" if ref_hint else ""
-            print(f"     try: git fetch --depth=1 {vcs_url}{hint} {commit_hash}")
+            depth_flag = "" if vcs_url in DUMB_HTTP_URLS else " --depth=1"
+            print(f"     try: git fetch{depth_flag} {vcs_url}{hint} {commit_hash}")
             print()
             print(f"     Option 1: Exclude from VCS and fetch via Go module proxy instead.")
             print(f"               Add to your recipe (.bb):")
@@ -5367,6 +5431,7 @@ Examples:
         exit_code = 1
     finally:
         save_ls_remote_cache()
+        save_dumb_http_cache()
         save_metadata_cache()
         save_vanity_url_cache()
         save_verify_commit_cache()
