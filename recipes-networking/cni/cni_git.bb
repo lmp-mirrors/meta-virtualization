@@ -9,9 +9,9 @@ Because of this focus, CNI has a wide range of support and the specification \
 is simple to implement. \
 "
 
-SRCREV_cni = "7c270076995b6a35f4774ce94dafcf266d1c6925"
-SRCREV_plugins = "d653d38d4f3699653aa25cc1697924b2a9c2ae3e"
-SRCREV_flannel_plugin = "e4902565b662b0fcc7ac7e6abf6b74e15518e024"
+SRCREV_cni = "3f51e8803ebbdba0ebeed735b42137e4c7302403"
+SRCREV_plugins = "4f4df5d7757cb86630d15a7489e75647df9a8719"
+SRCREV_flannel_plugin = "b380f201008e9bed159703846cf10d3c50b4f9ce"
 SRCREV_FORMAT = "cni_plugins"
 SRC_URI = "\
 	git://github.com/containernetworking/cni.git;branch=main;name=cni;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
