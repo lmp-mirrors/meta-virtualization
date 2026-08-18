@@ -844,6 +844,10 @@ graceful_shutdown() {
     [ "$RUNTIME_STATE" = "disk" ] && sleep 2
 
     log "=== ${VCONTAINER_RUNTIME_NAME} Complete ==="
-    # Use reboot -f which works with QEMU's -no-reboot flag to exit cleanly
-    reboot -f
+    # Use reboot -f which works with QEMU's -no-reboot flag to exit cleanly.
+    # Redirect its output so busybox's userspace "Rebooting." line doesn't reach
+    # the user's terminal on a clean exit (the kernel's "reboot: Restarting
+    # system." is already gated by the interactive console-level drop). The
+    # reboot(2) syscall the applet performs is unaffected by the redirect.
+    reboot -f >/dev/null 2>&1
 }
