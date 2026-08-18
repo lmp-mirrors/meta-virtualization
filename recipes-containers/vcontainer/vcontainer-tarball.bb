@@ -148,6 +148,15 @@ VCONTAINER_ARCHITECTURES ?= "x86_64 aarch64"
 # aarch64 Xen boots via a different mechanism and is a follow-up).
 VCONTAINER_INCLUDE_VXN ?= "0"
 
+# vdkr (docker) and vpdmn (podman) are included by default. Set either to "0" to
+# build a subset SDK -- e.g. a vxn-only SDK for AXIS:
+#   VCONTAINER_INCLUDE_VXN = "1"
+#   VCONTAINER_INCLUDE_VDKR = "0"
+#   VCONTAINER_INCLUDE_VPDMN = "0"
+# Their blobs (~127MB each per arch) are then neither built nor bundled.
+VCONTAINER_INCLUDE_VDKR ?= "1"
+VCONTAINER_INCLUDE_VPDMN ?= "1"
+
 # Conditionally set mcdepends based on available multiconfigs
 # (avoids parse errors when BBMULTICONFIG is not set, e.g. yocto-check-layer)
 #
@@ -172,12 +181,16 @@ VCONTAINER_INCLUDE_VXN ?= "0"
 python () {
     bbmulticonfig = (d.getVar('BBMULTICONFIG') or "").split()
     mcdeps = []
+    inc_vdkr = d.getVar('VCONTAINER_INCLUDE_VDKR') == '1'
+    inc_vpdmn = d.getVar('VCONTAINER_INCLUDE_VPDMN') == '1'
     for mc in ['vruntime-x86-64', 'vruntime-aarch64']:
         if mc in bbmulticonfig:
-            mcdeps.append('mc::%s:vdkr-initramfs-create:do_deploy' % mc)
-            mcdeps.append('mc::%s:vpdmn-initramfs-create:do_deploy' % mc)
-            mcdeps.append('mc::%s:vdkr-rootfs-image:do_image_complete' % mc)
-            mcdeps.append('mc::%s:vpdmn-rootfs-image:do_image_complete' % mc)
+            if inc_vdkr:
+                mcdeps.append('mc::%s:vdkr-initramfs-create:do_deploy' % mc)
+                mcdeps.append('mc::%s:vdkr-rootfs-image:do_image_complete' % mc)
+            if inc_vpdmn:
+                mcdeps.append('mc::%s:vpdmn-initramfs-create:do_deploy' % mc)
+                mcdeps.append('mc::%s:vpdmn-rootfs-image:do_image_complete' % mc)
 
     # vxn (opt-in): depend on the Xen dom0 image built in the vxn-<arch> MC.
     # Guarded by VCONTAINER_INCLUDE_VXN and MC presence so the tarball never
@@ -247,42 +260,44 @@ create_sdk_files:append () {
         MC_DEPLOY="${TOPDIR}/tmp-${MC}/deploy/images/${MC_MACHINE}"
         bbnote "MC_DEPLOY=${MC_DEPLOY} for ${ARCH}"
 
-        # Create blob directories
-        mkdir -p "${SDK_OUT}/vdkr-blobs/${ARCH}"
-        mkdir -p "${SDK_OUT}/vpdmn-blobs/${ARCH}"
-
-        # Copy vdkr blobs
-        VDKR_SRC="${MC_DEPLOY}/vdkr/${ARCH}"
-        if [ -d "${VDKR_SRC}" ]; then
-            for blob in ${KERNEL} initramfs.cpio.gz rootfs.img; do
-                if [ -f "${VDKR_SRC}/${blob}" ]; then
-                    cp "${VDKR_SRC}/${blob}" "${SDK_OUT}/vdkr-blobs/${ARCH}/"
-                    bbnote "Copied vdkr blob: ${ARCH}/${blob}"
-                else
-                    bbfatal "vdkr blob not found: ${VDKR_SRC}/${blob}"
-                fi
-            done
-            VDKR_INCLUDED=1
-        else
-            bbfatal "vdkr blobs not found for ${ARCH}. Build them first with:
+        # Copy vdkr blobs (skip entirely when VCONTAINER_INCLUDE_VDKR = 0)
+        if [ "${VCONTAINER_INCLUDE_VDKR}" = "1" ]; then
+            mkdir -p "${SDK_OUT}/vdkr-blobs/${ARCH}"
+            VDKR_SRC="${MC_DEPLOY}/vdkr/${ARCH}"
+            if [ -d "${VDKR_SRC}" ]; then
+                for blob in ${KERNEL} initramfs.cpio.gz rootfs.img; do
+                    if [ -f "${VDKR_SRC}/${blob}" ]; then
+                        cp "${VDKR_SRC}/${blob}" "${SDK_OUT}/vdkr-blobs/${ARCH}/"
+                        bbnote "Copied vdkr blob: ${ARCH}/${blob}"
+                    else
+                        bbfatal "vdkr blob not found: ${VDKR_SRC}/${blob}"
+                    fi
+                done
+                VDKR_INCLUDED=1
+            else
+                bbfatal "vdkr blobs not found for ${ARCH}. Build them first with:
   bitbake mc:${MC}:vdkr-initramfs-create"
+            fi
         fi
 
-        # Copy vpdmn blobs
-        VPDMN_SRC="${MC_DEPLOY}/vpdmn/${ARCH}"
-        if [ -d "${VPDMN_SRC}" ]; then
-            for blob in ${KERNEL} initramfs.cpio.gz rootfs.img; do
-                if [ -f "${VPDMN_SRC}/${blob}" ]; then
-                    cp "${VPDMN_SRC}/${blob}" "${SDK_OUT}/vpdmn-blobs/${ARCH}/"
-                    bbnote "Copied vpdmn blob: ${ARCH}/${blob}"
-                else
-                    bbfatal "vpdmn blob not found: ${VPDMN_SRC}/${blob}"
-                fi
-            done
-            VPDMN_INCLUDED=1
-        else
-            bbfatal "vpdmn blobs not found for ${ARCH}. Build them first with:
+        # Copy vpdmn blobs (skip entirely when VCONTAINER_INCLUDE_VPDMN = 0)
+        if [ "${VCONTAINER_INCLUDE_VPDMN}" = "1" ]; then
+            mkdir -p "${SDK_OUT}/vpdmn-blobs/${ARCH}"
+            VPDMN_SRC="${MC_DEPLOY}/vpdmn/${ARCH}"
+            if [ -d "${VPDMN_SRC}" ]; then
+                for blob in ${KERNEL} initramfs.cpio.gz rootfs.img; do
+                    if [ -f "${VPDMN_SRC}/${blob}" ]; then
+                        cp "${VPDMN_SRC}/${blob}" "${SDK_OUT}/vpdmn-blobs/${ARCH}/"
+                        bbnote "Copied vpdmn blob: ${ARCH}/${blob}"
+                    else
+                        bbfatal "vpdmn blob not found: ${VPDMN_SRC}/${blob}"
+                    fi
+                done
+                VPDMN_INCLUDED=1
+            else
+                bbfatal "vpdmn blobs not found for ${ARCH}. Build them first with:
   bitbake mc:${MC}:vpdmn-initramfs-create"
+            fi
         fi
     done
 
@@ -707,10 +722,17 @@ python do_populate_sdk:append() {
     toolchain_outputname = d.getVar('TOOLCHAIN_OUTPUTNAME')
     architectures = d.getVar('VCONTAINER_ARCHITECTURES').split()
 
-    # Find the installer script
+    # Find the installer script. Report its final SDK_DEPLOY path (where the
+    # user will find it), but size it from the SDKDEPLOYDIR work copy: this runs
+    # in do_populate_sdk:append, before the .sh is copied out to SDK_DEPLOY, so
+    # getsize() on the final path reads 0 (the "Size: 0 MB" banner bug).
     installer = os.path.join(deploy_dir, toolchain_outputname + '.sh')
+    installer_workdir = os.path.join(d.getVar('SDKDEPLOYDIR'),
+                                     toolchain_outputname + '.sh')
     installer_size = 0
-    if os.path.exists(installer):
+    if os.path.exists(installer_workdir):
+        installer_size = os.path.getsize(installer_workdir) // (1024 * 1024)
+    elif os.path.exists(installer):
         installer_size = os.path.getsize(installer) // (1024 * 1024)
 
     # Check what was included
