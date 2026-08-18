@@ -38,14 +38,20 @@ VCONTAINER_VERSION="1.2.0"
 # Source common init functions
 . /vcontainer-init-common.sh
 
-# Reboot the DomU quietly. The guest reboots to signal container completion to
-# the host; busybox prints "Rebooting." and the kernel prints "reboot:
-# Restarting system." at KERN_EMERG, which `dmesg -n 1` cannot gate (it clamps
-# the console level at KERN_ALERT). Drop console_loglevel and its minimum to 0
-# so the emergency line is suppressed too, then silence busybox's own message.
-# Nothing useful prints after this, so lowering the console level has no cost.
-_quiet_reboot() {
+# Drop console_loglevel (and its minimum) to 0 so even KERN_EMERG stays off the
+# console. `dmesg -n N` cannot reach 0 -- klogctl clamps at
+# minimum_console_loglevel (>=1), so the kernel's "reboot: Restarting system."
+# banner (KERN_EMERG, level 0) still leaks through `dmesg -n 1`. A direct write
+# to /proc/sys/kernel/printk is not clamped.
+_quiet_console() {
     echo "0 4 0 7" > /proc/sys/kernel/printk 2>/dev/null || true
+}
+
+# Reboot the DomU quietly. The guest reboots to signal container completion to
+# the host; suppress the kernel reboot banner and busybox's own "Rebooting."
+# Nothing useful prints after this.
+_quiet_reboot() {
+    _quiet_console
     reboot -f 2>/dev/null
 }
 
@@ -584,7 +590,11 @@ exec_in_container() {
         if [ -n "$VXN_WIN_ROWS" ] && [ -n "$VXN_WIN_COLS" ]; then
             stty rows "$VXN_WIN_ROWS" cols "$VXN_WIN_COLS" 2>/dev/null || true
         fi
-        dmesg -n 1 2>/dev/null || true
+        # Quiet the guest console for the whole interactive session: drop it to
+        # 0 (not `dmesg -n 1`, which leaves KERN_EMERG visible) so the "reboot:
+        # Restarting system." banner from graceful_shutdown below never reaches
+        # the user's terminal interleaved with the agent's UI.
+        _quiet_console
         if [ "$_vxn_argv_mode" = "1" ]; then
             # argv rides as positional params, never re-lexed
             (exec setsid -c $VXN_CGEXEC "$rootfs" /bin/sh -c 'cd "$1" 2>/dev/null; shift; exec "$@"' _ "$workdir" "$@")

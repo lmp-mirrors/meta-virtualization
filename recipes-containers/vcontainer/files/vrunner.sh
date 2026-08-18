@@ -1874,7 +1874,7 @@ if [ "$INTERACTIVE" = "true" ]; then
         log "WARN" "Interactive mode requested but stdin is not a terminal"
     fi
 
-    if [ -t 1 ]; then
+    if [ "$VERBOSE" = "true" ] && [ -t 1 ]; then
         printf "\r\033[0;36m[${TOOL_NAME}]\033[0m Starting container... \r"
     fi
 
