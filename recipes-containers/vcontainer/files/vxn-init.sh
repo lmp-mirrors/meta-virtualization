@@ -38,6 +38,17 @@ VCONTAINER_VERSION="1.2.0"
 # Source common init functions
 . /vcontainer-init-common.sh
 
+# Reboot the DomU quietly. The guest reboots to signal container completion to
+# the host; busybox prints "Rebooting." and the kernel prints "reboot:
+# Restarting system." at KERN_EMERG, which `dmesg -n 1` cannot gate (it clamps
+# the console level at KERN_ALERT). Drop console_loglevel and its minimum to 0
+# so the emergency line is suppressed too, then silence busybox's own message.
+# Nothing useful prints after this, so lowering the console level has no cost.
+_quiet_reboot() {
+    echo "0 4 0 7" > /proc/sys/kernel/printk 2>/dev/null || true
+    reboot -f 2>/dev/null
+}
+
 # ============================================================================
 # Container Rootfs Handling
 # ============================================================================
@@ -661,7 +672,7 @@ exec_in_container_background() {
             sleep "$ENTRYPOINT_GRACE_PERIOD"
         fi
         log "Grace period expired, shutting down"
-        reboot -f
+        _quiet_reboot
     ) &
     ENTRYPOINT_MONITOR_PID=$!
     log "Entrypoint monitor started (PID: $ENTRYPOINT_MONITOR_PID)"
@@ -797,7 +808,7 @@ run_vxn_daemon_mode() {
     touch "$ACTIVITY_FILE"
     DAEMON_PID=$$
 
-    trap 'log "Shutdown signal"; sync; reboot -f' TERM
+    trap 'log "Shutdown signal"; sync; _quiet_reboot' TERM
     trap 'rm -f "$ACTIVITY_FILE"; exit' INT
 
     log "Using hvc0 console for daemon IPC"
@@ -961,7 +972,7 @@ if ! find_container_rootfs; then
         echo "Contents of /mnt/input:"
         ls -la /mnt/input/ 2>/dev/null || echo "(empty)"
         sleep 2
-        reboot -f
+        _quiet_reboot
     fi
 fi
 
@@ -990,7 +1001,7 @@ else
         echo "===ERROR==="
         echo "No command to execute"
         sleep 2
-        reboot -f
+        _quiet_reboot
     fi
 
     # Execute in container rootfs

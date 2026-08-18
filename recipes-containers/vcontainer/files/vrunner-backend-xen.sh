@@ -707,8 +707,14 @@ hv_start_vm_foreground() {
     HV_XEN_CFG="${TEMP_DIR:-/tmp}/vxn-$$.cfg"
     _write_xen_config "$kernel_append" "$HV_XEN_CFG"
 
-    # Create domain and attach console
-    xl create -c "$HV_XEN_CFG"
+    # Create domain and attach console. Filter xl's cosmetic "Parsing config
+    # from <file>" banner off stderr while leaving genuine create errors (also
+    # on stderr) visible on the interactive console; stdin/stdout stay wired to
+    # the terminal for the guest console. This is the -it path -- the background
+    # path (hv_start_vm) already redirects to a log file, so only this one leaked
+    # the banner to the user. bash process substitution keeps the filter to the
+    # single stream without disturbing the tty.
+    xl create -c "$HV_XEN_CFG" 2> >(grep -v '^Parsing config from ' >&2)
 }
 
 hv_is_vm_running() {
