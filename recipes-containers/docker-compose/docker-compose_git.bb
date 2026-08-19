@@ -6,7 +6,7 @@ DEPENDS = " \
     go-md2man \
 "
 
-SRCREV_compose = "7eeb7de7a20b8d1e3e319e1499ae4b62d6fc2af9"
+SRCREV_compose = "9a70c817fa38af00efb4dd218291204bcbb8c044"
 SRCREV_FORMAT = "compose"
 
 SRC_URI = "git://github.com/docker/compose;branch=main;name=compose;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX}"
@@ -31,7 +31,7 @@ LIC_FILES_CHKSUM = "file://src/import/LICENSE;md5=175792518e4ac015ab6696d16c4f60
 
 GO_IMPORT = "import"
 
-PV = "5.1.4"
+PV = "5.5.0"
 
 CVE_PRODUCT = "docker:compose"
 
