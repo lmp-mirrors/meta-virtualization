@@ -16,6 +16,7 @@ SRCREV_FORMAT = "cosign"
 # go-mod-discovery configuration
 GO_MOD_DISCOVERY_SRCDIR = "${S}/src/${GO_IMPORT}"
 GO_MOD_DISCOVERY_BUILD_TARGET = "./cmd/cosign"
+GO_MOD_DISCOVERY_LICENSE_TARGETS = "./cmd/cosign"
 GO_MOD_DISCOVERY_GIT_REPO = "https://github.com/sigstore/cosign.git"
 GO_MOD_DISCOVERY_GIT_REF = "${SRCREV_cosign}"
 
