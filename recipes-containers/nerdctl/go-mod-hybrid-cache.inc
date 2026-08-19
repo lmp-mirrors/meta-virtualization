@@ -11,7 +11,7 @@ GO_MODULE_CACHE_DATA = '[\
 {"module":"github.com/containerd/cgroups/v3","version":"v3.1.3","vcs_hash":"3cacf869e6e5cb422592906f0e2f211bc239e0b2c0730e85debdfc8989de9e0d","timestamp":"2026-02-12T22:21:12Z","subdir":"","vcs_ref":"refs/tags/v3.1.3"},\
 {"module":"github.com/containerd/console","version":"v1.0.5","vcs_hash":"a38aca664db28f607862e39301d2fd06b3c58312662cbd189f451215c3eb9894","timestamp":"2025-05-20T06:25:07Z","subdir":"","vcs_ref":"refs/tags/v1.0.5"},\
 {"module":"github.com/containerd/containerd/api","version":"v1.11.1","vcs_hash":"e9733071c5be4c2ea5846c40aa96b55d4ec6851165ad185799b25a7fc53607f4","timestamp":"2026-05-20T17:33:06Z","subdir":"api","vcs_ref":"refs/tags/api/v1.11.1"},\
-{"module":"github.com/containerd/containerd/v2","version":"v2.3.1","vcs_hash":"fd04ac75b20dcd23ea40fd168d938bb8d8aaee2543c5851ee199013a91658963","timestamp":"2026-05-20T20:41:13Z","subdir":"","vcs_ref":"refs/tags/v2.3.1"},\
+{"module":"github.com/containerd/containerd/v2","version":"v2.3.2","vcs_hash":"cff6c1766645cb3c012dc81280300300efbef3bc9b78e7cf1a53c1b0f09057ce","timestamp":"2026-06-18T23:07:16Z","subdir":"","vcs_ref":"refs/tags/v2.3.2"},\
 {"module":"github.com/containerd/continuity","version":"v0.5.0","vcs_hash":"0bc5664bede9ac5d8f964515e65465327cb867960ba6f60b07146716d29f5d9b","timestamp":"2026-04-29T00:48:13Z","subdir":"","vcs_ref":"refs/tags/v0.5.0"},\
 {"module":"github.com/containerd/errdefs","version":"v1.0.0","vcs_hash":"d9d1c9949e837f39205605237b656e944c7d0cd69e48a906fabdb6bebe0edb66","timestamp":"2024-10-08T13:10:09Z","subdir":"","vcs_ref":"refs/tags/v1.0.0"},\
 {"module":"github.com/containerd/errdefs/pkg","version":"v0.3.0","vcs_hash":"d9d1c9949e837f39205605237b656e944c7d0cd69e48a906fabdb6bebe0edb66","timestamp":"2024-10-08T13:10:09Z","subdir":"pkg","vcs_ref":"refs/tags/pkg/v0.3.0"},\
@@ -21,7 +21,6 @@ GO_MODULE_CACHE_DATA = '[\
 {"module":"github.com/containerd/go-runc","version":"v1.1.0","vcs_hash":"9044e9e240020298712a51a4db4736afc66d70b1870cf11cac73c0661be06842","timestamp":"2023-05-17T04:55:20Z","subdir":"","vcs_ref":"refs/tags/v1.1.0"},\
 {"module":"github.com/containerd/imgcrypt/v2","version":"v2.0.2","vcs_hash":"7be492fe663b2b50ba4047664c79f816480e518b38e926a921a870033cd60104","timestamp":"2025-11-06T13:14:25Z","subdir":"","vcs_ref":"refs/tags/v2.0.2"},\
 {"module":"github.com/containerd/log","version":"v0.1.0","vcs_hash":"697be36d9b8a0eb34f8591d0f69b6d596e1e9341b5944ebf81ddd334b1907bc6","timestamp":"2023-09-09T00:27:15Z","subdir":"","vcs_ref":"refs/tags/v0.1.0"},\
-{"module":"github.com/containerd/nerdctl/v2","version":"v2.0.0-20260528082953-89ecd85071c4","vcs_hash":"1fc524e73a0559ca2b02d14c29578e0e141eac51b6a96d91f3004ae1068fc45a","timestamp":"2026-05-28T08:29:53Z","subdir":"v2","vcs_ref":""},\
 {"module":"github.com/containerd/nri","version":"v0.12.0","vcs_hash":"26084f999c885809086eb3cfc8d4d0f03e2dd35b49ac2b12d817c0f3b7da3008","timestamp":"2026-04-15T19:11:08Z","subdir":"","vcs_ref":"refs/tags/v0.12.0"},\
 {"module":"github.com/containerd/nydus-snapshotter","version":"v0.15.15","vcs_hash":"c91675f13bd373f32be137fdcf8537e51e1283a17c647d8da381f7004de04a34","timestamp":"2026-04-17T14:50:33Z","subdir":"","vcs_ref":"refs/tags/v0.15.15"},\
 {"module":"github.com/containerd/otelttrpc","version":"v0.1.0","vcs_hash":"c27d4a7087a7f4624cdf40c161f9707dbb90cd2d71159840f7c7b610260e9f24","timestamp":"2025-01-09T19:17:17Z","subdir":"","vcs_ref":"refs/tags/v0.1.0"},\
@@ -35,4 +34,5 @@ GO_MODULE_CACHE_DATA = '[\
 {"module":"github.com/containerd/typeurl/v2","version":"v2.3.0","vcs_hash":"2df385af2c5264c689a632460598c2976741236e67cb74b63ba47f487cb976e6","timestamp":"2024-11-07T05:33:21Z","subdir":"","vcs_ref":"refs/tags/v2.3.0"},\
 {"module":"github.com/containerd/zfs/v2","version":"v2.0.0","vcs_hash":"3b6e8e17660f86603ad978c35f23b066288dc5937890ca5c61f54fc5dfaa9052","timestamp":"2025-12-08T03:44:17Z","subdir":"","vcs_ref":"refs/tags/v2.0.0"},\
 {"module":"k8s.io/api","version":"v0.36.0","vcs_hash":"a37f2c0d0abc2c1a6c177808eb27ddd7c53ba671912b517d818cf9fa052ff722","timestamp":"2026-04-22T18:26:39Z","subdir":"","vcs_ref":"refs/tags/v0.36.0"},\
-{"module":"k8s.io/apimachinery","version":"v0.36.0","vcs_hash":"42e70ddb8f06828e01b81fd5045da331e997db88015c5f36f8f930956144dbce","timestamp":"2026-04-22T18:20:11Z","subdir":"","vcs_ref":"refs/tags/v0.36.0"}]'
+{"module":"k8s.io/apimachinery","version":"v0.36.0","vcs_hash":"42e70ddb8f06828e01b81fd5045da331e997db88015c5f36f8f930956144dbce","timestamp":"2026-04-22T18:20:11Z","subdir":"","vcs_ref":"refs/tags/v0.36.0"},\
+{"module":"k8s.io/client-go","version":"v0.36.0","vcs_hash":"e5de9a1f67e1c9c32dcecae091d75a8653a8ec368a48ad0c3c240b5c91cca187","timestamp":"2026-04-22T18:35:58Z","subdir":"","vcs_ref":"refs/tags/v0.36.0"}]'
