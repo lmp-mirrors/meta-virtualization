@@ -321,6 +321,7 @@ VERIFY_FALLBACK_COMMITS: Dict[Tuple[str, str], str] = {}  # Maps (url, original_
 VERIFY_FULL_REPOS: Set[str] = set()  # Track repos that have been fetched with full history
 DUMB_HTTP_URLS: Set[str] = set()  # URLs known to serve via dumb-HTTP (no shallow-fetch support)
 DUMB_HTTP_CACHE_DIRTY = False
+ORPHANED_COMMITS: Set[Tuple[str, str]] = set()  # (vcs_url, commit) whose commit is no longer upstream
 VERIFY_CORRECTIONS_APPLIED = False  # Track if any commit corrections were made
 MODULE_REPO_OVERRIDES: Dict[Tuple[str, Optional[str]], str] = {}  # Dynamic overrides from --set-repo
 MODULE_REPO_OVERRIDES_DIRTY = False
@@ -864,6 +865,11 @@ def verify_commit_accessible(vcs_url: str, commit: str, ref_hint: str = "", vers
                         # Can't fetch tag either - this is a real error
                         pass
 
+                # Tag-ref fetch failed with orphaned-commit error and the
+                # tag-moved fallback (if any) didn't rescue us. Record as
+                # orphaned so verify_module can classify it as skip vs. fail.
+                if _stderr_indicates_orphaned_commit(detail):
+                    ORPHANED_COMMITS.add((vcs_url, commit))
                 for lock_file in ["shallow.lock", "index.lock", "HEAD.lock"]:
                     lock_path = repo_dir / lock_file
                     if lock_path.exists():
@@ -1032,15 +1038,18 @@ def verify_commit_accessible(vcs_url: str, commit: str, ref_hint: str = "", vers
                     # Check if fallback commit exists
                     if not _commit_exists(fallback_commit):
                         print(f"  ⚠️  Fallback commit {fallback_commit[:12]} also not found!")
+                        ORPHANED_COMMITS.add((vcs_url, commit))
                         VERIFY_RESULTS[key] = False
                         return False
                 else:
-                    print(f"  ⚠️  Could not determine fallback commit")
+                    print(f"  ⚠️  Could not determine fallback commit for orphaned {commit[:12]}")
+                    ORPHANED_COMMITS.add((vcs_url, commit))
                     VERIFY_RESULTS[key] = False
                     return False
             else:
                 # Tagged version with bad commit - this shouldn't happen but fail gracefully
                 print(f"  ⚠️  Tagged version {version} has invalid commit {commit[:12]}")
+                ORPHANED_COMMITS.add((vcs_url, commit))
                 VERIFY_RESULTS[key] = False
                 return False
 
@@ -2319,6 +2328,24 @@ def _stderr_indicates_dumb_http(stderr: str) -> bool:
     if not stderr:
         return False
     return "dumb http transport does not support shallow capabilities" in stderr
+
+
+def _stderr_indicates_orphaned_commit(stderr: str) -> bool:
+    """
+    Detect the "commit no longer reachable upstream" pattern.
+
+    Happens when the upstream repo has force-pushed or regenerated history
+    (e.g. Google's auto-generated googleapis/go-genproto), leaving commits
+    referenced by Go proxy pseudo-versions orphaned. The proxy still serves
+    the module zip, but `git fetch` against the origin fails.
+    """
+    if not stderr:
+        return False
+    return (
+        "couldn't find remote ref" in stderr
+        or "not our ref" in stderr
+        or "upload-pack: not our ref" in stderr
+    )
 
 
 def _git_fetch_with_shallow_fallback(
@@ -4187,6 +4214,13 @@ def generate_recipe(modules: List[Dict], source_dir: Path, output_dir: Optional[
 
             # Verify commit is accessible
             if not verify_commit_accessible(vcs_url, commit_hash, ref_hint, module.get('version', ''), module.get('timestamp', '')):
+                # If verify recorded this as an orphaned upstream commit (the
+                # commit no longer exists in the origin repo and no fallback
+                # found), classify as 'skipped' so generation can proceed. The
+                # module will be excluded from git:// output; skipped modules
+                # are summarized at the end.
+                if (vcs_url, commit_hash) in ORPHANED_COMMITS:
+                    return ('skipped', module['module_path'], module['version'], commit_hash, vcs_url, 'orphaned upstream commit')
                 # PHASE MERGE: If verification fails and we have a ref, try auto-correction
                 if ref_hint and ref_hint.startswith("refs/"):
                     corrected_hash = correct_commit_hash_from_ref(vcs_url, commit_hash, ref_hint)
@@ -4240,9 +4274,42 @@ def generate_recipe(modules: List[Dict], source_dir: Path, output_dir: Optional[
                     save_verify_commit_cache(force=True)
                     print(f"  💾 Saved verification cache at {index}/{total_modules}")
 
-        # Separate corrected vs failed results
+        # Separate corrected vs failed vs skipped results
         corrected_results = [r for r in results if r and r[0] == 'corrected']
         failed_results = [r for r in results if r and r[0] == 'failed']
+        skipped_results = [r for r in results if r and r[0] == 'skipped']
+
+        # Drop orphaned/skipped modules from the modules list AND from
+        # vcs_repos so they don't get emitted as git:// SRC_URI entries.
+        # The build tolerates missing modules because do_compile deletes
+        # go.sum before compiling (see recipe do_compile), so orphaned
+        # /go.mod-only transitive references don't fail verification.
+        if skipped_results:
+            skip_keys = {(m_path, ver) for _, m_path, ver, _, _, _ in skipped_results}
+            before = len(modules)
+            modules = [
+                m for m in modules
+                if (m['module_path'], m['version']) not in skip_keys
+            ]
+            print(f"\n⚠️  Skipped {before - len(modules)} orphaned upstream commits (see summary below)")
+            # Feed into the shared SKIPPED_MODULES summary so the user sees them
+            for _, m_path, ver, _, _, reason in skipped_results:
+                SKIPPED_MODULES[(m_path, ver)] = reason
+            # Prune commit entries from vcs_repos that no longer have any modules
+            for _, m_path, ver, commit_hash, vcs_url, _ in skipped_results:
+                repo_key = repo_key_for_url(vcs_url)
+                commits = vcs_repos.get(repo_key, {}).get('commits', {})
+                if commit_hash in commits:
+                    commits[commit_hash]['modules'] = [
+                        mm for mm in commits[commit_hash]['modules']
+                        if (mm['module_path'], mm['version']) not in skip_keys
+                    ]
+                    if not commits[commit_hash]['modules']:
+                        del commits[commit_hash]
+            # Prune empty repos
+            for rk in list(vcs_repos.keys()):
+                if not vcs_repos[rk].get('commits'):
+                    del vcs_repos[rk]
 
         # Apply corrections back to modules list (needed for parallel execution)
         if corrected_results:
