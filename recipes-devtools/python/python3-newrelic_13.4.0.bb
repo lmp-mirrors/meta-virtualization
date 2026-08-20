@@ -15,7 +15,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=2b42edef8fa55315f34f2370b4715ca9"
 # spdx_license.LicenseRef regex in oe.license).
 NO_GENERIC_LICENSE[NewRelic] = "LICENSE"
 
-SRC_URI[sha256sum] = "1492f0fe510cdc0c1347f597baca2a3ddd7e0662895a800e19fe524396f7bf05"
+SRC_URI[sha256sum] = "f9443060aa32f95f2db443545ba8b15350be2d66ec22fadcdcda11f5472a06f6"
 
 inherit pypi python_setuptools_build_meta
 
