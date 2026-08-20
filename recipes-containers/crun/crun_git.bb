@@ -3,11 +3,11 @@ LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://COPYING;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 PRIORITY = "optional"
 
-SRCREV_crun = "fb54bc00bf4a9139e74ba68e00da22b424b90912"
-SRCREV_libocispec = "b465698c1d4d2be50016e6739cc7832563994760"
+SRCREV_crun = "ba38286f7d232be8087dbd393315bb05018da68c"
+SRCREV_libocispec = "872b8b0b7ccb1a121601ede0dcac8c6b8a1008a6"
 SRCREV_ispec = "af26a05fba5ee648512f4ea3c9fda1fcc1b6d6dc"
 SRCREV_rspec = "6999a89a76a0329f440d5740497bedb9dd431297"
-SRCREV_yajl = "f344d21280c3e4094919fd318bc5ce75da91fc06"
+SRCREV_yajl = "6bc5219389fd2752631682b0a8368e6d8218a8c5"
 
 SRCREV_FORMAT = "crun_rspec"
 SRC_URI = "git://github.com/containers/crun.git;branch=main;name=crun;protocol=https \
@@ -19,7 +19,7 @@ SRC_URI = "git://github.com/containers/crun.git;branch=main;name=crun;protocol=h
            file://0002-libocispec-fix-array-items-parsing.patch;patchdir=libocispec \
           "
 
-PV = "1.28.0+git"
+PV = "1.29.1+git"
 
 inherit autotools-brokensep pkgconfig features_check
 
