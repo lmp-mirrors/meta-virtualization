@@ -15,20 +15,21 @@ inherit cmake pkgconfig python3native python3-dir systemd useradd
 # without depending on the submodule remote staying intact. SRCREVs below
 # are from `git submodule status` at the main SRCREV.
 SRCREV_FORMAT = "ceph"
-SRCREV_ceph = "6830c0390c2bcbced5d4397d6581a02663bb5f0a"
-SRCREV_ceph_object_corpus = "44b11dd5aa8a2f965ea395f13cf4cbb4a61e9afe"
+SRCREV_ceph = "98d05bca3f179facf2a268657c7418d1f79d7854"
+SRCREV_ceph_object_corpus = "530602c5f31d68595495593027439838c459b1eb"
 SRCREV_jerasure = "96c76b89d661c163f65a014b8042c9354ccf7f31"
 SRCREV_gf_complete = "7e61b44404f0ed410c83cfd3947a52e88ae044e1"
-SRCREV_rocksdb = "24ea35870fe9b3ba15285ec8746ba97ed5d67ff3"
+SRCREV_rocksdb = "c7a7c6340c522d2ecc21625e2b726554cb61eb72"
 SRCREV_ceph_erasure_code_corpus = "2d7d78b9cc52e8a9529d8cc2d2954c7d375d5dd7"
 SRCREV_googletest = "6910c9d9165801d8827d628cb72eb7ea9dd538c5"
 SRCREV_spdk = "82fcb248516816f19bee2c8f598149067e16a4bd"
-SRCREV_xxHash = "bbb27a5efb85b92a0486cf361a8635715a53f6ba"
-SRCREV_isa_l = "c196241ae89b1aa4f62efeb849a937c011b3a926"
+SRCREV_xxHash = "e573d4d2aaeaba0f3e5a0a9a54144a1f2b4b56e7"
+SRCREV_isa_l = "7c3479e0a9dac17f448603ec1ad64c7c625f530c"
 SRCREV_zstd = "794ea1b0afca0f020f4e57b6732332231fb23c70"
-SRCREV_isa_l_crypto = "a6dc869666fca3eef9a0305b290e4e0fc8bac645"
+SRCREV_isa_l_crypto = "c353c2d021c03cfc6180ddf9e28a24b3b61e9760"
+SRCREV_librdkafka = "e1db7eaa517f0a6438bc846a9c49ede73b9ea211"
 SRCREV_blkin = "f24ceec055ea236a093988237a9821d145f5f7c8"
-SRCREV_seastar = "15b1ca1bec7e148df262343f57b160d0248c736b"
+SRCREV_seastar = "cced0236ee7cb4e157b5a37fd9076d62c5be4f58"
 SRCREV_fmt = "123913715afeb8a437e6388b4473fcc4753e1c9a"
 SRCREV_c_ares = "fd6124c74da0801f23f9d324559d8b66fb83f533"
 SRCREV_rook_client_python = "82673cd7c7a3f4919b98706985ff27e57d2c1b94"
@@ -40,7 +41,7 @@ SRCREV_opentelemetry_cpp = "95fe422d56d74ded3640c5cdcaa3011bc9e18f68"
 SRCREV_qatlib = "142e305970ec66a860945d20bb7c330f99ed900b"
 SRCREV_qatzip = "fdee557b5bb640827758f121102dcf3583292b7a"
 SRCREV_BLAKE3 = "92e4cd71be48fdf9a79e88ef37b8f415ec5ac210"
-SRCREV_gateway = "e27436eddacf8d4b2eace77c5fbd250adf48a155"
+SRCREV_gateway = "5e04ca9a89c5333004d2c3ff8114d91f0d0deac4"
 SRCREV_breakpad = "41b6533e5f3dd7f0320ef58608ee32e8e4f132fb"
 SRCREV_lss = "ed31caa60f20a4f6569883b2d752ef7522de51e0"
 # Nested submodules of s3select (s3select itself has a .gitmodules):
@@ -59,6 +60,7 @@ SRC_URI = "git://github.com/ceph/ceph.git;name=ceph;branch=main;protocol=https \
            git://github.com/intel/isa-l;name=isa_l;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/isa-l;nobranch=1;protocol=https \
            git://github.com/facebook/zstd;name=zstd;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/zstd;nobranch=1;protocol=https \
            git://github.com/intel/isa-l_crypto;name=isa_l_crypto;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/crypto/isa-l/isa-l_crypto;nobranch=1;protocol=https \
+           git://github.com/confluentinc/librdkafka.git;name=librdkafka;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/librdkafka;nobranch=1;protocol=https \
            git://github.com/ceph/blkin;name=blkin;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/blkin;nobranch=1;protocol=https \
            git://github.com/ceph/seastar.git;name=seastar;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/seastar;nobranch=1;protocol=https \
            git://github.com/ceph/fmt.git;name=fmt;subdir=${BB_GIT_DEFAULT_DESTSUFFIX}/src/fmt;nobranch=1;protocol=https \
@@ -87,7 +89,7 @@ SRC_URI = "git://github.com/ceph/ceph.git;name=ceph;branch=main;protocol=https \
            file://0001-cmake-Distutils-include-CMAKE_C_COMPILER_ARG1-in-PY_.patch \
 	   "
 
-PV = "20.3.0+git"
+PV = "21.3.0+git"
 
 DEPENDS = "boost bzip2 curl cryptsetup expat gperf-native \
            keyutils libaio liburing lua lz4 \
