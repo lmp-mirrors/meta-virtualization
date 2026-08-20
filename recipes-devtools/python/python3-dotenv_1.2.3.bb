@@ -8,7 +8,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=e914cdb773ae44a732b392532d88f072"
 PYPI_PACKAGE = "python_dotenv"
 UPSTREAM_CHECK_PYPI_PACKAGE = "${PYPI_PACKAGE}"
 
-SRC_URI[sha256sum] = "2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3"
+SRC_URI[sha256sum] = "a20a594dabeaa385725aa239d5244871c143ecb356add8a20fcf23773a6c3a35"
 
 inherit pypi python_setuptools_build_meta
 
