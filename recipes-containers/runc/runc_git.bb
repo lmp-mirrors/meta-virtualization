@@ -12,6 +12,6 @@ RUNC_VERSION = "1.5.1"
 RPROVIDES:${PN} += "runc-docker"
 RPROVIDES:${PN} += "runc-opencontainers"
 
-CVE_PRODUCT = "runc"
+CVE_PRODUCT = "linuxfoundation:runc"
 
 LDFLAGS += "${@bb.utils.contains('DISTRO_FEATURES', 'ld-is-gold', ' -fuse-ld=bfd', '', d)}"
