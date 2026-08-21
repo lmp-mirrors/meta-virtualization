@@ -8,6 +8,8 @@ PYPI_PACKAGE = "webob"
 
 SRC_URI[sha256sum] = "aa8c27231070b135c025e567a9cd7eda03f4df71352ffaac740cb6a75f0f81a5"
 
+CVE_PRODUCT = "pylons:webob pylonsproject:webob"
+
 inherit setuptools3 pypi
 
 RDEPENDS:${PN} += " \
