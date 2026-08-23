@@ -18,6 +18,7 @@ SRC_URI = "git://github.com/containers/crun.git;branch=main;name=crun;protocol=h
            file://0001-libocispec-correctly-parse-JSON-schema-references.patch;patchdir=libocispec \
            file://0002-libocispec-fix-array-items-parsing.patch;patchdir=libocispec \
            file://CVE-2026-30892.patch \
+           file://CVE-2026-47766.patch \
           "
 
 PV = "1.26.0+git"
